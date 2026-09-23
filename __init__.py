@@ -25,7 +25,7 @@ from review_loop import cli  # noqa: E402
 
 
 def register(ctx) -> None:  # noqa: ANN001 - PluginContext, untyped by design here
-    cli.register_cli(reg=ctx) if False else cli.register_cli(ctx)
+    cli.register_cli(ctx)
     skill_md = _HERE / "skill" / "SKILL.md"
     if skill_md.exists():
         ctx.register_skill(
