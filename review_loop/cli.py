@@ -229,9 +229,15 @@ def cmd_status(args) -> int:
               f"({loop['seats']['reviewer']['profile']}) · "
               f"fixer={loop['seats']['fixer']['login']} ({loop['seats']['fixer']['profile']})")
         locks = st._load(st.locks, {}) or {}
-        for seat, entry in locks.items():
-            held = (time.time() - entry.get("at", time.time())) / 60
-            print(f"  lock:       {seat} holding {entry.get('key')} for {held:.0f}m")
+        for seat, entries in locks.items():
+            for key, entry in (entries or {}).items():
+                held = (time.time() - entry.get("at", time.time())) / 60
+                print(f"  running:    {seat} on {key} for {held:.0f}m")
+        capacity = int(loop.get("concurrency") or 1)
+        for seat in ("reviewer", "fixer"):
+            queued = len(st.queue_items(seat))
+            if queued:
+                print(f"  queued:     {seat} {queued} ({capacity} at a time)")
         queue = st.queue_all()
         for seat, items in queue.items():
             for key, entry in items.items():

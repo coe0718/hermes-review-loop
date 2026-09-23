@@ -80,13 +80,15 @@ def main() -> None:
                     f"would loop forever")
         silence(f"cap reached on #{number} — handed to adjudication")
 
-    gate.take_seat(loop, st, seat, number, head, f"review #{number} @ {head[:7]}")
+    workspace = gate.take_seat(loop, st, seat, number, head, f"review #{number} @ {head[:7]}",
+                               login=(loop["seats"][seat].get("login") or ""))
     # The fixer pushed and asked: their turn is over, and anything queued behind them can start.
-    if st.seat_release_if("fixer", gate.seat_key(loop, number)):
+    if st.release_if("fixer", gate.seat_key(loop, number)):
         log(f"released fixer seat for {gate.seat_key(loop, number)}")
     gate.drain_seat(loop, "fixer")
 
-    payload["_loop"] = gate.loop_block(loop, number, head, round=rounds + 1, role="reviewer")
+    payload["_loop"] = gate.loop_block(loop, number, head, workspace, round=rounds + 1,
+                                       role="reviewer")
     st.inflight(f"review:{number}:{head}", record=True)
     gate.ping_start(loop, seat, gate.start_text(loop, seat, number, head, rounds + 1))
     print(json.dumps(payload))

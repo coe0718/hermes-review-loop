@@ -23,14 +23,45 @@ A **seat** is a role, not an agent: `reviewer` and `fixer`. Each seat is bound t
 (the way it is woken). Both seats are declared per loop, so the same install can run a different
 pair of agents on a different repository with a different budget.
 
-Two rules keep the seats honest:
+A seat is a **capacity, not a mutex**. `concurrency` says how many PRs it may work at once:
 
-- **a seat is a person-sized resource** — one run at a time, via a lock in `locks.json` that
-  expires after `ttl_min`, with a queue for anything that arrives while the seat is busy;
-- **a seat's turn ends when the other seat observes its artifact** — the reviewer gate releases the
-  fixer's lock when a push-and-request arrives; the fixer gate releases the reviewer's lock when a
-  verdict lands. Only for the *same* PR: releasing another PR's lock is how you get two runs in one
-  clone, which is the failure this whole design is built to avoid.
+- `concurrency: 1` — serialized. A second request queues and drains when the seat frees.
+- `concurrency: 2+` — **parallel with isolation**: each PR runs in its own clone with its own build
+  and temp directories, so two runs cannot corrupt each other. Requires `clone` in the loop config,
+  because without a source to isolate from the config loader refuses the setting outright.
+
+The ledger is keyed by **PR**, not by seat, so the same PR never runs twice even with a free slot —
+and the same *head* never runs twice at all (in-flight marks). A slot expires (`ttl_min`), so a
+crashed run cannot wedge a loop.
+
+## Isolation (parallel without the shared-clone bug)
+
+Isolation is not a performance feature; it is the difference between a parallel loop and a loop that
+publishes **wrong verdicts**. A review mutates its checkout — worktrees, `checkout --detach`,
+stashes, `merge --abort` — so two runs in one clone delete each other's working trees mid-review.
+
+Per PR, the gate prepares:
+
+```
+{state_dir}/artifacts/<PR>/
+├── repo/     own clone: own origin, own credential helper, own detached checkout at the head
+├── target/   CARGO_TARGET_DIR — reused across that PR's rounds (the cold build is paid once)
+└── tmp/      TMPDIR, so nothing collides in a shared /tmp
+```
+
+Cheap by construction: the clone is `git clone --local`, which hardlinks the object store, and git
+data is tiny next to build output (the loop this was built for: **25 MB of git, 177 GB of build
+artifacts**). The root is the same path the cleanup already deletes at merge, so isolation adds no
+new garbage and needs no new lifecycle.
+
+The token never lands in the tree: the clone's `origin` is the plain GitHub URL and
+`credential.helper` reads the PAT out of its 0600 file at use time, so the artifacts directory
+holds a **path**, not a key — and the fixer can still push from its own clone.
+
+When a sandbox cannot be built, `ensure` returns `None` and the gate decides honestly: at
+`concurrency: 1` the run proceeds against the shared clone (nothing else is running), at
+`concurrency: 2+` it is **queued**, because starting it beside another run is exactly the
+wrong-verdict case.
 
 ## Why the reviewer is woken by a request, not by a push
 

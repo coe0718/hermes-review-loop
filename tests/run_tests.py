@@ -466,35 +466,126 @@ def group_seats() -> None:
     check("busy seat → queued, silent", kind, "SILENT")
     check("  queue holds PR 9", "9" in load_state("pending.json").get("reviewer", {}).get(f"{REPO}#9", {}).get("url", ""), True)
 
-    # a stale lock frees itself
+    # a stale slot frees itself (the ledger is seat → PR key → entry)
     locks = load_state("locks.json")
-    locks["reviewer"]["at"] = time.time() - 46 * 60
+    locks["reviewer"][f"{REPO}#7"]["at"] = time.time() - 46 * 60
     state_file("locks.json").write_text(json.dumps(locks))
-    check("lock older than the TTL → seat free again",
+    check("slot older than the TTL → capacity again",
           run("gate_reviewer.py", pr_payload(9, head=HEAD_B))[0], "FIRE")
 
     # releasing a seat only ever releases ITS OWN turn
     reset(prs={"7": pr(7)})
     state_file("locks.json").write_text(json.dumps(
-        {"fixer": {"at": time.time(), "key": f"{REPO}#999", "why": "other PR"}}))
+        {"fixer": {f"{REPO}#999": {"at": time.time(), "head": HEAD_A, "why": "other PR"}}}))
     run("gate_reviewer.py", pr_payload(7))
-    check("another PR's fixer lock survives", "999" in state_file("locks.json").read_text(), True)
+    check("another PR's fixer slot survives", "999" in state_file("locks.json").read_text(), True)
 
-    # the reviewer seat and the in-flight mark are cleared so the next run reaches the release
+    # the reviewer slot and the in-flight mark are cleared so the next run reaches the release
     locks = load_state("locks.json")
     locks.pop("reviewer", None)
-    locks["fixer"] = {"at": time.time(), "key": f"{REPO}#7", "why": "this PR"}
+    locks["fixer"] = {f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "why": "this PR"}}
     state_file("locks.json").write_text(json.dumps(locks))
     state_file("inflight.json").write_text("{}")
     run("gate_reviewer.py", pr_payload(7))
-    check("this PR's fixer lock is released", "fixer" in load_state("locks.json"), False)
+    check("this PR's fixer slot is released", "fixer" in load_state("locks.json"), False)
 
     section("seats — the fixer side releases the reviewer")
     reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, rid=5)]}})
     state_file("locks.json").write_text(json.dumps(
-        {"reviewer": {"at": time.time(), "key": f"{REPO}#7", "why": "review"}}))
+        {"reviewer": {f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "why": "review"}}}))
     run("gate_fixer.py", review_payload(rid=5))
-    check("verdict → reviewer seat released", "reviewer" in load_state("locks.json"), False)
+    check("verdict → reviewer slot released", "reviewer" in load_state("locks.json"), False)
+
+
+def set_concurrency(value: int) -> None:
+    path = LOOPS_DIR / "widgets.json"
+    cfg = json.loads(path.read_text())
+    cfg["concurrency"] = value
+    path.write_text(json.dumps(cfg))
+
+
+def real_head() -> str:
+    return subprocess.run(["git", "-C", str(CLONE), "rev-parse", "HEAD"],
+                          capture_output=True, text=True).stdout.strip()
+
+
+def group_parallel() -> None:
+    section("parallel — own clone per PR, N at a time")
+    reset(prs={"7": pr(7), "9": pr(9)})
+    set_concurrency(2)
+    head = real_head()          # isolation checks out a real commit, so the sha must exist
+    set_prs({"7": pr(7, head=head), "9": pr(9, head=head), "11": pr(11, head=head)})
+
+    kind, out, err = run("gate_reviewer.py", pr_payload(7, head=head))
+    check("concurrency 2 → first PR starts", kind, "FIRE")
+
+    locks = load_state("locks.json").get("reviewer", {})
+    check("  its slot is held", f"{REPO}#7" in locks, True)
+
+    payload = json.loads(out)
+    iso = payload["_loop"]["isolation"]
+    check("  the run is isolated", iso.get("isolated"), True)
+    iso_clone = pathlib.Path(iso["clone"])
+    check("  own clone, not the shared one", iso_clone != CLONE and str(STATE_DIR) in str(iso_clone), True)
+    check("  the clone is a real checkout", (iso_clone / ".git").exists(), True)
+    check("  checked out at the head under review",
+          subprocess.run(["git", "-C", str(iso_clone), "rev-parse", "HEAD"],
+                         capture_output=True, text=True).stdout.strip(), head)
+    check("  build dir is inside the sandbox", iso["env"].startswith("CARGO_TARGET_DIR="), True)
+    check("  its own target dir, not a shared one",
+          str(STATE_DIR) in iso["target"] and iso["target"].startswith(str(iso_clone.parents[0])), True)
+    check("  the prompt says where to work", iso_clone.name in iso["brief"], True)
+    check("  no token in the clone's config",
+          "token-reviewer" in (iso_clone / ".git" / "config").read_text(), False)
+
+    # a second PR now runs too, in its own sandbox
+    kind, out2, _ = run("gate_reviewer.py", pr_payload(9, head=head))
+    check("second PR starts in parallel", kind, "FIRE")
+    iso2 = json.loads(out2)["_loop"]["isolation"]["clone"]
+    check("  different sandbox from the first", iso2 != iso["clone"], True)
+    check("  two runs now counted", len(load_state("locks.json").get("reviewer", {})), 2)
+
+    # capacity is the wall: a third waits
+    kind, _, _ = run("gate_reviewer.py", pr_payload(11, head=head))
+    check("third PR waits for a slot", kind, "SILENT")
+    check("  queued, not lost", f"{REPO}#11" in load_state("pending.json").get("reviewer", {}), True)
+
+    # the same PR never gets two runs, even with a free slot
+    state_file("inflight.json").write_text("{}")
+    kind, _, err = run("gate_reviewer.py", pr_payload(7, head=HEAD_B))
+    check("same PR twice → refused", kind, "SILENT")
+    check("  and it says why", "already running" in err, True)
+    check("  no second slot taken", len(load_state("locks.json").get("reviewer", {})), 2)
+
+    # a finished turn frees a slot, and the queue drains into it (the drain POSTs at the seat's
+    # route — the gate then runs there, so the sandbox is that run's business, not the drain's)
+    state_file("locks.json").write_text(json.dumps(
+        {"reviewer": {f"{REPO}#9": {"at": time.time(), "head": head, "why": "review"}}}))
+    before = len(RECEIVED)
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets", "--drain", "--seat", "reviewer")
+    check("freed slot → queued PR starts", "PR #11" in out, True)
+    check("  the wake really went out", len(RECEIVED) - before, 1)
+    check("  and the queue is cleared", load_state("pending.json").get("reviewer", {}), {})
+
+    # at capacity the drain declines rather than overcommitting
+    state_file("locks.json").write_text(json.dumps({"reviewer": {
+        f"{REPO}#7": {"at": time.time(), "head": head, "why": "review"},
+        f"{REPO}#9": {"at": time.time(), "head": head, "why": "review"}}}))
+    state_file("pending.json").write_text(json.dumps({"reviewer": {
+        f"{REPO}#11": {"at": time.time(), "head": head, "url": "u", "reason": "capacity"}}}))
+    before = len(RECEIVED)
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets", "--drain", "--seat", "reviewer")
+    check("full seat → drain declines", "at capacity (2/2" in out, True)
+    check("  nothing fired", len(RECEIVED) - before, 0)
+
+    # an unisolatable run is queued, never started beside another
+    reset(prs={"7": pr(7), "9": pr(9)})
+    set_concurrency(2)
+    state_file("locks.json").write_text(json.dumps({"reviewer": {}}))
+    kind, _, err = run("gate_reviewer.py", pr_payload(9, head=HEAD_B))
+    check("no sandbox + concurrency 2 → queued", kind, "SILENT")
+    check("  and it says isolation is why", "no isolated workspace" in err, True)
+    check("  no slot left held", load_state("locks.json").get("reviewer", {}), {})
 
 
 def group_watchdog() -> None:
@@ -526,14 +617,14 @@ def group_watchdog() -> None:
     check("already-reviewed queue entry is dropped", len(RECEIVED) - before, 0)
     check("  and removed from the queue", load_state("pending.json"), {})
 
-    # a still-busy seat fires nothing
+    # a full seat fires nothing
     reset(prs={"7": pr(7)})
     state_file("locks.json").write_text(json.dumps(
-        {"reviewer": {"at": time.time(), "key": f"{REPO}#9", "why": "working"}}))
+        {"reviewer": {f"{REPO}#9": {"at": time.time(), "head": HEAD_B, "why": "working"}}}))
     state_file("pending.json").write_text(json.dumps(
-        {"reviewer": {f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "url": "u", "reason": "busy"}}}))
+        {"reviewer": {f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "url": "u", "reason": "capacity"}}}))
     out, _, _ = run("watchdog.py", None, "--loop", "widgets", "--drain", "--seat", "reviewer")
-    check("busy seat drains nothing", "still busy" in out, True)
+    check("full seat drains nothing", "at capacity (1/1" in out, True)
 
     # shape 1: the reviewer never posted a verdict
     reset(prs={"7": pr(7, head=HEAD_A)})
@@ -573,11 +664,11 @@ def group_watchdog() -> None:
     reset(prs={})
     state_file("watchdog.json").write_text(json.dumps({"armed_since": time.time() - 86400}))
     state_file("locks.json").write_text(json.dumps(
-        {"reviewer": {"at": time.time() - 120 * 60, "key": f"{REPO}#7", "why": "died"}}))
+        {"reviewer": {f"{REPO}#7": {"at": time.time() - 120 * 60, "head": HEAD_A, "why": "died"}}}))
     state_file("pending.json").write_text(json.dumps(
         {"fixer": {f"{REPO}#7": {"at": time.time() - 90 * 60, "head": HEAD_A, "url": "u", "reason": "busy"}}}))
     out, _, _ = run("watchdog.py", None, "--loop", "widgets")
-    check("stuck: dead seat lock reported", "seat held 120m" in out, True)
+    check("stuck: dead slot reported", "slot held 120m" in out, True)
     check("stuck: waiting request reported", "waiting 90m" in out, True)
 
     reset(prs={"7": pr(7)}, hooks_active=False)
@@ -637,8 +728,8 @@ def group_cleanup() -> None:
 
 
 GROUPS = {"config": group_config, "reviewer": group_reviewer_gate, "budget": group_budget,
-          "fixer": group_fixer_gate, "seats": group_seats, "watchdog": group_watchdog,
-          "cleanup": group_cleanup}
+          "fixer": group_fixer_gate, "seats": group_seats, "parallel": group_parallel,
+          "watchdog": group_watchdog, "cleanup": group_cleanup}
 
 
 def main() -> int:

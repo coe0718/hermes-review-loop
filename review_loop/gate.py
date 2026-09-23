@@ -12,8 +12,9 @@ The order of the guards matters and is the same in both gates:
 2. can we read the facts we need (never guess a round count from a failed API call);
 3. has this exact head already been handled (in-flight marks);
 4. is the budget spent (cap → hand the PR to adjudication, do not buy another round);
-5. is the seat free (otherwise queue it and stay quiet);
-6. only then: record, announce, fire.
+5. is there a free slot for this seat (otherwise queue it and stay quiet);
+6. can this run be isolated (above ``concurrency 1`` a shared clone is not an option);
+7. only then: record, prepare the workspace, announce, fire.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ import sys
 import time
 import urllib.request
 
-from . import config, gh, routes, state as state_mod
+from . import config, gh, isolation, routes, state as state_mod
 from .util import log, now_iso, silence
 
 
@@ -75,9 +76,30 @@ def artifacts_for(loop: dict, number: int) -> str:
     return str(config.artifacts_dir(loop, number))
 
 
-def loop_block(loop: dict, number: int, head: str, **extra) -> dict:
+def isolation_block(loop: dict, number: int, workspace: dict | None) -> dict:
+    """Where this run is allowed to work — always present, so no prompt key renders as text.
+
+    The gate decided the workspace; the prompt only repeats the decision. ``isolated: false``
+    means no sandbox could be built, which is only allowed to happen at ``concurrency = 1``.
+    """
+    p = isolation.paths(loop, number)
+    shared = str(config.clone_path(loop)) if loop.get("clone") else ""
+    if workspace:
+        env = " ".join(f"{k}={v}" for k, v in workspace["env"].items()
+                       if k in ("CARGO_TARGET_DIR", "TMPDIR"))
+        return {"isolated": True, "root": workspace["root"], "clone": workspace["clone"],
+                "target": workspace["target"], "tmp": workspace["tmp"], "env": env,
+                "shared": shared, "brief": isolation.describe(workspace, loop, number)}
+    return {"isolated": False, "root": str(p["root"]), "clone": shared or str(p["root"]),
+            "target": "", "tmp": "", "env": "", "shared": shared,
+            "brief": isolation.describe(None, loop, number)}
+
+
+def loop_block(loop: dict, number: int, head: str, workspace: dict | None = None, **extra) -> dict:
     block = {"pr": number, "repo": loop["repo"], "head": head, "cap": loop["cap"],
-             "url": pr_url(loop, number), "artifacts": artifacts_for(loop, number)}
+             "url": pr_url(loop, number), "artifacts": artifacts_for(loop, number),
+             "concurrency": int(loop.get("concurrency") or 1),
+             "isolation": isolation_block(loop, number, workspace)}
     block.update(extra)
     return block
 
@@ -237,14 +259,42 @@ def start_text(loop: dict, seat: str, number: int, head: str, round_no: int,
 
 
 def take_seat(loop: dict, st: state_mod.LoopState, seat: str, number: int, head: str,
-              why: str) -> None:
-    """Serialize per seat: either take the lock, or queue this PR and stay silent."""
+              why: str, login: str = "") -> dict | None:
+    """Claim a slot for this PR and build its isolated workspace.
+
+    Either the run starts — slot available, own clone ready — or this PR is queued and the gate
+    stays silent. The claim happens *before* the workspace is built (a clone can take minutes;
+    two events arriving in that window must not both decide the seat is free).
+
+    Returns the workspace, or ``None`` when no sandbox could be built. Above ``concurrency = 1``
+    an unisolated run is never started: two runs sharing a checkout produce wrong verdicts, and
+    the caller would rather have a queued PR than a wrong one.
+    """
     key = seat_key(loop, number)
-    if not st.seat_free(seat):
-        held = st.seat_holder(seat)
-        age = int(time.time() - held.get("at", time.time()))
-        st.queue_add(seat, key, head, pr_url(loop, number),
-                     f"{seat} busy on {held.get('key')} for {age}s")
-        log(f"{seat} busy on {held.get('key')} — queued #{number} head {head[:7]}")
+    capacity = int(loop.get("concurrency") or 1)
+
+    if st.is_active(seat, key):
+        log(f"{seat} is already running {key} — refusing a second run at the same PR")
         silence()
-    st.seat_acquire(seat, key, why)
+
+    live = st.active(seat)
+    if len(live) >= capacity:
+        held = ", ".join(f"{k} ({int(time.time() - v.get('at', time.time()))}s)"
+                         for k, v in sorted(live.items()))
+        st.queue_add(seat, key, head, pr_url(loop, number),
+                     f"{seat} at capacity {len(live)}/{capacity}: {held}")
+        log(f"{seat} at capacity {len(live)}/{capacity} ({held}) — queued #{number} @ {head[:7]}")
+        silence()
+
+    st.acquire(seat, key, head, why)
+
+    workspace = isolation.ensure(loop, number, head, login=login or "")
+    if workspace is None and capacity > 1:
+        st.release_if(seat, key)
+        st.queue_add(seat, key, head, pr_url(loop, number),
+                     "no isolated workspace — a parallel run would share a checkout")
+        log(f"no isolated workspace for #{number} and concurrency={capacity} — queued")
+        silence()
+    if workspace is None:
+        log(f"running #{number} without isolation (concurrency=1) under {artifacts_for(loop, number)}")
+    return workspace

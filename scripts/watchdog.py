@@ -60,15 +60,22 @@ def hooks_armed(loop: dict) -> bool:
 
 
 def drain(loop: dict, st: state_mod.LoopState, seat: str, quiet: bool = False) -> int:
-    """Start whatever queued while a seat was busy. One at a time; the lock then holds it."""
+    """Start whatever queued while a seat was at capacity. Up to the free slots; the claim holds it."""
     items = st.queue_items(seat)
     if not items:
         return 0
-    if not st.seat_free(seat):
+    capacity = int(loop.get("concurrency") or 1)
+    live = st.active(seat)
+    free = capacity - len(live)
+    if free <= 0:
         if not quiet:
-            held = st.seat_holder(seat)
-            print(f"{seat} is still busy ({held.get('key')}) — {len(items)} request(s) queued")
+            held = ", ".join(f"{k} ({int((time.time() - v.get('at', 0)) / 60)}m)"
+                             for k, v in sorted(live.items()))
+            print(f"{seat} is at capacity ({len(live)}/{capacity}: {held}) — "
+                  f"{len(items)} request(s) queued")
         return 0
+
+    started = 0
 
     for key in sorted(items, key=lambda k: items[k].get("at", 0)):
         entry = items[key]
@@ -129,9 +136,12 @@ def drain(loop: dict, st: state_mod.LoopState, seat: str, quiet: bool = False) -
             st.note(f"drained {seat} for {key}")
             if not quiet:
                 print(f"{seat}: started the queued run for PR #{number} (head {head[:7]})")
-            return 1
-        return 0
-    return 0
+            started += 1
+            if started >= free:
+                break
+            continue
+        break
+    return started
 
 
 # -- the sweep ------------------------------------------------------------------
@@ -216,11 +226,12 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
                 alerts.append((number, kind, (pr.get("title") or "")[:60]))
 
     stuck: list[str] = []
-    for seat, entry in (st._load(st.locks, {}) or {}).items():
-        age = (now - entry.get("at", now)) / 60
-        if age > loop["ttl_min"] * 2:
-            stuck.append(f"  {seat} seat held {age:.0f}m on {entry.get('key')} — that run died; "
-                         f"the seat frees itself at {loop['ttl_min']}m")
+    for seat, entries in (st._load(st.locks, {}) or {}).items():
+        for key, entry in (entries or {}).items():
+            age = (now - entry.get("at", now)) / 60
+            if age > loop["ttl_min"] * 2:
+                stuck.append(f"  {seat} slot held {age:.0f}m on {key} — that run died; the slot "
+                             f"frees itself at {loop['ttl_min']}m")
     for seat, items in st.queue_all().items():
         for key, entry in (items or {}).items():
             age = (now - entry.get("at", now)) / 60

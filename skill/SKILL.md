@@ -14,15 +14,23 @@ preconditions and handed you a `_loop` block with the facts you need:
 | `round` / `cap` | which verdict this is, and how many are allowed before the loop stops |
 | `head` | the commit your turn is about |
 | `url` | the pull request |
-| `artifacts` | the only directory you may create files in |
+| `isolation` | your **own clone** for this PR, the env to export, and the directory your logs go in |
+
+Your workspace is per pull request, not shared: its own clone, its own origin, its own detached
+checkout, its own build and temp directories. So you may run anything — checkouts, worktrees,
+stashes, a full build — without touching another seat's run. `isolation.brief` in the payload names
+the exact paths; export what it lists before building, or your output lands in a shared directory
+and a parallel run will fight you for it. When `isolation.isolated` is false, only the logs
+directory is yours: still keep everything inside it and out of the repository.
 
 ## If you are the reviewer
 
 1. Read the PR first: description, diff, and what earlier rounds already settled. Repeating a
    finding that was answered last round wastes the whole budget.
-2. Check the head out **under `{artifacts}`** and verify the claims yourself — build it, run the
+2. Check the head out in **your own clone** and verify the claims yourself — build it, run the
    tests it touches, reproduce what it says it fixed. A claim you did not check is not a finding,
-   it is a rumor. Never work inside the main clone: another seat may be using it.
+   it is a rumor. Never work in the shared clone named in `isolation.shared`: another seat may be
+   using it right now.
 3. Post a verdict on the PR. For each finding: severity, evidence (the command and what it
    printed), and `file:line`. Findings without evidence get argued about instead of fixed.
 4. If the head moved while you worked, say which sha you actually reviewed.
@@ -34,7 +42,8 @@ preconditions and handed you a `_loop` block with the facts you need:
 
 1. Read the verdict. Fix what was found — a rewrite that dodges the finding is not a fix, and the
    next round will say so.
-2. Push to the same branch.
+2. Commit and push **from your own clone** (its origin and credential helper are already set up
+   for you — that is why the token is not in your working tree).
 3. **Re-request the review.** This is the step that gets forgotten and it is why the loop stops:
 
    ```
@@ -59,14 +68,17 @@ the cap is wrong for this PR, say so in your summary and let the operator change
 
 ## What the loop records about you
 
-The gate, not you, keeps the books: seat locks, the queue, in-flight marks and breach markers
-live under the loop's state directory, and the watchdog reads GitHub state directly rather than
-trusting anyone's summary. That means two things for how you work:
+The gate, not you, keeps the books: per-seat run ledgers, the queue, in-flight marks and breach
+markers live under the loop's state directory, and the watchdog reads GitHub state directly rather
+than trusting anyone's summary. That means three things for how you work:
 
 * your review's verdict count comes from the reviews on the PR, so a verdict you post is the
   round — commenting without a verdict does not consume one;
-* a run that died mid-way leaves a lock that expires, so you never need to clean up after
-  yourself for the loop to keep moving.
+* a run that died mid-way leaves a slot that expires, so you never need to clean up after yourself
+  for the loop to keep moving;
+* your PR's workspace is reused if you are woken again on the same PR — a warm build directory is
+  the point — and deleted when the PR closes. Anything you need to keep belongs on the PR, not on
+  this disk.
 
 ## When something is wrong with the loop itself
 

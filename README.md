@@ -49,7 +49,7 @@ Every one of those is a *silent* failure, so this plugin makes each one loud or 
 | fixer never pushes | the watchdog reports "changes requested N hours ago at head X, fixer never pushed" |
 | reviewer never posts | "head pushed N hours ago, 0 verdicts at this head" |
 | verdict ping-pong forever | the cap is counted in **verdicts**; hitting it hands the PR to an adjudicator instead of buying round four |
-| two runs, one clone | seats are serialized: a lock is taken, anything else is queued and drained when the seat frees |
+| two runs, one clone | a seat is a capacity with a per-PR ledger; `concurrency: 2+` gives each PR its own clone, build dir and tmp dir, and an unisolatable run is queued rather than shared |
 | a run dies mid-way | the lock expires; a stalled head frees itself |
 | disk creep | a merged/closed PR runs the cleanup: worktrees, build dirs, logs, locks, counters |
 | "did the loop ever run?" | every branch of every gate either fires or logs *why not*; the watchdog reads GitHub state directly instead of trusting anyone's summary |
@@ -101,8 +101,11 @@ that pushes and the token that reads are separate and revocable one at a time. A
 
 ## What the loop guarantees
 
-- **One run per seat.** A lock keyed to the PR; a second request is queued, costs nothing, and
-  starts when the seat frees. Locks expire, so a crashed run cannot wedge a loop.
+- **One run per PR.** A slot keyed to the PR; a second request is queued, costs nothing, and starts
+  when a slot frees. Slots expire, so a crashed run cannot wedge a loop.
+- **Parallel only when it is safe.** `concurrency: 1` serializes (the default). Above that, each PR
+  gets its own clone and its own build/temp dirs — a run that cannot be isolated is queued, never
+  started beside another.
 - **The cap is a wall, not a suggestion.** `cap` verdicts, `cap - 1` fix turns. The verdict that
   reaches the cap escalates instead of buying another round. The human is the veto, not the
   reviewer: the adjudicator rules and reports, and never merges or pushes.
@@ -119,8 +122,9 @@ that pushes and the token that reads are separate and revocable one at a time. A
 
 Exercised and passing:
 
-- `python3 tests/run_tests.py` — 78 checks, no network: every gate branch, the cap, seat locks and
-  queueing, all four watchdog stall shapes, and the cleanup rails against a real git clone.
+- `python3 tests/run_tests.py` — 104 checks, no network: every gate branch, the cap, seat capacity
+  and queueing, **real isolation** (a real second clone, checked out at the head, with no token in
+  it), all four watchdog stall shapes, and the cleanup rails against a real git clone.
 - Live use on a private repository: two seats, dozens of PRs, review → verdict → fix → cleanup.
 
 Not proven, and worth knowing before you trust it:

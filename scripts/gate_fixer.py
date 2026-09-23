@@ -59,7 +59,7 @@ def main() -> None:
         silence(f"a fix run for head {pr_head[:7]} is already out")
 
     # A verdict landed: the reviewer's turn is over, and anything queued behind it can start.
-    if st.seat_release_if("reviewer", key):
+    if st.release_if("reviewer", key):
         log(f"released reviewer seat for {key}")
     gate.drain_seat(loop, "reviewer")
 
@@ -69,9 +69,10 @@ def main() -> None:
                     f"({loop['cap']} reviews / {loop['cap'] - 1} fixes)")
         silence(f"cap reached on #{number} — handed to adjudication instead of a fix")
 
-    gate.take_seat(loop, st, seat, number, pr_head, f"fix #{number} @ {pr_head[:7]}")
+    workspace = gate.take_seat(loop, st, seat, number, pr_head, f"fix #{number} @ {pr_head[:7]}",
+                              login=(loop["seats"][seat].get("login") or ""))
 
-    payload["_loop"] = gate.loop_block(loop, number, pr_head, round=prior + 1,
+    payload["_loop"] = gate.loop_block(loop, number, pr_head, workspace, round=prior + 1,
                                        role="fixer", verdict="changes_requested",
                                        reviewer=gate.reviewer_login(review))
     st.inflight(f"fix:{number}:{pr_head}", record=True)

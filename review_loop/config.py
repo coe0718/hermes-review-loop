@@ -55,6 +55,7 @@ DEFAULTS: dict = {
     "tokens": {},
     "clone": "",
     "roots": [],
+    "concurrency": 1,         # runs allowed at once per seat; >1 requires isolation
     "grace_min": 25,          # how long a quiet head is allowed to sit before the watchdog speaks
     "marker_grace_min": 60,
     "cooldown_h": 6,
@@ -134,6 +135,15 @@ def normalize(raw: dict, source: pathlib.Path | None = None) -> dict:
     loop["tokens"] = {k: str(v) for k, v in (loop.get("tokens") or {}).items()}
     loop["read_token"] = str(loop.get("read_token") or (next(iter(loop["tokens"]), "")))
     loop["roots"] = [str(p) for p in (loop.get("roots") or [])]
+
+    loop["concurrency"] = int(loop.get("concurrency") or 1)
+    if loop["concurrency"] < 1:
+        raise ConfigError(f"{where}: 'concurrency' must be >= 1")
+    if loop["concurrency"] > 1 and not loop.get("clone"):
+        # Above one run per seat, isolation is not a preference: without a clone to isolate from,
+        # two runs would share whatever checkout they find, which is the wrong-verdict bug.
+        raise ConfigError(f"{where}: 'concurrency' > 1 requires 'clone' (runs must be isolated)")
+
     loop["host"] = str(loop.get("host") or DEFAULTS["host"]).rstrip("/")
     if not loop.get("state_dir"):
         loop["state_dir"] = str(home() / "state" / "review-loops" / loop["id"])

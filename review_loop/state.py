@@ -6,8 +6,9 @@ be deleted by removing one directory.
 
 Two rules the shapes below encode:
 
-* **A seat is a person-sized resource.** A run holds a lock while it works; anything else
-  waits in the queue. Locks expire, because a crashed run must not wedge a loop forever.
+* **A seat is a capacity, not a mutex.** ``concurrency`` says how many PRs that seat may work at
+  once (1 = serialized). The ledger is keyed by PR so one PR can never run twice, and it expires,
+  because a crashed run must not wedge a loop forever.
 * **One wake per head.** Every marker is keyed by PR *and* head sha: a new commit is a new
   situation, the same commit is not.
 """
@@ -56,37 +57,55 @@ class LoopState:
         except Exception:
             pass
 
-    # -- seat locks ---------------------------------------------------------
+    # -- active runs per seat (the concurrency ledger) ----------------------
 
-    def seat_free(self, seat: str) -> bool:
-        entry = (self._load(self.locks, {}) or {}).get(seat)
-        if not entry:
-            return True
-        return (time.time() - entry.get("at", 0)) > self.loop["ttl_min"] * 60
+    def active(self, seat: str) -> dict:
+        """This seat's live runs, ``{key: entry}``, expired ones dropped and persisted away.
 
-    def seat_holder(self, seat: str) -> dict:
-        return (self._load(self.locks, {}) or {}).get(seat) or {}
-
-    def seat_acquire(self, seat: str, key: str, why: str) -> None:
+        The ledger is per *seat* and keyed by PR, because isolation is per *PR*: two PRs may run
+        at once when ``concurrency`` allows it, but the same PR never runs twice.
+        """
         data = self._load(self.locks, {}) or {}
-        data[seat] = {"at": time.time(), "key": key, "why": why}
+        entries = data.get(seat) or {}
+        ttl = self.loop["ttl_min"] * 60
+        now = time.time()
+        live = {k: v for k, v in entries.items()
+                if isinstance(v, dict) and now - v.get("at", 0) <= ttl}
+        if live != entries:
+            if live:
+                data[seat] = live
+            else:
+                data.pop(seat, None)
+            self._save(self.locks, data)
+        return live
+
+    def active_count(self, seat: str) -> int:
+        return len(self.active(seat))
+
+    def is_active(self, seat: str, key: str) -> bool:
+        return key in self.active(seat)
+
+    def acquire(self, seat: str, key: str, head: str = "", why: str = "") -> None:
+        data = self._load(self.locks, {}) or {}
+        data.setdefault(seat, {})[key] = {"at": time.time(), "head": head, "why": why}
         self._save(self.locks, data)
 
-    def seat_release(self, seat: str) -> bool:
+    def release_if(self, seat: str, key: str) -> bool:
+        """Free a seat only for *this* PR's turn — never another PR's in-flight work."""
         data = self._load(self.locks, {}) or {}
-        if data.pop(seat, None) is None:
+        if (data.get(seat) or {}).pop(key, None) is None:
             return False
+        if not data[seat]:
+            data.pop(seat, None)
         self._save(self.locks, data)
         return True
 
-    def seat_release_if(self, seat: str, key: str) -> bool:
-        """Release a seat only when the lock is *this* PR's turn — never another PR's work."""
+    def release_all(self, seat: str) -> int:
         data = self._load(self.locks, {}) or {}
-        if (data.get(seat) or {}).get("key") != key:
-            return False
-        data.pop(seat, None)
-        self._save(self.locks, data)
-        return True
+        count = len(data.pop(seat, {}) or {})
+        if count:
+            self._save(self.locks, data)
+        return count
 
     # -- queue --------------------------------------------------------------
 
