@@ -1,0 +1,16 @@
+name: hermes-review-loop
+version: 0.1.0
+description: >-
+  Review loop — unattended PR review between two agents: a fixer pushes, a different reviewer
+  returns a verdict, the budget is counted in verdicts, a watchdog finds silent stalls, and a
+  finished PR gives its local disk back. Disclosure — creates webhook routes and (optionally) a
+  cron job, calls the GitHub API with repo-scope tokens you provide, and deletes local review
+  artifacts for merged or closed PRs.
+author: Jeremy Coe
+homepage: https://github.com/coe0718/hermes-review-loop
+license: MIT
+requires_hermes: ">=0.21.0"
+platforms:
+  - linux
+  - darwin
+python_dependencies: []

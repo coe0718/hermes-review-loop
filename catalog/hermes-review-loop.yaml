@@ -1,0 +1,27 @@
+# Copy of the catalog entry for this plugin.
+#
+# The live entry lives in NousResearch/hermes-agent at plugin-catalog/hermes-review-loop.yaml.
+# This copy is kept here so the entry and the code it points at move together: a SHA bump here is
+# the reminder that the catalog PR needs the same change. `sha` below is filled in by the release
+# step (it must be a full 40-character commit SHA — the loader rejects branches and short SHAs).
+name: hermes-review-loop
+repo: https://github.com/coe0718/hermes-review-loop
+sha: 0000000000000000000000000000000000000000   # replaced with the release commit at publish time
+description: Unattended PR review between two agents — one pushes, a different one reviews, the
+  budget is counted in verdicts, a watchdog reports silent stalls, and a finished PR gives its
+  local disk back. Disclosure — creates webhook routes and a cron job, calls the GitHub API with
+  repo-scope tokens you provide, and deletes local review artifacts for merged or closed PRs.
+maintainer: coe0718
+tier: community
+category: automation
+requires_hermes: '>=0.21.0'
+docs_url: https://github.com/coe0718/hermes-review-loop#readme
+version: 0.1.0
+platforms:
+  - linux
+  - darwin
+capabilities:
+  provides_tools: []
+  provides_hooks: []
+  provides_middleware: []
+  requires_env: []

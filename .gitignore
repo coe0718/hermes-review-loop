@@ -1,0 +1,8 @@
+# Test scratch: real git clones and worktrees are created here and thrown away
+tests/.tmp/
+__pycache__/
+*.pyc
+.venv/
+venv/
+.install-metadata.json
+.hermes-catalog.json
