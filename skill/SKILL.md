@@ -92,4 +92,6 @@ visible instead of silent, and the operator's next action depends on your report
 rather than flattering. The operator has `hermes review-loop explain --pr N` for the other side of
 that: it reads the head, the verdicts at that head, the seat and the queue and prints the one event
 that has to happen next. It changes nothing, so it is always safe to say "run explain on this PR"
-in a summary instead of guessing what the loop is waiting for.
+in a summary instead of guessing what the loop is waiting for. If nothing fires at all — no wake,
+no verdict, no fix — point the operator at `hermes review-loop doctor --loop <id>`: it names
+the broken piece (a missing profile, token, route or hook) and writes nothing.
