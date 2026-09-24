@@ -4631,6 +4631,31 @@ def group_state_race() -> None:
     check("  and the ledger holds one run", len(load_state("locks.json").get("reviewer") or {}), 1)
 
 
+def group_open_prs() -> None:
+    section("open PR listing — every page, or unknown")
+    from review_loop import gh
+
+    loop = {"repo": REPO}
+    path = f"/repos/{REPO}/pulls?state=open&per_page=100"
+    first = [pr(n) for n in range(1, 101)]
+    second = [pr(n) for n in range(101, 151)]
+    with mock.patch.object(gh, "fetch", side_effect=[(first, ""), (second, "")]) as fetch:
+        listed = gh.open_prs(loop)
+    check("a second page is read", [c.args[1] for c in fetch.call_args_list],
+          [path, path + "&page=2"])
+    check("  and every open PR is listed", len(listed or []), 150)
+    for label, page in (("failed", (None, "HTTP 502")), ("malformed", ({"message": "x"}, "")),
+                        ("item-less", ([None], ""))):
+        with mock.patch.object(gh, "fetch", side_effect=[(first, ""), page]):
+            check(f"a {label} later page makes the listing unknown",
+                  gh.open_prs(loop) is None, True)
+    with (mock.patch.object(gh, "MAX_PR_PAGES", 3),
+          mock.patch.object(gh, "fetch", return_value=(first, "")) as fetch):
+        check("an endless full listing is unknown, not truncated",
+              gh.open_prs(loop) is None, True)
+        check("  and the read is bounded", fetch.call_count, 3)
+
+
 def group_reconciliation() -> None:
     section("seat reconciliation — route, hook and config rollback")
     test = subprocess.run([sys.executable, str(ROOT / "tests" / "test_reconciliation.py")],
@@ -4649,6 +4674,7 @@ GROUPS = {"routes": group_routes, "config": group_config, "reviewer": group_revi
           "watchdog": group_watchdog, "explain": group_explain,
           "cleanup": group_cleanup, "doctor": group_doctor,
           "reconciliation": group_reconciliation, "state_race": group_state_race,
+          "open_prs": group_open_prs,
            "observer": group_observer, "observer_safety": group_observer_safety,
            "observer_cli": group_observer_cli}
 
