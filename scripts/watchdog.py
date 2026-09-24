@@ -78,7 +78,9 @@ def drain(loop: dict, st: state_mod.LoopState, seat: str, quiet: bool = False) -
     started = 0
 
     for key in sorted(items, key=lambda k: items[k].get("at", 0)):
-        entry = items[key]
+        if key in live:
+            # A free *other* slot is not permission to wake this PR twice.
+            continue
         try:
             number = int(str(key).split("#")[-1])
         except Exception:
@@ -154,6 +156,13 @@ def drain(loop: dict, st: state_mod.LoopState, seat: str, quiet: bool = False) -
 # -- the sweep ------------------------------------------------------------------
 
 
+def drain_queued(loop: dict, st: state_mod.LoopState, lines: list[str]) -> None:
+    """Free capacity is a scheduling signal, not a stall notification."""
+    for seat in ("reviewer", "fixer"):
+        if drain(loop, st, seat, quiet=True):
+            lines.append(f"started the queued {seat} run whose wait was over")
+
+
 def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
     lines: list[str] = []
     watch = st.watch()
@@ -168,6 +177,7 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
         watch["armed_since"] = now
         st.watch_save(watch)
         st.note("loop observed armed — baseline set; older heads excluded")
+        drain_queued(loop, st, lines)
         return lines
 
     armed_since = 0.0 if TEST else watch["armed_since"]
@@ -178,7 +188,9 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
 
     prs = gh.open_prs(loop)
     if not isinstance(prs, list):
-        return [f"⚠️ {loop['id']}: could not list open PRs — nothing checked this run"]
+        lines.append(f"⚠️ {loop['id']}: could not list open PRs — stall scan skipped this run")
+        drain_queued(loop, st, lines)  # individual PR reads may still work
+        return lines
 
     alerts: list[tuple[int, str, str]] = []
     seen: dict[str, float] = {}
@@ -255,11 +267,9 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
         if stuck:
             lines.append(f"⚠️ Review loop {header} — {len(stuck)} stuck state(s):")
             lines.extend(stuck)
-        lines.append("Nothing here is retrying itself. Check the gateway log for the run, or "
-                     "re-drive the route by hand.")
-        for seat in ("reviewer", "fixer"):
-            if drain(loop, st, seat, quiet=True):
-                lines.append(f"started the queued {seat} run whose wait was over")
+        lines.append("Check the gateway log for the run, or re-drive the route by hand.")
+
+    drain_queued(loop, st, lines)
 
     history = {**watch.get("alerts", {}), **seen}
     watch["alerts"] = {k: v for k, v in history.items() if now - v < 30 * 86400}

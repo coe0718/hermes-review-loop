@@ -1149,6 +1149,51 @@ def group_watchdog() -> None:
     out, _, _ = run("watchdog.py", None, "--loop", "widgets", "--drain", "--seat", "reviewer")
     check("full seat drains nothing", "at capacity (1/1" in out, True)
 
+    # An ordinary armed sweep must drain after a lock expires even without an alert.
+    reset(prs={"7": pr(7), "9": pr(9)})
+    state_file("watchdog.json").write_text(json.dumps({"armed_since": time.time() - 60}))
+    state_file("locks.json").write_text(json.dumps({"reviewer": {
+        f"{REPO}#9": {"at": time.time() - 46 * 60, "head": HEAD_B, "why": "expired"}}}))
+    state_file("pending.json").write_text(json.dumps({"reviewer": {
+        f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "url": "u", "reason": "capacity"}}}))
+    before = len(RECEIVED)
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets",
+                    extra_env={"REVIEW_LOOP_TEST": ""})
+    check("zero-alert sweep wakes queued PR after lock expiry", len(RECEIVED) - before, 1)
+    check("  the eligible PR was woken", json.loads(RECEIVED[-1]["body"])["number"] if RECEIVED else None, 7)
+    check("  no stall warning is required", "silent stall" in out or "stuck state" in out, False)
+    check("  queue is cleared", load_state("pending.json"), {})
+    check("  expired lock is cleared", load_state("locks.json"), {})
+    before = len(RECEIVED)
+    run("watchdog.py", None, "--loop", "widgets", extra_env={"REVIEW_LOOP_TEST": ""})
+    check("  repeated sweep does not wake twice", len(RECEIVED) - before, 0)
+
+    # A spare slot must not wake a PR already held by that seat.
+    reset(prs={"7": pr(7)})
+    set_concurrency(2)
+    state_file("watchdog.json").write_text(json.dumps({"armed_since": time.time() - 60}))
+    state_file("locks.json").write_text(json.dumps({"reviewer": {
+        f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "why": "working"}}}))
+    state_file("pending.json").write_text(json.dumps({"reviewer": {
+        f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "url": "u", "reason": "busy"}}}))
+    before = len(RECEIVED)
+    run("watchdog.py", None, "--loop", "widgets", extra_env={"REVIEW_LOOP_TEST": ""})
+    check("spare slot does not re-wake an active PR", len(RECEIVED) - before, 0)
+    check("  active PR stays queued for its handoff", f"{REPO}#7" in
+          load_state("pending.json").get("reviewer", {}), True)
+    check("  existing slot remains held", len(load_state("locks.json").get("reviewer", {})), 1)
+
+    # The fixer seat also drains without a fresh stall, but only with an eligible verdict.
+    reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER)]}})
+    state_file("watchdog.json").write_text(json.dumps({"armed_since": time.time() - 60}))
+    state_file("pending.json").write_text(json.dumps({"fixer": {
+        f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "url": "u", "reason": "busy"}}}))
+    before = len(RECEIVED)
+    run("watchdog.py", None, "--loop", "widgets", extra_env={"REVIEW_LOOP_TEST": ""})
+    check("zero-alert sweep drains eligible fixer", len(RECEIVED) - before, 1)
+    check("  fixer route received the verdict", RECEIVED[-1]["event"], "pull_request_review")
+    check("  fixer queue cleared", load_state("pending.json"), {})
+
     # shape 1: the reviewer never posted a verdict
     reset(prs={"7": pr(7, head=HEAD_A)})
     state_file("watchdog.json").parent.mkdir(parents=True, exist_ok=True)
