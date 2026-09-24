@@ -908,6 +908,29 @@ def group_fixer_gate() -> None:
     check("same head twice → second is silent",
           run("gate_fixer.py", review_payload(rid=5))[0], "SILENT")
 
+    # A delayed webhook with an unchanged commit cannot discharge a seat after the
+    # base moved. These are old-worker effects, not merely an old-head duplicate.
+    reset(prs={"7": {**pr(7), "base": {"ref": "main", "sha": HEAD_B},
+                        "reviews": [review(REVIEWER, rid=5)]}})
+    state_file("locks.json").write_text(json.dumps({"reviewer": {
+        f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "why": "review"}}}))
+    old = review_payload(rid=5)
+    old["pull_request"]["base"] = {"ref": "main", "sha": HEAD_A}
+    before = len(RECEIVED)
+    check("old-base verdict cannot start fixer", run("gate_fixer.py", old)[0], "SILENT")
+    check("old-base verdict keeps reviewer seat", f"{REPO}#7" in load_state("locks.json")["reviewer"], True)
+    check("old-base verdict produces no POST", len(RECEIVED), before)
+    old["review"]["state"] = "approved"
+    check("old-base approval is silent", run("gate_fixer.py", old)[0], "SILENT")
+    check("old-base approval keeps seat", f"{REPO}#7" in load_state("locks.json")["reviewer"], True)
+    check("old-base approval produces no POST", len(RECEIVED), before)
+
+    reset(prs={"7": {**pr(7, base="parent"), "reviews": [review(REVIEWER, rid=5)]}})
+    old = review_payload(rid=5)
+    before = len(RECEIVED)
+    check("retargeted stacked PR refuses old fixer wake", run("gate_fixer.py", old)[0], "SILENT")
+    check("retargeted stacked PR produces no POST", len(RECEIVED), before)
+
 
 def group_seats() -> None:
     section("seats — one run at a time, and only its own turn")
@@ -4452,6 +4475,15 @@ def group_reconciliation() -> None:
     check("route and hook reconciliation regression suite", test.returncode, 0)
 
 
+def group_situation_authorization() -> None:
+    section("stacked situation authorization — read-only fail closed")
+    test = subprocess.run([sys.executable, "-m", "unittest", "tests.test_situation_authorization"],
+                          cwd=ROOT, capture_output=True, text=True)
+    if test.returncode:
+        print(test.stdout + test.stderr)
+    check("generation-bound parent approval regression suite", test.returncode, 0)
+
+
 GROUPS = {"routes": group_routes, "config": group_config, "reviewer": group_reviewer_gate, "budget": group_budget,
           "adjudicator": group_adjudicator,
           "fixer": group_fixer_gate, "seats": group_seats, "parallel": group_parallel,
@@ -4460,7 +4492,7 @@ GROUPS = {"routes": group_routes, "config": group_config, "reviewer": group_revi
           "plugin_settings": group_plugin_settings, "seat_identity": group_seat_identity,
           "watchdog": group_watchdog, "explain": group_explain,
           "cleanup": group_cleanup, "doctor": group_doctor,
-          "reconciliation": group_reconciliation,
+          "reconciliation": group_reconciliation, "situation_authorization": group_situation_authorization,
            "observer": group_observer, "observer_safety": group_observer_safety,
            "observer_cli": group_observer_cli}
 

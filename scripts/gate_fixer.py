@@ -47,6 +47,22 @@ def main() -> None:
     number = gate.number_of(payload, pr)
     key = gate.seat_key(loop, number)
 
+    # A webhook is a delivered snapshot, not permission to release a seat, announce
+    # approval, escalate, or start a fixer after the PR was retargeted. Stacked reviews
+    # have no trustworthy review-ID/base association in this direct-gh workflow yet.
+    if (pr.get("base") or {}).get("ref") != loop["base"]:
+        silence("stacked/retargeted verdict has no verified review situation")
+    live = gh.pr(loop, number)
+    if (not isinstance(live, dict) or live.get("number") != number
+            or live.get("state") != "open" or live.get("draft")
+            or (live.get("base") or {}).get("ref") != loop["base"]
+            or (live.get("head") or {}).get("sha") != (pr.get("head") or {}).get("sha")):
+        silence("verdict snapshot is stale or live PR unavailable")
+    snapshot_base_sha = (pr.get("base") or {}).get("sha")
+    live_base_sha = (live.get("base") or {}).get("sha")
+    if snapshot_base_sha and live_base_sha != snapshot_base_sha:
+        silence("verdict base generation changed")
+
     state = str(review.get("state", "")).upper()
     if state == "APPROVED":
         # An approval ends the reviewer's turn exactly as a rejection does, and nothing else would

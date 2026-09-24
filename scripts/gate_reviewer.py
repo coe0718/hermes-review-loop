@@ -87,6 +87,9 @@ def main() -> None:
     if (current.get("draft") or (current.get("base") or {}).get("ref") != loop["base"]
             or ((current.get("user") or {}).get("login") or "").lower() not in loop["fixers"]):
         silence("current PR is no longer eligible for this review")
+    snapshot_base_sha = (pr.get("base") or {}).get("sha")
+    if snapshot_base_sha and snapshot_base_sha != (current.get("base") or {}).get("sha"):
+        silence("review trigger is from an older base generation")
 
     reviews = gate.fetch_reviews(loop, number)
     if gate.reviewed_at_head(reviews, loop, head):

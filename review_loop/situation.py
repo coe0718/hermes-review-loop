@@ -127,3 +127,37 @@ def resolve(loop: dict, number: int, *, listing: list[dict] | None = None) -> Re
                               tuple(item[0] for item in chain))
         current_ref, current_sha = next_ref, next_sha
     return Resolution("blocked", f"parent chain exceeds {MAX_PARENT_DEPTH} levels")
+
+
+def parent_readiness(loop: dict, st, number: int, expected: Resolution) -> tuple[bool, str]:
+    """A child may proceed only with current, associated approvals on every parent.
+
+    A delivered webhook, matching head SHA, or a bare APPROVED REST review never
+    establishes which diff was approved. Re-resolve both the child and every parent;
+    any changed generation, missing receipt, dismissed verdict, or failed read parks it.
+    There is deliberately no automatic receipt writer in the current gh workflow.
+    """
+    if expected.status != "waiting" or expected.identity is None or not expected.parents:
+        return False, "no verified stacked child situation"
+    current = resolve(loop, number)
+    if (current.status != "waiting" or current.identity != expected.identity
+            or current.parents != expected.parents):
+        return False, "child/parent generation changed or cannot be re-read"
+    from . import gate  # avoid module import cycle; gate imports situation
+    for parent_number in expected.parents:
+        parent = resolve(loop, parent_number)
+        if parent.status not in {"eligible", "waiting"} or parent.identity is None:
+            return False, f"parent #{parent_number} situation unverified"
+        reviews, error = gh.reviews_read(loop, parent_number)
+        if error or not isinstance(reviews, list):
+            return False, f"parent #{parent_number} reviews unreadable"
+        latest = gate.latest_effective_review_at_head(reviews, loop, parent.identity.head_sha)
+        if (latest is None or gh.review_state(latest) != "APPROVED"
+                or type(latest.get("id")) is not int
+                or not st.associated_review(parent_number, parent.identity.key, latest["id"])):
+            return False, f"parent #{parent_number} approval unassociated or not current"
+    # A parent can advance during the approval reads; prove the original chain again.
+    final = resolve(loop, number)
+    if final.status != "waiting" or final.identity != expected.identity:
+        return False, "parent chain changed during approval reads"
+    return True, "all parents have current associated approvals"

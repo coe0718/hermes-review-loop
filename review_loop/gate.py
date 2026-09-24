@@ -386,9 +386,12 @@ def explain_facts(loop: dict, number: int) -> dict:
                 chain.identity.base_ref != base or
                 chain.identity.base_sha != (pr.get("base") or {}).get("sha")):
             chain = situation.Resolution("blocked", "PR changed during chain read; retry")
+    readiness = (situation.parent_readiness(loop, state_mod.state_for(loop), number, chain)
+                 if isinstance(chain, situation.Resolution) and chain.status == "waiting"
+                 else (False, "parent chain unverified"))
     return {"pr": pr, "pr_error": pr_error, "reviews": reviews, "reviews_error": reviews_error,
             "armed": armed, "armed_error": armed_error, "read_at": time.time(),
-            "chain": chain}
+            "chain": chain, "parent_readiness": readiness}
 
 
 def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> dict:
@@ -419,6 +422,8 @@ def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> di
     stacked = bool(base and base != loop["base"])
     chain_reason = (chain.reason if isinstance(chain, situation.Resolution) else
                     "parent chain not verified")
+    if stacked and isinstance(facts.get("parent_readiness"), tuple):
+        chain_reason += f"; parent approval: {facts['parent_readiness'][1]}"
     chain_parents = (chain.parents if isinstance(chain, situation.Resolution) else ())
     author = str(((pr or {}).get("user") or {}).get("login") or "").lower()
     state = ("unknown" if pr is None
