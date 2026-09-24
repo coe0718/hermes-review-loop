@@ -47,7 +47,7 @@ Every one of those is a *silent* failure, so this plugin makes each one loud or 
 |---|---|
 | push without a request | the gate only wakes the reviewer on an explicit request (and the fixer's prompt spells out the `gh api` call) |
 | fixer never pushes | the watchdog reports "changes requested N hours ago at head X, fixer never pushed" |
-| reviewer never posts | "head pushed N hours ago, 0 verdicts at this head" |
+| reviewer never posts | "head first observed N hours ago, 0 verdicts at this head" |
 | verdict ping-pong forever | the cap is counted in **verdicts**; hitting it hands the PR to an adjudicator instead of buying round four |
 | two runs, one clone | a seat is a capacity with a per-PR ledger; `concurrency: 2+` gives each PR its own clone, build dir and tmp dir, and an unisolatable run is queued rather than shared |
 | a run dies mid-way | the lock expires; a stalled head frees itself |
@@ -201,7 +201,8 @@ never copied into `~/.hermes/skills/`.
 - **Unknown is not a guess.** If the review list cannot be read, the gate stays silent rather than
   assuming round 1 — a skipped round beats a miscounted one.
 - **The watchdog is read-only until it has a reason.** Four stall shapes, read from GitHub state;
-  it drains a queued run only once the wait has passed the grace period.
+  each armed sweep drains eligible queued runs when a seat is free, without waiting for a stall alert.
+  A queued head that no longer matches the PR is dropped, never silently retargeted.
 - **Paused means silent.** With the repo hooks off, the watchdog says nothing and drains nothing: a
   parked loop must never spend a run.
 
@@ -209,7 +210,7 @@ never copied into `~/.hermes/skills/`.
 
 Exercised and passing:
 
-- `python3 tests/run_tests.py` — 218 checks, no network: every gate branch, the cap, the one-PR-one-
+- `python3 tests/run_tests.py` — 466 checks, no network: every gate branch, the cap, the one-PR-one-
   seat rule (including the handoff that must *not* deadlock the gates), per-seat capacity and
   queueing, an approval freeing its slot and starting the next queued PR, **real isolation** (real
   clones — one per PR *and* per seat — checked out at the head, with no token in them), the `set` /

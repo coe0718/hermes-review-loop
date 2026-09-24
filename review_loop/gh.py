@@ -116,19 +116,6 @@ def open_prs(loop: dict):
     return api(loop, f"/repos/{loop['repo']}/pulls?state=open&per_page=100")
 
 
-def commit_epoch(loop: dict, sha: str) -> float:
-    """When the head commit was authored — the watchdog's clock for "this has gone quiet"."""
-    from .util import epoch
-
-    if not sha:
-        return 0.0
-    data = api(loop, f"/repos/{loop['repo']}/commits/{sha}")
-    if not isinstance(data, dict):
-        return 0.0
-    commit = data.get("commit") or {}
-    return epoch((commit.get("committer") or {}).get("date")
-                 or (commit.get("author") or {}).get("date"))
-
 
 def request_review(loop: dict, number: int, login: str | None = None, as_login: str | None = None):
     """Ask for a review explicitly.

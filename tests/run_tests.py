@@ -33,6 +33,7 @@ import sys
 import tempfile
 import threading
 import time
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from types import SimpleNamespace
 from typing import Any
@@ -1362,6 +1363,33 @@ def group_watchdog() -> None:
     check("  signature is valid for that route", verify_sig(RECEIVED[-1], "widgets-review"), True)
     check("  queue is now empty", load_state("pending.json"), {})
 
+    # A queued A must not turn into a synthetic request for B. A fresh event can
+    # subsequently enqueue B, but the stale request has no authority to wake it.
+    for seat, reviews in (("reviewer", []), ("fixer", [review(REVIEWER, head=HEAD_B)])):
+        reset(prs={"7": {**pr(7, head=HEAD_B), "reviews": reviews}})
+        state_file("pending.json").write_text(json.dumps({seat: {
+            f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "url": "u", "reason": "busy"}}}))
+        before = len(RECEIVED)
+        out, _, _ = run("watchdog.py", None, "--loop", "widgets", "--drain", "--seat", seat)
+        check(f"stale {seat} A queue never wakes B", len(RECEIVED) - before, 0)
+        check(f"stale {seat} A queue is discarded", load_state("pending.json"), {})
+        check(f"stale {seat} queue is not reported started", "started the queued run" in out, False)
+    # An unreadable PR leaves the queue alone for a later safe retry.
+    reset(prs={"7": pr(7, head=HEAD_B)})
+    state_file("pending.json").write_text(json.dumps({"reviewer": {
+        f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "url": "u", "reason": "busy"}}}))
+    run("watchdog.py", None, "--loop", "widgets", "--drain", "--seat", "reviewer",
+        extra_env={"REVIEW_LOOP_GH_STUB": "/bin/false"})
+    check("unreadable fresh PR keeps queue for retry", f"{REPO}#7" in
+          load_state("pending.json").get("reviewer", {}), True)
+    # A genuinely new B request is independently eligible, rather than inheriting A.
+    state_file("pending.json").write_text(json.dumps({"reviewer": {
+        f"{REPO}#7": {"at": time.time(), "head": HEAD_B, "url": "u", "reason": "fresh"}}}))
+    before = len(RECEIVED)
+    run("watchdog.py", None, "--loop", "widgets", "--drain", "--seat", "reviewer")
+    check("fresh B request is woken", len(RECEIVED) - before, 1)
+    check("fresh B wake carries B", json.loads(RECEIVED[-1]["body"])["pull_request"]["head"]["sha"], HEAD_B)
+
     # a queued request for a head that was already reviewed dies quietly
     reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER)]}})
     state_file("pending.json").write_text(json.dumps(
@@ -1394,6 +1422,51 @@ def group_watchdog() -> None:
         {"reviewer": {f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "url": "u", "reason": "capacity"}}}))
     out, _, _ = run("watchdog.py", None, "--loop", "widgets", "--drain", "--seat", "reviewer")
     check("full seat drains nothing", "at capacity (1/1" in out, True)
+
+    # An ordinary armed sweep must drain after a lock expires even without an alert.
+    reset(prs={"7": pr(7), "9": pr(9)})
+    state_file("watchdog.json").write_text(json.dumps({"armed_since": time.time() - 60}))
+    state_file("locks.json").write_text(json.dumps({"reviewer": {
+        f"{REPO}#9": {"at": time.time() - 46 * 60, "head": HEAD_B, "why": "expired"}}}))
+    state_file("pending.json").write_text(json.dumps({"reviewer": {
+        f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "url": "u", "reason": "capacity"}}}))
+    before = len(RECEIVED)
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets",
+                    extra_env={"REVIEW_LOOP_TEST": ""})
+    check("zero-alert sweep wakes queued PR after lock expiry", len(RECEIVED) - before, 1)
+    check("  the eligible PR was woken", json.loads(RECEIVED[-1]["body"])["number"] if RECEIVED else None, 7)
+    check("  no stall warning is required", "silent stall" in out or "stuck state" in out, False)
+    check("  queue is cleared", load_state("pending.json"), {})
+    check("  expired lock is cleared", load_state("locks.json"), {})
+    before = len(RECEIVED)
+    run("watchdog.py", None, "--loop", "widgets", extra_env={"REVIEW_LOOP_TEST": ""})
+    check("  repeated sweep does not wake twice", len(RECEIVED) - before, 0)
+
+    # A spare slot must not wake a PR already held by that seat.
+    reset(prs={"7": pr(7)})
+    set_concurrency(2)
+    state_file("watchdog.json").write_text(json.dumps({"armed_since": time.time() - 60}))
+    state_file("locks.json").write_text(json.dumps({"reviewer": {
+        f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "why": "working"}}}))
+    state_file("pending.json").write_text(json.dumps({"reviewer": {
+        f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "url": "u", "reason": "busy"}}}))
+    before = len(RECEIVED)
+    run("watchdog.py", None, "--loop", "widgets", extra_env={"REVIEW_LOOP_TEST": ""})
+    check("spare slot does not re-wake an active PR", len(RECEIVED) - before, 0)
+    check("  active PR stays queued for its handoff", f"{REPO}#7" in
+          load_state("pending.json").get("reviewer", {}), True)
+    check("  existing slot remains held", len(load_state("locks.json").get("reviewer", {})), 1)
+
+    # The fixer seat also drains without a fresh stall, but only with an eligible verdict.
+    reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER)]}})
+    state_file("watchdog.json").write_text(json.dumps({"armed_since": time.time() - 60}))
+    state_file("pending.json").write_text(json.dumps({"fixer": {
+        f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "url": "u", "reason": "busy"}}}))
+    before = len(RECEIVED)
+    run("watchdog.py", None, "--loop", "widgets", extra_env={"REVIEW_LOOP_TEST": ""})
+    check("zero-alert sweep drains eligible fixer", len(RECEIVED) - before, 1)
+    check("  fixer route received the verdict", RECEIVED[-1]["event"], "pull_request_review")
+    check("  fixer queue cleared", load_state("pending.json"), {})
 
     # shape 1: the reviewer never posted a verdict
     reset(prs={"7": pr(7, head=HEAD_A)})
@@ -1428,6 +1501,186 @@ def group_watchdog() -> None:
     state_file("watchdog.json").write_text(json.dumps({"armed_since": time.time() - 86400}))
     out, _, _ = run("watchdog.py", None, "--loop", "widgets")
     check("stall: cap spent, no escalation marker", "NO escalation marker" in out, True)
+
+    # Real grace/baseline mode (not REVIEW_LOOP_TEST's zero-grace bypass).
+    normal = {"REVIEW_LOOP_TEST": ""}
+    reset(prs={"7": pr(7)})
+    DATA["world"]["commit_dates"] = {HEAD_A: "2020-01-01T00:00:00Z",
+                                       HEAD_B: "2020-01-01T00:00:00Z"}
+    save_world()
+    run("watchdog.py", None, "--loop", "widgets", extra_env=normal)  # arm with old head
+    watch = load_state("watchdog.json")
+    check("arming snapshots the existing head", watch.get("heads", {}).get("7", {}).get("sha"), HEAD_A)
+    watch["armed_since"] = time.time() - 7200
+    state_file("watchdog.json").write_text(json.dumps(watch))
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    check("old PR at original head is not a stall", "reviewer never posted" in out, False)
+    set_prs({"7": pr(7, head=HEAD_B)})
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    watch = load_state("watchdog.json")
+    check("changed old-dated head gets observation clock", watch.get("heads", {}).get("7", {}).get("sha"), HEAD_B)
+    check("new head gets grace before alarm", "reviewer never posted" in out, False)
+    watch["heads"]["7"]["observed_at"] = time.time() - 3600
+    state_file("watchdog.json").write_text(json.dumps(watch))
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    check("old-dated new head alarms after observed grace", "reviewer never posted" in out, True)
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    check("restart retains head and cooldown", "reviewer never posted" in out, False)
+
+    # Cap marker is likewise gated by observation, not by the commit's date.
+    reset(prs={"7": pr(7)})
+    run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    cap_reviews = [review(REVIEWER, head="c" * 40, rid=1),
+                   review(REVIEWER, head="d" * 40, rid=2),
+                   review(REVIEWER, head="e" * 40, rid=3)]
+    set_prs({"7": {**pr(7), "reviews": cap_reviews}})
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    check("old unchanged PR does not signal missing cap marker", "NO escalation marker" in out, False)
+    set_prs({"7": {**pr(7, head=HEAD_B), "reviews": cap_reviews}})
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    check("new old-dated head signals missing cap marker", "NO escalation marker" in out, True)
+
+    # Review API failure leaves the observation persisted but does not guess verdicts.
+    reset(prs={"7": pr(7)})
+    run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    set_prs({"7": {**pr(7, head=HEAD_B), "reviews": None}})
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    check("unknown reviews yield no false stall", "reviewer never posted" in out, False)
+    watch = load_state("watchdog.json")
+    check("review failure does not erase new head clock", watch["heads"]["7"]["sha"], HEAD_B)
+    watch["heads"]["7"]["observed_at"] = time.time() - 3600
+    state_file("watchdog.json").write_text(json.dumps(watch))
+    set_prs({"7": pr(7, head=HEAD_B)})
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    check("review recovery evaluates retained clock", "reviewer never posted" in out, True)
+
+    # First-seen old PRs (including migrated state) are conservative; PRs created
+    # after arming receive a clock even if they were absent from the initial list.
+    reset(prs={})
+    run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    old = pr(7)
+    old["created_at"] = "2020-01-01T00:00:00Z"
+    new = pr(9)
+    new["created_at"] = datetime.now(timezone.utc).isoformat()
+    set_prs({"7": old, "9": new})
+    run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    heads = load_state("watchdog.json")["heads"]
+    check("first-seen old PR is baseline", heads["7"]["observed_at"], None)
+    check("post-arm new PR gets observed clock", heads["9"]["observed_at"] is not None, True)
+
+    reset(prs={"7": old})
+    state_file("watchdog.json").write_text(json.dumps({"armed_since": time.time() - 7200}))
+    run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    check("legacy watchdog state baselines unknown old head",
+          load_state("watchdog.json")["heads"]["7"]["observed_at"], None)
+
+    # A failed listing must not arm the loop or replace its head snapshot.
+    reset(prs={"7": pr(7)})
+    DATA["world"]["prs"] = None
+    save_world()
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    check("failed initial listing reports uncertainty", "could not list open PRs" in out, True)
+    check("failed initial listing does not arm", load_state("watchdog.json"), {})
+    set_prs({"7": pr(7)})
+    run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    old = load_state("watchdog.json")
+    DATA["world"]["prs"] = None
+    save_world()
+    run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    check("failed listing preserves prior snapshot", load_state("watchdog.json")["heads"], old["heads"])
+    state_file("pending.json").write_text(json.dumps({"reviewer": {
+        f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "url": "u", "reason": "busy"}}}))
+    before = len(RECEIVED)
+    run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    check("failed listing never drains queue", len(RECEIVED) - before, 0)
+    check("failed listing leaves queue intact", f"{REPO}#7" in
+          load_state("pending.json").get("reviewer", {}), True)
+
+    # A malformed arming clock cannot grant a historical grace deadline. Recovery
+    # snapshots only after a successful listing, while safe queued work still drains.
+    for bad_clock in ("not-a-timestamp", [1], True, False, 0, time.time() + 86400):
+        reset(prs={"7": pr(7), "9": pr(9, head=HEAD_B)})
+        old_clock = time.time() - 7200
+        state_file("watchdog.json").write_text(json.dumps({
+            "armed_since": bad_clock,
+            "heads": {"7": {"sha": HEAD_A, "observed_at": old_clock,
+                             "last_seen_at": old_clock}}}))
+        state_file("pending.json").write_text(json.dumps({"reviewer": {
+            f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "url": "u", "reason": "busy"},
+            f"{REPO}#9": {"at": time.time(), "head": HEAD_A, "url": "u", "reason": "stale"}}}))
+        before = len(RECEIVED)
+        started = time.time()
+        out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+        watch = load_state("watchdog.json")
+        label = repr(bad_clock)
+        check(f"{label} recovery does not crash", "watchdog failed" in out, False)
+        check(f"{label} recovery does not alert", "silent stall" in out, False)
+        check(f"{label} re-arms at recovery, not historical time",
+              isinstance(watch.get("armed_since"), (int, float)) and
+              started <= watch["armed_since"] <= time.time(), True)
+        check(f"{label} baselines existing head", watch["heads"]["7"]["observed_at"], None)
+        check(f"{label} drains authorized same head", len(RECEIVED) - before, 1)
+        check(f"{label} leaves second queued item for capacity", f"{REPO}#9" in
+              load_state("pending.json").get("reviewer", {}), True)
+        out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+        check(f"{label} next sweep does not prematurely alert", "silent stall" in out, False)
+        check(f"{label} rejects stale queued head", load_state("pending.json"), {})
+        check(f"{label} never wakes stale head", len(RECEIVED) - before, 1)
+
+    # Failed listing cannot establish a safe recovery baseline or drain.
+    reset(prs={"7": pr(7)})
+    state_file("watchdog.json").write_text(json.dumps({"armed_since": [1]}))
+    state_file("pending.json").write_text(json.dumps({"reviewer": {
+        f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "url": "u", "reason": "busy"}}}))
+    DATA["world"]["prs"] = None
+    save_world()
+    before = len(RECEIVED)
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    check("invalid arming plus failed listing reports uncertainty", "could not list open PRs" in out, True)
+    check("invalid arming plus failed listing retains state", load_state("watchdog.json")["armed_since"], [1])
+    check("invalid arming plus failed listing does not drain", len(RECEIVED) - before, 0)
+    check("invalid arming plus failed listing keeps queue", f"{REPO}#7" in
+          load_state("pending.json").get("reviewer", {}), True)
+
+    # Clock survives transient omission, draft, and close/reopen at the same SHA.
+    for absent in (None, pr(7, head=HEAD_B, draft=True), pr(7, head=HEAD_B, state="closed")):
+        reset(prs={"7": pr(7)})
+        run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+        set_prs({"7": pr(7, head=HEAD_B)})
+        run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+        watch = load_state("watchdog.json")
+        watch["heads"]["7"]["observed_at"] = time.time() - 3600
+        state_file("watchdog.json").write_text(json.dumps(watch))
+        set_prs({"7": absent} if absent is not None else {})
+        run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+        check(f"{absent and ('draft' if absent['draft'] else 'closed') or 'omitted'} retains clock",
+              load_state("watchdog.json")["heads"]["7"]["observed_at"], watch["heads"]["7"]["observed_at"])
+        set_prs({"7": pr(7, head=HEAD_B)})
+        out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+        check("return at same SHA alarms on original clock", "reviewer never posted" in out, True)
+
+    # Old noncurrent observations are pruned; malformed timestamps cannot crash a scan
+    # or masquerade as a trusted grace clock.
+    reset(prs={"7": pr(7)})
+    run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    watch = load_state("watchdog.json")
+    watch["heads"]["999"] = {"sha": HEAD_B, "observed_at": time.time() - 40 * 86400,
+                                "last_seen_at": time.time() - 40 * 86400}
+    watch["heads"]["7"]["observed_at"] = "not-a-timestamp"
+    state_file("watchdog.json").write_text(json.dumps(watch))
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    check("malformed clock never crashes scan", "watchdog failed" in out, False)
+    check("malformed clock is not a false stall", "reviewer never posted" in out, False)
+    check("aged absent observation is pruned", "999" in load_state("watchdog.json")["heads"], False)
+    # After the bounded absence, an old PR at the same SHA is not a fresh push.
+    watch = load_state("watchdog.json")
+    watch["heads"]["7"] = {"sha": HEAD_A, "observed_at": time.time() - 41 * 86400,
+                             "last_seen_at": time.time() - 40 * 86400}
+    state_file("watchdog.json").write_text(json.dumps(watch))
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    check("expired clock cannot cause a false stall", "reviewer never posted" in out, False)
+    check("expired old head is conservative baseline",
+          load_state("watchdog.json")["heads"]["7"]["observed_at"], None)
 
     # stuck state, and paused means silent
     reset(prs={})
