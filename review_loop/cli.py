@@ -68,7 +68,7 @@ def _install_routes(loop: dict) -> dict:
         routes.new_route(
             loop["adjudicator"]["route"], profile=loop["adjudicator"].get("profile", "default"),
             prompt=prompts.ADJUDICATOR, events=["pull_request"],
-            script="gate_reviewer.py", deliver=loop["adjudicator"].get("deliver", "telegram"),
+            script="gate_adjudicator.py", deliver=loop["adjudicator"].get("deliver", "telegram"),
             host=host,
             description=f"{loop['repo']} — adjudicate a loop that spent its budget")
     return names

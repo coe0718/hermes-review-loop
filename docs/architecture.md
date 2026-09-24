@@ -129,10 +129,13 @@ turns; the third `changes_requested` escalates.
 
 ## Escalation
 
-When the cap is spent, the gate writes a breach marker (keyed by PR *and* head) and POSTs at the
-adjudicator route — a route bound to the adjudicator's own profile, so the ruling happens as the
-adjudicator and not as the seat that just went quiet. One wake per head: a PR parked at sha X stays
-parked, so repeated events cannot spawn a ruling each time.
+When the cap is spent, the gate verifies the live PR head, writes a durable `delivery-pending`
+breach marker, and POSTs at the adjudicator route under a cross-process lock. A successful 2xx
+promotes it to `awaiting-adjudication`; a failed delivery remains pending for a later event or
+watchdog sweep to retry. The route is bound to the adjudicator's own profile, not the seat that
+went quiet. One accepted wake per head: repeated events cannot spawn a second ruling, and a late
+event for an older head cannot replace the current marker. After an ambiguous transport timeout,
+a retry may deliver another POST, but the adjudicator gate atomically claims only one run per head.
 
 The adjudicator is told to read both positions, rule with a reason, post the ruling on the PR, and
 **not** merge or push. The operator is the veto, not the reviewer — overriding a ruling should cost
@@ -140,8 +143,19 @@ one message, not a re-read of the whole thread.
 
 ## The watchdog's four shapes
 
-Read from GitHub every 15 minutes, against the heads that postdate the moment the loop was first
-seen armed (`armed_since`, which is what keeps a loop's history out of its alerts):
+Read from GitHub every 15 minutes. The first successful armed sweep snapshots existing PR heads
+as history. Each subsequent SHA change gets a durable first-observed timestamp in `watchdog.json`;
+the reviewer grace starts then, not at the commit's authored/committed date. A first-seen PR created
+since arming also gets a clock; an old PR first seen later is conservatively baseline-only until its
+head changes. Existing `watchdog.json` files without `heads` establish this conservative snapshot on
+their next successful sweep. Unreadable PR listings neither advance the snapshot nor drain queues;
+unreadable review lists do not produce verdict-dependent alerts. An old PR whose head changed before
+the first successful observation cannot be distinguished from an unchanged old PR without an event
+record, so it remains baseline-only until the next observed SHA change. An observation survives a
+brief omission from the listing, a draft transition, or close/reopen at the same SHA. Absent heads
+expire after 30 days since last seen; a reappearing old head after expiry is baseline-only, never
+falsely treated as a recent push. Corrupt observation clocks are also treated as unknown. The four
+shapes are:
 
 1. reviewer never posted a verdict for a quiet head;
 2. fixer never pushed after a verdict;
@@ -149,7 +163,8 @@ seen armed (`armed_since`, which is what keeps a loop's history out of its alert
 4. the cap is spent at this head with no approval and no escalation marker — i.e. *the gate did not
    fire*, which is the failure the loop cannot see about itself.
 
-It also reports stuck seats (a lock older than a run could plausibly live, a request waiting past
+It also retries pending adjudicator deliveries for current heads with a verified spent cap and
+reports stuck seats (a lock older than a run could plausibly live, a request waiting past
 the grace period) and drains the queue when it can be proven safe: the seat is free, the PR is still
 open, the head has not moved, and the verdict has not already landed. A drain that fails these
 checks drops the entry instead of firing — a stale queue entry must die quietly, not start a run
@@ -160,12 +175,17 @@ against a head that moved on.
 A finished PR gives its disk back: worktrees, build directories, probe logs, plus the loop's own
 state (locks, queue, in-flight marks, breach marker). Rails, because this deletes real directories:
 
-- only paths inside the loop's configured `roots` are considered;
+- only paths inside non-symlink configured `roots` (or the loop's artifacts directory) are
+  considered; a root's PR-like name does not attribute every child to that PR;
+- detached worktrees must be registered to this clone and inside an allowed root. Other Git
+  checkouts, nested repositories, the clone and its contents are protected even if PR-named;
 - a worktree with a **branch** checked out is never touched — that is somebody's working tree, not
   a review artifact (only detached checkouts are cleaned);
 - evidence patterns (`phase3`, `evidence`, `soak`, `release-verification`) are skipped: regenerable
   build output is not the same thing as a receipt;
-- a PR that is still open is refused; `--force` is required to override that;
+- cleanup requires a fresh GitHub lookup confirming the matching PR is closed; open, failed, and
+  malformed lookups are refused. The standalone cleanup script's explicit `--force` is the
+  operator-only override (the webhook and plugin CLI never pass it);
 - the clone itself is out of scope by construction.
 
 ## What a plugin can and cannot own

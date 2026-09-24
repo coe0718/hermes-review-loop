@@ -87,8 +87,8 @@ erase one when you run `apply`. A public GitHub webhook should use HTTPS.
 | `locks.json` | `{seat: {"repo#PR": {at, head, why}}}` — live runs per seat; `concurrency` of them may be active at once |
 | `pending.json` | `{seat: {"repo#PR": {at, head, url, reason}}}` — queued, not run |
 | `inflight.json` | `{"review:PR:sha" / "fix:PR:sha": ts}` — this head is already being handled |
-| `breach.json` | `{"repo#PR": {head, rounds, cap, reason, at, status}}` — awaiting adjudication |
-| `watchdog.json` | `armed_since` baseline, alert history, last run |
+| `breach.json` | `{"repo#PR": {head, rounds, cap, reason, at, status}}` — `delivery-pending` retries on a current-head watchdog sweep; `awaiting-adjudication` means POST accepted; `adjudicating` means the ruling run was claimed |
+| `watchdog.json` | `armed_since`, `{heads: {PR: {sha, observed_at, last_seen_at}}}` (null observation for baseline/invalid clocks; absent PR clocks retained 30 days since last seen). A missing, malformed, boolean, non-finite, or future `armed_since` re-arms at the first successful PR listing and baselines all current heads rather than trusting old observations; a failed listing leaves state and queue unchanged. Alert history and last run are also stored here. |
 | `watchdog.log` | one line per sweep, and per breach |
 | `artifacts/<PR>/<seat>/` | where a run must keep its worktrees, build dirs and logs — per PR *and* per seat, so the two never share a checkout |
 

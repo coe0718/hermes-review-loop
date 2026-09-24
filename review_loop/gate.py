@@ -117,9 +117,9 @@ def loop_block(loop: dict, number: int, head: str, workspace: dict | None = None
 def fetch_reviews(loop: dict, number: int):
     """The verdict list, or silence. A loop that cannot count its rounds must not guess one."""
     reviews = gh.reviews(loop, number)
-    if reviews is None:
-        silence("could not read the review list — not guessing the round count")
-    return reviews if isinstance(reviews, list) else []
+    if not isinstance(reviews, list):
+        silence("could not read a valid review list — not guessing the round count")
+    return reviews
 
 
 def is_reviewer(review: dict, loop: dict) -> bool:
@@ -140,7 +140,9 @@ def verdicts(reviews: list, loop: dict, exclude_id=None) -> list:
 
 
 def reviewed_at_head(reviews: list, loop: dict, head: str) -> bool:
+    """A submitted verdict at this head, not a comment, draft, or dismissed review."""
     return any(is_reviewer(r, loop) and r.get("commit_id") == head
+               and gh.review_state(r) in {"APPROVED", "CHANGES_REQUESTED"}
                for r in reviews if isinstance(r, dict))
 
 
@@ -186,40 +188,55 @@ def reclaim(loop: dict, number: int, state: str) -> None:
         log(f"cleanup failed for #{number}: {exc}")
 
 
-def wake_adjudicator(loop: dict, number: int, head: str, rounds: int, reason: str) -> None:
+def wake_adjudicator(loop: dict, number: int, head: str, rounds: int, reason: str) -> bool:
     """Hand a stalled PR to the adjudicator seat — a route bound to its own profile.
 
     The rule the adjudicator is given: read the two positions, rule, and do not merge. The
-    marker written by the caller stays the audit trail if this POST never lands.
+    pending marker written by the caller stays retryable if this POST fails.
     """
     target = routes.target(loop["adjudicator"]["route"], loop.get("host"))
     if not target:
         log("no adjudicator route — the breach marker is the only record")
-        return
+        return False
     payload = {"repository": {"full_name": loop["repo"]},
+               "action": "review_loop_breach", "number": number,
                "_loop": {**loop_block(loop, number, head, round=rounds, reason=reason),
                          "role": "adjudicator"}}
-    if routes.fire(loop["adjudicator"]["route"], "pull_request", payload,
-                   f"breach-{number}", loop.get("host")):
+    delivered = routes.fire(loop["adjudicator"]["route"], "pull_request", payload,
+                            f"breach-{number}", loop.get("host"))
+    if delivered:
         log(f"adjudicator woken for #{number}")
+    return delivered
 
 
 def breach(loop: dict, st: state_mod.LoopState, number: int, head: str, rounds: int,
            reason: str) -> None:
-    prior = st.breach_set(number, {
+    entry = {
         "pr": number, "head": head, "rounds": rounds, "cap": loop["cap"],
         "reason": reason, "at": now_iso(), "status": "awaiting-adjudication",
-    })
-    st.note(f"breach {loop['repo']}#{number} at {head[:7]}: {reason}")
-    # One wake per head: a PR already parked at this sha stays parked, so repeated events
-    # cannot spawn an adjudication run each time. A new head is a new escalation.
-    if prior.get("status") == "awaiting-adjudication" and prior.get("head") == head:
-        log(f"#{number} already awaiting adjudication at {head[:7]} — not re-waking")
-        return
-    if not loop.get("adjudicator", {}).get("route"):
-        log("no adjudicator configured — marker written, nothing woken")
-        return
-    wake_adjudicator(loop, number, head, rounds, reason)
+    }
+
+    def current_head() -> bool:
+        # Both gate payloads can arrive late. Recheck GitHub inside the breach
+        # lock so a delayed A cannot overwrite an already parked B.
+        current = gh.pr(loop, number)
+        return (isinstance(current, dict) and current.get("number") == number
+                and current.get("state") == "open" and not current.get("draft")
+                and (current.get("base") or {}).get("ref") == loop["base"]
+                and ((current.get("user") or {}).get("login") or "").lower() in loop["fixers"]
+                and (current.get("head") or {}).get("sha") == head)
+
+    route = loop.get("adjudicator", {}).get("route")
+    outcome = st.breach_deliver(number, entry, current_head,
+                                lambda marker: wake_adjudicator(loop, number, head,
+                                                                marker["rounds"], marker["reason"])
+                                if route else True)
+    if outcome == "new":
+        st.note(f"breach {loop['repo']}#{number} at {head[:7]}: {reason}")
+        if not route:
+            log("no adjudicator configured — marker written, nothing woken")
+    elif outcome == "stale":
+        log(f"#{number} @ {head[:7]} no longer current — not escalating")
 
 
 def ping_start(loop: dict, seat: str, text: str) -> None:

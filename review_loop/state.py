@@ -15,9 +15,14 @@ Two rules the shapes below encode:
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
+import os
 import pathlib
+import tempfile
 import time
+from collections.abc import Callable
 
 from . import config
 from .util import log
@@ -164,16 +169,100 @@ class LoopState:
 
     # -- breach markers -----------------------------------------------------
 
+    @contextlib.contextmanager
+    def _breach_lock(self):
+        self.dir.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self.dir / "breach.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    def _breach_save(self, data: dict) -> None:
+        """Persist a claim before releasing the lock or allowing the route to fire."""
+        name = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", dir=self.dir, prefix=".breach-",
+                                             delete=False) as file:
+                name = file.name
+                json.dump(data, file, indent=2)
+                file.flush()
+                os.fsync(file.fileno())
+            os.replace(name, self.breach)
+            directory = os.open(self.dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            if name and os.path.exists(name):
+                os.unlink(name)
+
     def breach_get(self, number: int) -> dict:
         return (self._load(self.breach, {}) or {}).get(f"{self.loop['repo']}#{number}") or {}
 
     def breach_set(self, number: int, entry: dict) -> dict:
-        data = self._load(self.breach, {}) or {}
         key = f"{self.loop['repo']}#{number}"
-        prior = data.get(key) or {}
-        data[key] = entry
-        self._save(self.breach, data)
-        return prior
+        with self._breach_lock():
+            data = self._load(self.breach, {}) or {}
+            prior = data.get(key) or {}
+            # Duplicate cap events cannot re-arm an already claimed head.
+            if prior.get("head") == entry.get("head"):
+                return prior
+            data[key] = entry
+            self._breach_save(data)
+            return prior
+
+    def breach_deliver(self, number: int, entry: dict, current: Callable[[], bool],
+                       send: Callable[[dict], bool]) -> str:
+        """Persist pending before POST; serialize validation and delivery per loop.
+
+        A 2xx promotes pending to awaiting, while a failed POST stays retryable.
+        The lock covers the network call: cooperating gateways cannot deliver
+        twice or let an older event replace a newer marker between checks.
+        """
+        key = f"{self.loop['repo']}#{number}"
+        head = entry["head"]
+        with self._breach_lock():
+            if not current():
+                return "stale"
+            data = self._load(self.breach, {}) or {}
+            prior = data.get(key) or {}
+            if prior.get("head") == head and prior.get("status") != "delivery-pending":
+                return "already"
+            new = prior.get("head") != head
+            if new:
+                data[key] = {**entry, "status": "delivery-pending"}
+                self._breach_save(data)
+            # Pending may be left by an earlier crashed process. Keep its
+            # original reason/rounds for the signed wake and audit marker.
+            marker = data[key]
+            try:
+                delivered = send(marker)
+            except Exception as exc:
+                log(f"adjudicator delivery failed: {exc}")
+                delivered = False
+            if delivered:
+                data[key] = {**marker, "status": "awaiting-adjudication"}
+                self._breach_save(data)
+            return "new" if new else "retry"
+
+
+    def breach_claim(self, number: int, head: str) -> dict | None:
+        """Claim exactly one wake for this PR/head across gateway processes."""
+        key = f"{self.loop['repo']}#{number}"
+        with self._breach_lock():
+            data = self._load(self.breach, {}) or {}
+            marker = data.get(key)
+            if (not isinstance(marker, dict) or marker.get("pr") != number
+                    or marker.get("head") != head
+                    or marker.get("status") != "awaiting-adjudication"):
+                return None
+            data[key] = {**marker, "status": "adjudicating"}
+            self._breach_save(data)
+            return marker
 
     def breach_all(self) -> dict:
         return self._load(self.breach, {}) or {}

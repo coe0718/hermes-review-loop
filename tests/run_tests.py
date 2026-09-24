@@ -17,7 +17,9 @@ Runs with a plain interpreter and no network — no ``gh``, no pytest, no GitHub
 from __future__ import annotations
 
 import argparse
+import atexit
 import contextlib
+import importlib.util
 import hashlib
 import hmac
 import io
@@ -28,16 +30,22 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from types import SimpleNamespace
 from typing import Any
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-TMP = ROOT / "tests" / ".tmp"
+# Fixtures must not inherit the source checkout's Git owner: cleanup correctly
+# refuses to delete artifacts under an unrelated repository, even a test repo.
+TMP = pathlib.Path(tempfile.mkdtemp(prefix="review-loop-tests-", dir=os.environ.get("TMPDIR")))
+atexit.register(shutil.rmtree, TMP, ignore_errors=True)
 LOOPS_DIR = TMP / "loops"
 STATE_DIR = TMP / "state"
 REVIEWS = TMP / "reviews"
@@ -392,12 +400,51 @@ def group_reviewer_gate() -> None:
     check("an unknown action is silent", run("gate_reviewer.py", pr_payload(action="labeled"))[0],
           "SILENT")
 
+    # A delayed request must not resurrect a closed, deleted, or advanced PR,
+    # even if its webhook snapshot still describes a valid open head.
+    for label, current in (("closed", pr(7, state="closed")),
+                           ("missing", None), ("superseded", pr(7, head=HEAD_B)),
+                           ("draft", pr(7, draft=True)),
+                           ("retargeted", pr(7, base="release")),
+                           ("transferred", pr(7, author="outsider"))):
+        reset(prs={"7": current} if current else {})
+        state_file("locks.json").write_text(json.dumps({"fixer": {
+            f"{REPO}#7": {"at": time.time(), "head": HEAD_A}}}))
+        check(f"delayed request for {label} PR is silent",
+              run("gate_reviewer.py", pr_payload())[0], "SILENT")
+        check(f"  {label} PR did not release fixer",
+              f"{REPO}#7" in load_state("locks.json").get("fixer", {}), True)
+        check(f"  {label} PR did not claim reviewer",
+              load_state("locks.json").get("reviewer", {}), {})
+    reset(prs={"7": pr(7)})
+    check("failed fresh PR lookup is silent",
+          run("gate_reviewer.py", pr_payload(),
+              extra_env={"REVIEW_LOOP_GH_STUB": "/bin/false"})[0], "SILENT")
+
     # a head that already has a verdict from a reviewer
     reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER)]}})
     check("head already reviewed → silent", run("gate_reviewer.py", pr_payload())[0], "SILENT")
 
+    # Only a submitted verdict closes this head. COMMENTED is an ordinary review
+    # comment, PENDING is not submitted, and DISMISSED has lost its verdict.
+    for state in ("COMMENTED", "PENDING", "DISMISSED"):
+        reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, state=state)]}})
+        kind, out, _ = run("gate_reviewer.py", pr_payload())
+        check(f"{state} at head does not suppress review_requested", kind, "FIRE")
+        if kind == "FIRE":
+            check(f"  {state} does not spend a round", json.loads(out)["_loop"]["round"], 1)
+
+    for state in ("APPROVED", "CHANGES_REQUESTED"):
+        reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, state=state)]}})
+        check(f"{state} at head suppresses duplicate request",
+              run("gate_reviewer.py", pr_payload())[0], "SILENT")
+
+    reset(prs={"7": {**pr(7), "reviews": [review("unconfigured", state="APPROVED")]}})
+    check("unconfigured reviewer's verdict does not suppress request",
+          run("gate_reviewer.py", pr_payload())[0], "FIRE")
+
     # an approved head
-    reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, state="approved")]}})
+    reset(prs={"7": {**pr(7, head=HEAD_B), "reviews": [review(REVIEWER, state="approved")]}})
     check("new commit after a verdict fires",
           run("gate_reviewer.py", pr_payload(head=HEAD_B))[0], "FIRE")
 
@@ -405,7 +452,25 @@ def group_reviewer_gate() -> None:
     reset(prs={"7": pr(7)})
     kind, _, err = run("gate_reviewer.py", pr_payload(), extra_env={"REVIEW_LOOP_GH_STUB": "/bin/false"})
     check("unreadable review list → silent (never guess)", kind, "SILENT")
-    check("  and it says why", "not guessing" in err, True)
+    check("  and it says why", "unavailable" in err or "not guessing" in err, True)
+
+    # A syntactically valid but wrong-shaped API response is still an unknown
+    # round count. It must not release an already occupied reviewer seat.
+    reset(prs={"7": {**pr(7), "reviews": {"message": "bad response"}}})
+    state_file("locks.json").write_text(json.dumps({"fixer": {
+        f"{REPO}#7": {"at": time.time(), "head": HEAD_A}}}))
+    check("object review list fails closed", run("gate_reviewer.py", pr_payload())[0], "SILENT")
+    check("  malformed list keeps fixer seat", f"{REPO}#7" in
+          load_state("locks.json").get("fixer", {}), True)
+    check("  malformed list never claims reviewer seat",
+          load_state("locks.json").get("reviewer", {}), {})
+    reset(prs={"7": {**pr(7), "reviews": {"message": "bad response"}}})
+    state_file("locks.json").write_text(json.dumps({"reviewer": {
+        f"{REPO}#7": {"at": time.time(), "head": HEAD_A}}}))
+    check("fixer refuses malformed review list",
+          run("gate_fixer.py", review_payload())[0], "SILENT")
+    check("  malformed list keeps reviewer seat", f"{REPO}#7" in
+          load_state("locks.json").get("reviewer", {}), True)
 
 
 def group_settings() -> None:
@@ -547,6 +612,213 @@ def group_budget() -> None:
     check("  round number is 1", json.loads(out)["_loop"]["round"], 1)
     check("  verdict carried in _loop", json.loads(out)["_loop"]["verdict"], "changes_requested")
 
+def group_adjudicator() -> None:
+    """Exercise installed route, signed breach POST, gateway filter, and rendered run."""
+    from review_loop import cli, config, prompts
+
+    section("adjudicator — signed breach becomes a ruling run, not a reviewer run")
+    reset(prs={"7": {**pr(7, head=HEAD_B), "reviews": [
+        review(REVIEWER, head=ch, rid=i) for i, ch in enumerate("cde", 1)]}})
+    loop = config.load_id("widgets")
+    cli._install_routes(loop)
+    subscriptions = json.loads(SUBS.read_text())
+    route = subscriptions["widgets-breach"]
+    check("installed adjudicator uses its own script", route["script"], "gate_adjudicator.py")
+    check("installed adjudicator uses ruling prompt", route["prompt"] == prompts.ADJUDICATOR, True)
+    check("installed adjudicator uses its own profile", route["profile"], "default")
+
+    kind, _, _ = run("gate_reviewer.py", pr_payload(head=HEAD_B))
+    check("cap still prevents fourth review", kind, "SILENT")
+    wake = RECEIVED[-1] if RECEIVED else {}
+    check("breach reaches configured adjudicator route", wake.get("path"), "/webhooks/widgets-breach")
+    body = (wake.get("body") or "").encode()
+    sig = "sha256=" + hmac.new(route["secret"].encode(), body, hashlib.sha256).hexdigest()
+    check("gateway authenticates signed POST", hmac.compare_digest(wake.get("sig", ""), sig), True)
+    check("gateway event matches subscription", wake.get("event") in route["events"], True)
+    payload = json.loads(body) if body else {}
+    forged = {**payload, "_loop": {**payload["_loop"], "reason": "forged ruling", "round": 100}}
+    outcome, out, _ = run(route["script"], forged)
+    check("gateway script starts adjudication despite untrusted descriptions", outcome, "FIRE")
+    if outcome == "FIRE":
+        check("reason comes from marker, not POST", "forged ruling" in json.loads(out)["_loop"]["reason"], False)
+        check("round comes from marker, not POST", json.loads(out)["_loop"]["round"], 3)
+    check("signed wake replay does not start a second ruling run",
+          run(route["script"], payload)[0], "SILENT")
+    check("marker records consumed head",
+          load_state("breach.json")[f"{REPO}#7"].get("status"), "adjudicating")
+    before = len(RECEIVED)
+    run("gate_reviewer.py", pr_payload(head=HEAD_B))
+    check("another cap event cannot re-arm consumed head", len(RECEIVED) - before, 0)
+    check("consumed marker survives duplicate cap event",
+          load_state("breach.json")[f"{REPO}#7"].get("status"), "adjudicating")
+    if outcome == "FIRE":
+        accepted = json.loads(out)
+        check("gate confirms adjudicator role", accepted["_loop"]["role"], "adjudicator")
+        check("gate confirms PR and head", (accepted["_loop"]["pr"], accepted["_loop"]["head"]),
+              (7, HEAD_B))
+        rendered = re.sub(r"\{([^{}]+)\}", lambda m: str(
+            (accepted.get("_loop") or {}).get(m[1].removeprefix("_loop."), m[0])), route["prompt"])
+        check("ruling prompt reaches agent, not reviewer prompt",
+              "PR #7 stopped and needs a ruling" in rendered and "Do **not** merge" in rendered,
+              True)
+        check("ruling prompt has no unresolved slots", "{_loop." in rendered, False)
+    check("reviewer gate refuses breach payload", run("gate_reviewer.py", payload)[0], "SILENT")
+    check("adjudicator refuses normal review request", run(route["script"], pr_payload())[0], "SILENT")
+    check("adjudicator refuses another repository",
+          run(route["script"], {**payload, "repository": {"full_name": "other/repo"}})[0], "SILENT")
+    check("adjudicator refuses mismatched marker head",
+          run(route["script"], {**payload, "_loop": {**payload.get("_loop", {}), "head": HEAD_A}})[0], "SILENT")
+    check("adjudicator refuses forged PR number",
+          run(route["script"], {**payload, "number": 9})[0], "SILENT")
+    check("adjudicator refuses unreadable GitHub state",
+          run(route["script"], payload, extra_env={"REVIEW_LOOP_GH_STUB": "/bin/false"})[0], "SILENT")
+    set_prs({"7": {**pr(7, head=HEAD_A), "reviews": DATA["world"]["prs"]["7"]["reviews"]}})
+    check("adjudicator refuses a moved head", run(route["script"], payload)[0], "SILENT")
+    set_prs({"7": {**pr(7, head=HEAD_B), "reviews": []}})
+    check("adjudicator refuses a cap no longer spent", run(route["script"], payload)[0], "SILENT")
+    state_file("breach.json").write_text("{}")
+    check("adjudicator refuses absent marker", run(route["script"], payload)[0], "SILENT")
+
+    # Invalid delivery cannot consume the claim; after facts recover a real
+    # signed wake fires once. Simultaneous redeliveries must have one winner.
+    from concurrent.futures import ThreadPoolExecutor
+    reset(prs={"7": {**pr(7, head=HEAD_B), "reviews": [
+        review(REVIEWER, head=ch, rid=i) for i, ch in enumerate("cde", 1)]}})
+    cli._install_routes(config.load_id("widgets"))
+    run("gate_reviewer.py", pr_payload(head=HEAD_B))
+    pending = json.loads(RECEIVED[-1]["body"])
+    set_prs({"7": {**pr(7, head=HEAD_A), "reviews": DATA["world"]["prs"]["7"]["reviews"]}})
+    check("stale wake leaves claim pending", run(route["script"], pending)[0], "SILENT")
+    check("stale wake does not consume marker",
+          load_state("breach.json")[f"{REPO}#7"]["status"], "awaiting-adjudication")
+    set_prs({"7": {**pr(7, head=HEAD_B), "reviews": DATA["world"]["prs"]["7"]["reviews"]}})
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        outcomes = list(pool.map(lambda _: run(route["script"], pending)[0], range(4)))
+    check("concurrent signed wakes start exactly one run", outcomes.count("FIRE"), 1)
+    check("concurrent wake claim remains consumed", run(route["script"], pending)[0], "SILENT")
+
+    # A new head after the ruling is a separate escalation, not suppressed by
+    # the old consumed marker.
+    new_head = "f" * 40
+    set_prs({"7": {**pr(7, head=new_head), "reviews": DATA["world"]["prs"]["7"]["reviews"]}})
+    before = len(RECEIVED)
+    run("gate_reviewer.py", pr_payload(head=new_head))
+    check("new head creates new adjudicator wake", len(RECEIVED) - before, 1)
+    check("new head is claimable", run(route["script"], json.loads(RECEIVED[-1]["body"]))[0], "FIRE")
+
+    # The review-verdict trigger must take the same authenticated route to the
+    # ruling run; the old suite checked only that its HTTP POST succeeded.
+    reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, rid=i) for i in (5, 6, 7)]}})
+    cli._install_routes(config.load_id("widgets"))
+    check("fixer gate refuses cap-spending verdict", run("gate_fixer.py", review_payload(rid=7))[0],
+          "SILENT")
+    wake = RECEIVED[-1]
+    route = json.loads(SUBS.read_text())["widgets-breach"]
+    check("fixer-triggered breach reaches ruling run", run(route["script"], json.loads(wake["body"]))[0],
+          "FIRE")
+
+    section("adjudicator — failed delivery retries and delayed heads cannot regress")
+    reviews = [review(REVIEWER, head=ch * 40, rid=i) for i, ch in enumerate("cde", 1)]
+    reset(prs={"7": {**pr(7, head=HEAD_A), "reviews": reviews}})
+    # Refuse the first POST at the transport layer; the marker must stay
+    # retryable rather than pretending the adjudicator received it.
+    cfg = json.loads((LOOPS_DIR / "widgets.json").read_text())
+    cfg["host"] = "http://127.0.0.1:9"
+    (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
+    check("failed POST leaves gate silent", run("gate_reviewer.py", pr_payload())[0], "SILENT")
+    check("failed POST leaves retryable marker",
+          load_state("breach.json")[f"{REPO}#7"].get("status"), "delivery-pending")
+    check("failed POST delivered nothing", len(RECEIVED), 0)
+    cfg["host"] = HOST
+    (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
+    before = len(RECEIVED)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(lambda _: run("gate_reviewer.py", pr_payload())[0], range(4)))
+    check("concurrent recovery delivers exactly once", len(RECEIVED) - before, 1)
+    check("recovered marker is claimable", run(route["script"],
+          json.loads(RECEIVED[-1]["body"]))[0], "FIRE")
+
+    # B is the current head and has been escalated. An A event arriving late
+    # cannot replace its marker or send a second POST for stale A.
+    set_prs({"7": {**pr(7, head=HEAD_B), "reviews": reviews}})
+    run("gate_reviewer.py", pr_payload(head=HEAD_B))
+    before = len(RECEIVED)
+    check("B marker installed", load_state("breach.json")[f"{REPO}#7"]["head"], HEAD_B)
+    run("gate_reviewer.py", pr_payload(head=HEAD_A))
+    check("delayed A cannot displace B", load_state("breach.json")[f"{REPO}#7"]["head"], HEAD_B)
+    check("delayed A cannot POST", len(RECEIVED) - before, 0)
+    check("B wake remains claimable", run(route["script"],
+          json.loads(RECEIVED[-1]["body"]))[0], "FIRE")
+
+    # The fixer gate takes its head from an old webhook, so unlike the
+    # reviewer request it has no earlier fresh-PR guard.
+    reset(prs={"7": {**pr(7, head=HEAD_A), "reviews": reviews}})
+    run("gate_fixer.py", review_payload(head=HEAD_A, rid=3))
+    set_prs({"7": {**pr(7, head=HEAD_B), "reviews": reviews}})
+    run("gate_fixer.py", review_payload(head=HEAD_B, rid=3))
+    before = len(RECEIVED)
+    run("gate_fixer.py", review_payload(head=HEAD_A, rid=3))
+    check("delayed fixer A cannot replace B",
+          load_state("breach.json")[f"{REPO}#7"]["head"], HEAD_B)
+    check("delayed fixer A does not deliver", len(RECEIVED) - before, 0)
+
+    # No new webhook is needed: the periodic sweep recovers a persisted
+    # pending marker after the endpoint comes back.
+    reset(prs={"7": {**pr(7, head=HEAD_B), "reviews": reviews}})
+    cfg = json.loads((LOOPS_DIR / "widgets.json").read_text())
+    cfg["host"] = "http://127.0.0.1:9"
+    (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
+    run("gate_reviewer.py", pr_payload(head=HEAD_B))
+    cfg["host"] = HOST
+    (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets")
+    check("first armed sweep delivers pending breach without another webhook", len(RECEIVED), 1)
+    check("first armed sweep does not report a stall", "silent stall" in out, False)
+    check("sweep marks successful delivery",
+          load_state("breach.json")[f"{REPO}#7"]["status"], "awaiting-adjudication")
+    run("watchdog.py", None, "--loop", "widgets")
+    check("subsequent sweep does not redeliver", len(RECEIVED), 1)
+
+    # Unknown reviews/listing cannot authorize delivery; neither can an
+    # approval, a cap that is no longer spent, or a moved head.
+    for label, candidate in (("unreadable reviews", {**pr(7, head=HEAD_B), "reviews": None}),
+                             ("below cap", {**pr(7, head=HEAD_B), "reviews": reviews[:2]}),
+                             ("approved", {**pr(7, head=HEAD_B), "reviews": reviews +
+                                           [review(REVIEWER, head=HEAD_B, rid=8, state="APPROVED")]}),
+                             ("moved head", {**pr(7, head=HEAD_A), "reviews": reviews})):
+        reset(prs={"7": {**pr(7, head=HEAD_B), "reviews": reviews}})
+        cfg = json.loads((LOOPS_DIR / "widgets.json").read_text())
+        cfg["host"] = "http://127.0.0.1:9"
+        (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
+        run("gate_reviewer.py", pr_payload(head=HEAD_B))
+        cfg["host"] = HOST
+        (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
+        set_prs({"7": candidate})
+        out, _, _ = run("watchdog.py", None, "--loop", "widgets")
+        check(f"{label} does not deliver pending", len(RECEIVED), 0)
+        check(f"{label} retains pending marker", load_state("breach.json")[f"{REPO}#7"]["status"],
+              "delivery-pending")
+        check(f"{label} first sweep has no false stall", "silent stall" in out, False)
+        if label == "unreadable reviews":
+            set_prs({"7": {**pr(7, head=HEAD_B), "reviews": reviews}})
+            run("watchdog.py", None, "--loop", "widgets")
+            check("review recovery retries pending POST", len(RECEIVED), 1)
+
+    reset(prs={"7": {**pr(7, head=HEAD_B), "reviews": reviews}})
+    cfg = json.loads((LOOPS_DIR / "widgets.json").read_text())
+    cfg["host"] = "http://127.0.0.1:9"
+    (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
+    run("gate_reviewer.py", pr_payload(head=HEAD_B))
+    cfg["host"] = HOST
+    (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets",
+                    extra_env={"REVIEW_LOOP_GH_STUB": "/bin/false"})
+    check("failed listing leaves pending marker", load_state("breach.json")[f"{REPO}#7"]["status"],
+          "delivery-pending")
+    check("failed listing does not POST", len(RECEIVED), 0)
+    run("watchdog.py", None, "--loop", "widgets")
+    check("listing recovery retries pending POST", len(RECEIVED), 1)
+
 
 def group_fixer_gate() -> None:
     section("fixer gate — only a verdict it must answer")
@@ -668,6 +940,7 @@ def group_parallel() -> None:
 
     # the same PR never gets two runs, even with a free slot
     state_file("inflight.json").write_text("{}")
+    set_prs({"7": pr(7, head=HEAD_B), "9": pr(9, head=head), "11": pr(11, head=head)})
     kind, _, err = run("gate_reviewer.py", pr_payload(7, head=HEAD_B))
     check("same PR twice → refused", kind, "SILENT")
     check("  and it says why", "already running" in err, True)
@@ -695,7 +968,7 @@ def group_parallel() -> None:
     check("  nothing fired", len(RECEIVED) - before, 0)
 
     # an unisolatable run is queued, never started beside another
-    reset(prs={"7": pr(7), "9": pr(9)})
+    reset(prs={"7": pr(7), "9": pr(9, head=HEAD_B)})
     set_concurrency(2)
     state_file("locks.json").write_text(json.dumps({"reviewer": {}}))
     kind, _, err = run("gate_reviewer.py", pr_payload(9, head=HEAD_B))
@@ -1131,6 +1404,43 @@ def group_watchdog() -> None:
     check("  signature is valid for that route", verify_sig(RECEIVED[-1], "widgets-review"), True)
     check("  queue is now empty", load_state("pending.json"), {})
 
+    # A queued A must not turn into a synthetic request for B. A fresh event can
+    # subsequently enqueue B, but the stale request has no authority to wake it.
+    for seat, reviews in (("reviewer", []), ("fixer", [review(REVIEWER, head=HEAD_B)])):
+        reset(prs={"7": {**pr(7, head=HEAD_B), "reviews": reviews}})
+        state_file("pending.json").write_text(json.dumps({seat: {
+            f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "url": "u", "reason": "busy"}}}))
+        before = len(RECEIVED)
+        out, _, _ = run("watchdog.py", None, "--loop", "widgets", "--drain", "--seat", seat)
+        check(f"stale {seat} A queue never wakes B", len(RECEIVED) - before, 0)
+        check(f"stale {seat} A queue is discarded", load_state("pending.json"), {})
+        check(f"stale {seat} queue is not reported started", "started the queued run" in out, False)
+    # An unreadable PR leaves the queue alone for a later safe retry.
+    reset(prs={"7": pr(7, head=HEAD_B)})
+    state_file("pending.json").write_text(json.dumps({"reviewer": {
+        f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "url": "u", "reason": "busy"}}}))
+    run("watchdog.py", None, "--loop", "widgets", "--drain", "--seat", "reviewer",
+        extra_env={"REVIEW_LOOP_GH_STUB": "/bin/false"})
+    check("unreadable fresh PR keeps queue for retry", f"{REPO}#7" in
+          load_state("pending.json").get("reviewer", {}), True)
+    # A genuinely new B request is independently eligible, rather than inheriting A.
+    state_file("pending.json").write_text(json.dumps({"reviewer": {
+        f"{REPO}#7": {"at": time.time(), "head": HEAD_B, "url": "u", "reason": "fresh"}}}))
+    before = len(RECEIVED)
+    run("watchdog.py", None, "--loop", "widgets", "--drain", "--seat", "reviewer")
+    check("fresh B request is woken", len(RECEIVED) - before, 1)
+    check("fresh B wake carries B", json.loads(RECEIVED[-1]["body"])["pull_request"]["head"]["sha"], HEAD_B)
+
+    # A readable but malformed reviews response is not evidence of zero verdicts.
+    reset(prs={"7": {**pr(7), "reviews": {"message": "not a review list"}}})
+    state_file("pending.json").write_text(json.dumps({"reviewer": {
+        f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "url": "u", "reason": "busy"}}}))
+    before = len(RECEIVED)
+    run("watchdog.py", None, "--loop", "widgets", "--drain", "--seat", "reviewer")
+    check("malformed review list never wakes queued reviewer", len(RECEIVED) - before, 0)
+    check("malformed review list retains queue for retry",
+          f"{REPO}#7" in load_state("pending.json").get("reviewer", {}), True)
+
     # a queued request for a head that was already reviewed dies quietly
     reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER)]}})
     state_file("pending.json").write_text(json.dumps(
@@ -1140,6 +1450,21 @@ def group_watchdog() -> None:
     check("already-reviewed queue entry is dropped", len(RECEIVED) - before, 0)
     check("  and removed from the queue", load_state("pending.json"), {})
 
+    for state in ("COMMENTED", "PENDING", "DISMISSED", "APPROVED", "CHANGES_REQUESTED"):
+        reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, state=state)]}})
+        state_file("pending.json").write_text(json.dumps(
+            {"reviewer": {f"{REPO}#7": {"at": time.time(), "head": HEAD_A,
+                                         "url": "u", "reason": "busy"}}}))
+        before = len(RECEIVED)
+        run("watchdog.py", None, "--loop", "widgets", "--drain", "--seat", "reviewer")
+        expected = state in ("COMMENTED", "PENDING", "DISMISSED")
+        check(f"queued review with {state} {'fires' if expected else 'drops'}",
+              len(RECEIVED) - before, 1 if expected else 0)
+        check(f"  {state} queue entry cleared", load_state("pending.json"), {})
+        if expected and len(RECEIVED) > before:
+            check(f"  {state} wake targets requested head",
+                  json.loads(RECEIVED[-1]["body"])["pull_request"]["head"]["sha"], HEAD_A)
+
     # a full seat fires nothing
     reset(prs={"7": pr(7)})
     state_file("locks.json").write_text(json.dumps(
@@ -1148,6 +1473,51 @@ def group_watchdog() -> None:
         {"reviewer": {f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "url": "u", "reason": "capacity"}}}))
     out, _, _ = run("watchdog.py", None, "--loop", "widgets", "--drain", "--seat", "reviewer")
     check("full seat drains nothing", "at capacity (1/1" in out, True)
+
+    # An ordinary armed sweep must drain after a lock expires even without an alert.
+    reset(prs={"7": pr(7), "9": pr(9)})
+    state_file("watchdog.json").write_text(json.dumps({"armed_since": time.time() - 60}))
+    state_file("locks.json").write_text(json.dumps({"reviewer": {
+        f"{REPO}#9": {"at": time.time() - 46 * 60, "head": HEAD_B, "why": "expired"}}}))
+    state_file("pending.json").write_text(json.dumps({"reviewer": {
+        f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "url": "u", "reason": "capacity"}}}))
+    before = len(RECEIVED)
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets",
+                    extra_env={"REVIEW_LOOP_TEST": ""})
+    check("zero-alert sweep wakes queued PR after lock expiry", len(RECEIVED) - before, 1)
+    check("  the eligible PR was woken", json.loads(RECEIVED[-1]["body"])["number"] if RECEIVED else None, 7)
+    check("  no stall warning is required", "silent stall" in out or "stuck state" in out, False)
+    check("  queue is cleared", load_state("pending.json"), {})
+    check("  expired lock is cleared", load_state("locks.json"), {})
+    before = len(RECEIVED)
+    run("watchdog.py", None, "--loop", "widgets", extra_env={"REVIEW_LOOP_TEST": ""})
+    check("  repeated sweep does not wake twice", len(RECEIVED) - before, 0)
+
+    # A spare slot must not wake a PR already held by that seat.
+    reset(prs={"7": pr(7)})
+    set_concurrency(2)
+    state_file("watchdog.json").write_text(json.dumps({"armed_since": time.time() - 60}))
+    state_file("locks.json").write_text(json.dumps({"reviewer": {
+        f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "why": "working"}}}))
+    state_file("pending.json").write_text(json.dumps({"reviewer": {
+        f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "url": "u", "reason": "busy"}}}))
+    before = len(RECEIVED)
+    run("watchdog.py", None, "--loop", "widgets", extra_env={"REVIEW_LOOP_TEST": ""})
+    check("spare slot does not re-wake an active PR", len(RECEIVED) - before, 0)
+    check("  active PR stays queued for its handoff", f"{REPO}#7" in
+          load_state("pending.json").get("reviewer", {}), True)
+    check("  existing slot remains held", len(load_state("locks.json").get("reviewer", {})), 1)
+
+    # The fixer seat also drains without a fresh stall, but only with an eligible verdict.
+    reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER)]}})
+    state_file("watchdog.json").write_text(json.dumps({"armed_since": time.time() - 60}))
+    state_file("pending.json").write_text(json.dumps({"fixer": {
+        f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "url": "u", "reason": "busy"}}}))
+    before = len(RECEIVED)
+    run("watchdog.py", None, "--loop", "widgets", extra_env={"REVIEW_LOOP_TEST": ""})
+    check("zero-alert sweep drains eligible fixer", len(RECEIVED) - before, 1)
+    check("  fixer route received the verdict", RECEIVED[-1]["event"], "pull_request_review")
+    check("  fixer queue cleared", load_state("pending.json"), {})
 
     # shape 1: the reviewer never posted a verdict
     reset(prs={"7": pr(7, head=HEAD_A)})
@@ -1182,6 +1552,186 @@ def group_watchdog() -> None:
     state_file("watchdog.json").write_text(json.dumps({"armed_since": time.time() - 86400}))
     out, _, _ = run("watchdog.py", None, "--loop", "widgets")
     check("stall: cap spent, no escalation marker", "NO escalation marker" in out, True)
+
+    # Real grace/baseline mode (not REVIEW_LOOP_TEST's zero-grace bypass).
+    normal = {"REVIEW_LOOP_TEST": ""}
+    reset(prs={"7": pr(7)})
+    DATA["world"]["commit_dates"] = {HEAD_A: "2020-01-01T00:00:00Z",
+                                       HEAD_B: "2020-01-01T00:00:00Z"}
+    save_world()
+    run("watchdog.py", None, "--loop", "widgets", extra_env=normal)  # arm with old head
+    watch = load_state("watchdog.json")
+    check("arming snapshots the existing head", watch.get("heads", {}).get("7", {}).get("sha"), HEAD_A)
+    watch["armed_since"] = time.time() - 7200
+    state_file("watchdog.json").write_text(json.dumps(watch))
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    check("old PR at original head is not a stall", "reviewer never posted" in out, False)
+    set_prs({"7": pr(7, head=HEAD_B)})
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    watch = load_state("watchdog.json")
+    check("changed old-dated head gets observation clock", watch.get("heads", {}).get("7", {}).get("sha"), HEAD_B)
+    check("new head gets grace before alarm", "reviewer never posted" in out, False)
+    watch["heads"]["7"]["observed_at"] = time.time() - 3600
+    state_file("watchdog.json").write_text(json.dumps(watch))
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    check("old-dated new head alarms after observed grace", "reviewer never posted" in out, True)
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    check("restart retains head and cooldown", "reviewer never posted" in out, False)
+
+    # Cap marker is likewise gated by observation, not by the commit's date.
+    reset(prs={"7": pr(7)})
+    run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    cap_reviews = [review(REVIEWER, head="c" * 40, rid=1),
+                   review(REVIEWER, head="d" * 40, rid=2),
+                   review(REVIEWER, head="e" * 40, rid=3)]
+    set_prs({"7": {**pr(7), "reviews": cap_reviews}})
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    check("old unchanged PR does not signal missing cap marker", "NO escalation marker" in out, False)
+    set_prs({"7": {**pr(7, head=HEAD_B), "reviews": cap_reviews}})
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    check("new old-dated head signals missing cap marker", "NO escalation marker" in out, True)
+
+    # Review API failure leaves the observation persisted but does not guess verdicts.
+    reset(prs={"7": pr(7)})
+    run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    set_prs({"7": {**pr(7, head=HEAD_B), "reviews": None}})
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    check("unknown reviews yield no false stall", "reviewer never posted" in out, False)
+    watch = load_state("watchdog.json")
+    check("review failure does not erase new head clock", watch["heads"]["7"]["sha"], HEAD_B)
+    watch["heads"]["7"]["observed_at"] = time.time() - 3600
+    state_file("watchdog.json").write_text(json.dumps(watch))
+    set_prs({"7": pr(7, head=HEAD_B)})
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    check("review recovery evaluates retained clock", "reviewer never posted" in out, True)
+
+    # First-seen old PRs (including migrated state) are conservative; PRs created
+    # after arming receive a clock even if they were absent from the initial list.
+    reset(prs={})
+    run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    old = pr(7)
+    old["created_at"] = "2020-01-01T00:00:00Z"
+    new = pr(9)
+    new["created_at"] = datetime.now(timezone.utc).isoformat()
+    set_prs({"7": old, "9": new})
+    run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    heads = load_state("watchdog.json")["heads"]
+    check("first-seen old PR is baseline", heads["7"]["observed_at"], None)
+    check("post-arm new PR gets observed clock", heads["9"]["observed_at"] is not None, True)
+
+    reset(prs={"7": old})
+    state_file("watchdog.json").write_text(json.dumps({"armed_since": time.time() - 7200}))
+    run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    check("legacy watchdog state baselines unknown old head",
+          load_state("watchdog.json")["heads"]["7"]["observed_at"], None)
+
+    # A failed listing must not arm the loop or replace its head snapshot.
+    reset(prs={"7": pr(7)})
+    DATA["world"]["prs"] = None
+    save_world()
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    check("failed initial listing reports uncertainty", "could not list open PRs" in out, True)
+    check("failed initial listing does not arm", load_state("watchdog.json"), {})
+    set_prs({"7": pr(7)})
+    run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    old = load_state("watchdog.json")
+    DATA["world"]["prs"] = None
+    save_world()
+    run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    check("failed listing preserves prior snapshot", load_state("watchdog.json")["heads"], old["heads"])
+    state_file("pending.json").write_text(json.dumps({"reviewer": {
+        f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "url": "u", "reason": "busy"}}}))
+    before = len(RECEIVED)
+    run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    check("failed listing never drains queue", len(RECEIVED) - before, 0)
+    check("failed listing leaves queue intact", f"{REPO}#7" in
+          load_state("pending.json").get("reviewer", {}), True)
+
+    # A malformed arming clock cannot grant a historical grace deadline. Recovery
+    # snapshots only after a successful listing, while safe queued work still drains.
+    for bad_clock in ("not-a-timestamp", [1], True, False, 0, time.time() + 86400):
+        reset(prs={"7": pr(7), "9": pr(9, head=HEAD_B)})
+        old_clock = time.time() - 7200
+        state_file("watchdog.json").write_text(json.dumps({
+            "armed_since": bad_clock,
+            "heads": {"7": {"sha": HEAD_A, "observed_at": old_clock,
+                             "last_seen_at": old_clock}}}))
+        state_file("pending.json").write_text(json.dumps({"reviewer": {
+            f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "url": "u", "reason": "busy"},
+            f"{REPO}#9": {"at": time.time(), "head": HEAD_A, "url": "u", "reason": "stale"}}}))
+        before = len(RECEIVED)
+        started = time.time()
+        out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+        watch = load_state("watchdog.json")
+        label = repr(bad_clock)
+        check(f"{label} recovery does not crash", "watchdog failed" in out, False)
+        check(f"{label} recovery does not alert", "silent stall" in out, False)
+        check(f"{label} re-arms at recovery, not historical time",
+              isinstance(watch.get("armed_since"), (int, float)) and
+              started <= watch["armed_since"] <= time.time(), True)
+        check(f"{label} baselines existing head", watch["heads"]["7"]["observed_at"], None)
+        check(f"{label} drains authorized same head", len(RECEIVED) - before, 1)
+        check(f"{label} leaves second queued item for capacity", f"{REPO}#9" in
+              load_state("pending.json").get("reviewer", {}), True)
+        out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+        check(f"{label} next sweep does not prematurely alert", "silent stall" in out, False)
+        check(f"{label} rejects stale queued head", load_state("pending.json"), {})
+        check(f"{label} never wakes stale head", len(RECEIVED) - before, 1)
+
+    # Failed listing cannot establish a safe recovery baseline or drain.
+    reset(prs={"7": pr(7)})
+    state_file("watchdog.json").write_text(json.dumps({"armed_since": [1]}))
+    state_file("pending.json").write_text(json.dumps({"reviewer": {
+        f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "url": "u", "reason": "busy"}}}))
+    DATA["world"]["prs"] = None
+    save_world()
+    before = len(RECEIVED)
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    check("invalid arming plus failed listing reports uncertainty", "could not list open PRs" in out, True)
+    check("invalid arming plus failed listing retains state", load_state("watchdog.json")["armed_since"], [1])
+    check("invalid arming plus failed listing does not drain", len(RECEIVED) - before, 0)
+    check("invalid arming plus failed listing keeps queue", f"{REPO}#7" in
+          load_state("pending.json").get("reviewer", {}), True)
+
+    # Clock survives transient omission, draft, and close/reopen at the same SHA.
+    for absent in (None, pr(7, head=HEAD_B, draft=True), pr(7, head=HEAD_B, state="closed")):
+        reset(prs={"7": pr(7)})
+        run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+        set_prs({"7": pr(7, head=HEAD_B)})
+        run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+        watch = load_state("watchdog.json")
+        watch["heads"]["7"]["observed_at"] = time.time() - 3600
+        state_file("watchdog.json").write_text(json.dumps(watch))
+        set_prs({"7": absent} if absent is not None else {})
+        run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+        check(f"{absent and ('draft' if absent['draft'] else 'closed') or 'omitted'} retains clock",
+              load_state("watchdog.json")["heads"]["7"]["observed_at"], watch["heads"]["7"]["observed_at"])
+        set_prs({"7": pr(7, head=HEAD_B)})
+        out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+        check("return at same SHA alarms on original clock", "reviewer never posted" in out, True)
+
+    # Old noncurrent observations are pruned; malformed timestamps cannot crash a scan
+    # or masquerade as a trusted grace clock.
+    reset(prs={"7": pr(7)})
+    run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    watch = load_state("watchdog.json")
+    watch["heads"]["999"] = {"sha": HEAD_B, "observed_at": time.time() - 40 * 86400,
+                                "last_seen_at": time.time() - 40 * 86400}
+    watch["heads"]["7"]["observed_at"] = "not-a-timestamp"
+    state_file("watchdog.json").write_text(json.dumps(watch))
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    check("malformed clock never crashes scan", "watchdog failed" in out, False)
+    check("malformed clock is not a false stall", "reviewer never posted" in out, False)
+    check("aged absent observation is pruned", "999" in load_state("watchdog.json")["heads"], False)
+    # After the bounded absence, an old PR at the same SHA is not a fresh push.
+    watch = load_state("watchdog.json")
+    watch["heads"]["7"] = {"sha": HEAD_A, "observed_at": time.time() - 41 * 86400,
+                             "last_seen_at": time.time() - 40 * 86400}
+    state_file("watchdog.json").write_text(json.dumps(watch))
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    check("expired clock cannot cause a false stall", "reviewer never posted" in out, False)
+    check("expired old head is conservative baseline",
+          load_state("watchdog.json")["heads"]["7"]["observed_at"], None)
 
     # stuck state, and paused means silent
     reset(prs={})
@@ -1226,19 +1776,297 @@ def group_cleanup() -> None:
           "pr7-wt" in subprocess.run(["git", "-C", str(CLONE), "worktree", "list"],
                                      capture_output=True, text=True).stdout, False)
 
+    # A branch checkout matching the *same* closed PR must survive the configured-root
+    # scan, even when a configured root points inside that checkout.
+    reset(prs={"7": pr(7, state="closed")})
+    branch = REVIEWS / "pr7-dev"
+    subprocess.run(["git", "-C", str(CLONE), "worktree", "add", "-b", "fix/pr7",
+                    str(branch), "HEAD"], check=True, capture_output=True)
+    sentinel = branch / "uncommitted.txt"
+    sentinel.write_text("do not lose local work\n")
+    nested = branch / "pr7-logs"
+    nested.mkdir()
+    (nested / "build.log").write_text("preserve\n")
+    cfg = json.loads((LOOPS_DIR / "widgets.json").read_text())
+    cfg["roots"].append(str(branch))
+    (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
+    out, _, _ = run("cleanup.py", None, "--loop", "widgets", "--pr", "7")
+    check("same-PR branch sentinel survives root cleanup", sentinel.read_text() if sentinel.exists() else None,
+          "do not lose local work\n")
+    check("nested candidate inside branch survives", (nested / "build.log").exists(), True)
+    check("branch remains registered", str(branch) in subprocess.run(
+        ["git", "-C", str(CLONE), "worktree", "list", "--porcelain"],
+        capture_output=True, text=True).stdout, True)
+
+    # A root child enclosing a branch checkout is just as destructive to remove.
+    reset(prs={"7": pr(7, state="closed")})
+    parent = REVIEWS / "pr7-container"
+    parent.mkdir()
+    inside = parent / "developer"
+    subprocess.run(["git", "-C", str(CLONE), "worktree", "add", "-b", "fix/inside7",
+                    str(inside), "HEAD"], check=True, capture_output=True)
+    (inside / "uncommitted.txt").write_text("inside branch\n")
+    run("cleanup.py", None, "--loop", "widgets", "--pr", "7")
+    check("parent candidate containing branch survives", (inside / "uncommitted.txt").exists(), True)
+
+    # The explicit artifacts base is a separate candidate source, not just a root scan.
+    reset(prs={"7": pr(7, state="closed")})
+    base = STATE_DIR / "artifacts" / "7"
+    base.parent.mkdir(parents=True)
+    subprocess.run(["git", "-C", str(CLONE), "worktree", "add", "-b", "fix/base7",
+                    str(base), "HEAD"], check=True, capture_output=True)
+    base_sentinel = base / "uncommitted.txt"
+    base_sentinel.write_text("preserve base\n")
+    run("cleanup.py", None, "--loop", "widgets", "--pr", "7")
+    check("branch worktree at artifacts base survives", base_sentinel.read_text() if base_sentinel.exists() else None,
+          "preserve base\n")
+
+    # Configured roots are discovery boundaries, not permission to remove another repo.
+    reset(prs={"7": pr(7, state="closed")})
+    other = REVIEWS / "pr7-other-repo"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(other)], check=True)
+    other_sentinel = other / "uncommitted.txt"
+    other_sentinel.write_text("other repo's branch\n")
+    clone_child = CLONE / "pr7-cache"
+    clone_child.mkdir()
+    (clone_child / "sentinel.txt").write_text("inside clone\n")
+    cfg = json.loads((LOOPS_DIR / "widgets.json").read_text())
+    cfg["roots"].append(str(CLONE))
+    (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
+    run("cleanup.py", None, "--loop", "widgets", "--pr", "7")
+    check("unrelated repository branch survives", other_sentinel.read_text() if other_sentinel.exists() else None,
+          "other repo's branch\n")
+    check("PR-named directory inside clone survives", (clone_child / "sentinel.txt").exists(), True)
+
+    # A configured root inside another repository is not owned by this clone.
+    reset(prs={"7": pr(7, state="closed")})
+    foreign = TMP / "foreign-checkout"
+    shutil.rmtree(foreign, ignore_errors=True)
+    subprocess.run(["git", "init", "-q", "-b", "main", str(foreign)], check=True)
+    foreign_root = foreign / "build"
+    foreign_root.mkdir()
+    foreign_file = foreign_root / "pr7-source"
+    foreign_file.write_text("foreign source\n")
+    cfg = json.loads((LOOPS_DIR / "widgets.json").read_text())
+    cfg["roots"].append(str(foreign_root))
+    (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
+    run("cleanup.py", None, "--loop", "widgets", "--pr", "7")
+    check("foreign repo root cannot authorize source removal", foreign_file.read_text() if foreign_file.exists() else None,
+          "foreign source\n")
+
+    reset(prs={"7": pr(7, state="closed")})
+    outside = TMP / "pr7-outside"
+    subprocess.run(["git", "-C", str(CLONE), "worktree", "add", "--detach", str(outside), "HEAD"],
+                   check=True, capture_output=True)
+    (outside / "sentinel.txt").write_text("outside roots\n")
+    run("cleanup.py", None, "--loop", "widgets", "--pr", "7")
+    check("detached worktree outside roots survives", (outside / "sentinel.txt").exists(), True)
+    check("outside worktree stays registered", str(outside) in subprocess.run(
+        ["git", "-C", str(CLONE), "worktree", "list", "--porcelain"],
+        capture_output=True, text=True).stdout, True)
+    if outside.exists():
+        subprocess.run(["git", "-C", str(CLONE), "worktree", "remove", "--force", str(outside)], check=True)
+
+    reset(prs={"7": pr(7, state="closed")})
+    external = TMP / "external-cleanup"
+    shutil.rmtree(external, ignore_errors=True)
+    external.mkdir()
+    (external / "pr7-sentinel").write_text("external root\n")
+    linked = TMP / "linked-root"
+    linked.unlink(missing_ok=True)
+    linked.symlink_to(external, target_is_directory=True)
+    cfg = json.loads((LOOPS_DIR / "widgets.json").read_text())
+    cfg["roots"].append(str(linked))
+    (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
+    run("cleanup.py", None, "--loop", "widgets", "--pr", "7")
+    check("symlinked root cannot delete external child", (external / "pr7-sentinel").exists(), True)
+
+    # Swap a validated root at the du seam; string-path unlink would hit the sentinel.
+    reset(prs={"7": pr(7, state="closed")})
+    external = TMP / "outside-swap"
+    shutil.rmtree(external, ignore_errors=True)
+    external.mkdir()
+    outside_file = external / "pr7-build.log"
+    outside_file.write_text("outside must survive\n")
+    outside_tree = external / "pr7-wt"
+    outside_tree.mkdir()
+    (outside_tree / "sentinel.txt").write_text("outside worktree survives\n")
+    saved_root = TMP / "reviews-before-swap"
+    spec = importlib.util.spec_from_file_location("cleanup_under_test", ROOT / "scripts" / "cleanup.py")
+    cleanup = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cleanup)
+    with mock.patch.object(cleanup.gh, "pr", return_value={"number": True, "state": "closed"}):
+        check("boolean true is not PR #1", cleanup.pr_state({}, 1), {})
+    real_du = cleanup.du
+    swapped = False
+
+    def swap_during_du(path):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            REVIEWS.rename(saved_root)
+            REVIEWS.symlink_to(external, target_is_directory=True)
+        return real_du(path)
+
+    try:
+        with mock.patch.object(cleanup, "du", side_effect=swap_during_du):
+            cleanup.clean_pr(json.loads((LOOPS_DIR / "widgets.json").read_text()), 7,
+                             dry=False, quiet=True, force=True)
+        check("swap hook exercised after validation", swapped, True)
+        check("swapped root cannot unlink outside sentinel", outside_file.read_text() if outside_file.exists() else None,
+              "outside must survive\n")
+        check("swapped root cannot remove outside tree", (outside_tree / "sentinel.txt").exists(), True)
+    finally:
+        REVIEWS.unlink(missing_ok=True)
+        saved_root.rename(REVIEWS)
+
+    # A replacement *real directory* (not a symlink) must not bypass the
+    # validation-time parent identity check, even with a matching basename.
+    original = TMP / "original-root"
+    replacement = TMP / "replacement-root"
+    original.mkdir()
+    replacement.mkdir()
+    candidate = original / "pr7-log"
+    candidate.write_text("original\n")
+    (replacement / "pr7-log").write_text("replacement\n")
+    identity = cleanup.candidate_identity(candidate)
+    moved = TMP / "moved-original-root"
+    original.rename(moved)
+    replacement.rename(original)
+    check("real-directory root swap refuses replacement inode",
+          cleanup.remove_path(candidate, quiet=True, expected=identity), 0)
+    check("real-directory root swap preserves replacement", candidate.read_text(), "replacement\n")
+
+    tree = TMP / "pr7-tree-swap"
+    tree.mkdir()
+    child = tree / "build"
+    child.mkdir()
+    (child / "artifact.log").write_text("build\n")
+    outside_tree = TMP / "outside-tree-swap"
+    outside_tree.mkdir()
+    outside_marker = outside_tree / "sentinel.txt"
+    outside_marker.write_text("do not follow\n")
+    real_remove_tree = cleanup.remove_tree_fd
+
+    def swap_nested_before_walk(fd):
+        shutil.rmtree(child)
+        child.symlink_to(outside_tree, target_is_directory=True)
+        return real_remove_tree(fd)
+
+    with mock.patch.object(cleanup, "remove_tree_fd", side_effect=swap_nested_before_walk):
+        cleanup.remove_path(tree, quiet=True, expected=cleanup.candidate_identity(tree))
+    check("nested symlink swap cannot traverse outside", outside_marker.read_text(), "do not follow\n")
+
+    reset(prs={"7": pr(7, state="closed")})
+    unrelated = TMP / "pr7-unrelated-root"
+    shutil.rmtree(unrelated, ignore_errors=True)
+    unrelated.mkdir()
+    (unrelated / "neutral.log").write_text("unrelated child\n")
+    subprocess.run(["git", "-C", str(CLONE), "worktree", "add", "--detach",
+                    str(unrelated / "neutral-wt"), "HEAD"], check=True, capture_output=True)
+    (unrelated / "neutral-wt" / "sentinel.txt").write_text("not PR 7\n")
+    cfg = json.loads((LOOPS_DIR / "widgets.json").read_text())
+    cfg["roots"].append(str(unrelated))
+    (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
+    run("cleanup.py", None, "--loop", "widgets", "--pr", "7")
+    check("root name does not attribute unrelated child", (unrelated / "neutral.log").exists(), True)
+    check("root name does not attribute neutral detached checkout",
+          (unrelated / "neutral-wt" / "sentinel.txt").exists(), True)
+    run("cleanup.py", None, "--loop", "widgets", "--sweep")
+    check("sweep does not attribute unrelated child", (unrelated / "neutral.log").exists(), True)
+    check("sweep does not attribute neutral detached checkout",
+          (unrelated / "neutral-wt" / "sentinel.txt").exists(), True)
+
+    reset(prs={"7": pr(7, state="closed")})
+    nested_repo = REVIEWS / "pr7-bundle" / "developer"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(nested_repo)], check=True)
+    (nested_repo / "uncommitted.txt").write_text("nested repo\n")
+    link = REVIEWS / "pr7-external-link"
+    external = TMP / "external-cleanup"
+    external.mkdir(exist_ok=True)
+    (external / "sentinel.txt").write_text("external link\n")
+    link.symlink_to(external, target_is_directory=True)
+    run("cleanup.py", None, "--loop", "widgets", "--pr", "7")
+    check("nested unrelated checkout survives parent removal", (nested_repo / "uncommitted.txt").exists(), True)
+    check("symlink child is not removed or followed", link.is_symlink() and
+          (external / "sentinel.txt").exists(), True)
+
     # state is cleared for that PR
     reset(prs={"7": pr(7, state="closed", merged="2026-02-02T00:00:00Z")})
     state_file("locks.json").write_text(json.dumps({"reviewer": {"at": time.time(), "key": f"{REPO}#7"}}))
     state_file("breach.json").write_text(json.dumps({f"{REPO}#7": {"status": "awaiting-adjudication"}}))
+    state_file("inflight.json").write_text(json.dumps({
+        f"review:7:{HEAD_A}": time.time(), f"fix:7:{HEAD_A}": time.time(),
+        f"review:70:{HEAD_A}": 123, f"fix:70:{HEAD_A}": 456,
+        f"review:7x:{HEAD_A}": 789, f"other:7:{HEAD_A}": 321,
+        f"review:7:{HEAD_A}:extra": 654}))
+    state_file("pending.json").write_text(json.dumps({"reviewer": {
+        f"{REPO}#7": {"head": HEAD_A}, f"{REPO}#70": {"head": HEAD_A}}}))
+    state_file("breach.json").write_text(json.dumps({f"{REPO}#7": {"status": "awaiting-adjudication"},
+                                                      f"{REPO}#70": {"status": "delivery-pending"}}))
     run("cleanup.py", None, "--loop", "widgets", "--pr", "7")
     check("locks cleared for the PR", load_state("locks.json"), {})
-    check("breach marker cleared", load_state("breach.json"), {})
+    check("breach marker cleared without adjacent PR", load_state("breach.json"),
+          {f"{REPO}#70": {"status": "delivery-pending"}})
+    check("queue keeps adjacent PR", load_state("pending.json"),
+          {"reviewer": {f"{REPO}#70": {"head": HEAD_A}}})
+    check("only exact PR in-flight marks cleared", load_state("inflight.json"), {
+        f"review:70:{HEAD_A}": 123, f"fix:70:{HEAD_A}": 456,
+        f"review:7x:{HEAD_A}": 789, f"other:7:{HEAD_A}": 321,
+        f"review:7:{HEAD_A}:extra": 654})
+    set_prs({"7": pr(7, head=HEAD_A)})
+    check("reopened same head can enter reviewer gate", run("gate_reviewer.py", pr_payload())[0], "FIRE")
 
     # an open PR is refused without --force
     reset(prs={"7": pr(7, state="open")})
     out, _, _ = run("cleanup.py", None, "--loop", "widgets", "--pr", "7")
     check("open PR is refused", "still open" in out, True)
     check("  and its files stay", (REVIEWS / "pr7-wt").exists(), True)
+
+    # A failed or malformed fresh lookup must not turn an unknown PR into a deletion.
+    # Use real scratch worktrees and persisted state so the test catches both effects.
+    for label, response in (("missing", None),
+                            ("malformed state", {"number": 7, "state": "mystery"}),
+                            ("missing identity", {"state": "closed"}),
+                            ("error body", {"message": "API unavailable"}),
+                            ("wrong PR", pr(9, state="closed")),
+                            ("boolean PR", {**pr(7, state="closed"), "number": True}),
+                            ("float PR", {**pr(7, state="closed"), "number": 7.0})):
+        reset(prs={"7": response} if response is not None else {})
+        marker = state_file("breach.json")
+        marker.write_text(json.dumps({f"{REPO}#7": {"status": "awaiting-adjudication"}}))
+        run("cleanup.py", None, "--loop", "widgets", "--pr", "7")
+        check(f"direct {label}: worktree kept", (REVIEWS / "pr7-wt").exists(), True)
+        check(f"direct {label}: state kept", f"{REPO}#7" in load_state("breach.json"), True)
+        payload = pr_payload(action="closed", merged="2026-02-02T00:00:00Z")
+        kind, _, _ = run("gate_reviewer.py", payload)
+        check(f"webhook {label}: silent", kind, "SILENT")
+        check(f"webhook {label}: worktree kept", (REVIEWS / "pr7-wt").exists(), True)
+        check(f"webhook {label}: state kept", f"{REPO}#7" in load_state("breach.json"), True)
+
+    reset(prs={"7": pr(7, state="closed")})
+    marker = state_file("breach.json")
+    marker.write_text(json.dumps({f"{REPO}#7": {"status": "awaiting-adjudication"}}))
+    failed_lookup = {"REVIEW_LOOP_GH_STUB": "/bin/false"}
+    run("cleanup.py", None, "--loop", "widgets", "--pr", "7", extra_env=failed_lookup)
+    check("failed GitHub command: direct keeps worktree", (REVIEWS / "pr7-wt").exists(), True)
+    check("failed GitHub command: direct keeps state", f"{REPO}#7" in load_state("breach.json"), True)
+    kind, _, _ = run("gate_reviewer.py", pr_payload(action="closed"), extra_env=failed_lookup)
+    check("failed GitHub command: webhook silent", kind, "SILENT")
+    check("failed GitHub command: webhook keeps worktree", (REVIEWS / "pr7-wt").exists(), True)
+    check("failed GitHub command: webhook keeps state", f"{REPO}#7" in load_state("breach.json"), True)
+
+    reset(prs={"7": pr(7, state="open")})
+    payload = pr_payload(action="closed", merged="2026-02-02T00:00:00Z")
+    run("gate_reviewer.py", payload)
+    check("stale close webhook keeps reopened PR", (REVIEWS / "pr7-wt").exists(), True)
+    reset(prs={"7": pr(7, state="closed")})
+    run("gate_reviewer.py", pr_payload(action="closed"))
+    check("confirmed closed webhook reclaims worktree", (REVIEWS / "pr7-wt").exists(), False)
+
+    reset(prs={})
+    run("cleanup.py", None, "--loop", "widgets", "--pr", "7", "--force")
+    check("explicit operator force permits unknown cleanup", (REVIEWS / "pr7-wt").exists(), False)
 
     # the sweep walks what is closed and leaves what is open
     reset(prs={"7": pr(7, state="closed", merged="2026-02-02T00:00:00Z"),
@@ -1260,6 +2088,7 @@ def group_routes() -> None:
 
 
 GROUPS = {"routes": group_routes, "config": group_config, "reviewer": group_reviewer_gate, "budget": group_budget,
+          "adjudicator": group_adjudicator,
           "fixer": group_fixer_gate, "seats": group_seats, "parallel": group_parallel,
           "exclusive": group_exclusive, "settings": group_settings,
           "webhook_host": group_webhook_host,
