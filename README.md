@@ -87,13 +87,19 @@ That writes exactly four things, all of them visible and reversible:
 
 ```bash
 hermes review-loop list                 # what is configured
-hermes review-loop status --loop name   # locks, queue, breach markers, last watchdog run
+hermes review-loop status --loop name   # parallel setting, live runs, queue, breaches
+hermes review-loop set --loop name --concurrency 2   # 2 PRs at once, each in its own clone
 hermes review-loop arm --loop name      # arm/pause by flipping the repo hooks
 hermes review-loop pause --loop name
 hermes review-loop drain --loop name --seat reviewer
 hermes review-loop cleanup --loop name --sweep --dry-run
 hermes review-loop uninstall --loop name
 ```
+
+`set` is how you change the knobs after install — `--concurrency`, `--cap`, `--clone`, `--base`,
+`--grace-min`, `--ttl-min` — through the same validation `init` uses, so `--concurrency 2` without a
+clone is refused here exactly as it is at init. Prompts are rendered from the payload at fire time,
+so a change takes effect on the next event with nothing to re-install.
 
 Each seat needs its own GitHub token, and that is deliberate: the token that reviews, the token
 that pushes and the token that reads are separate and revocable one at a time. A classic PAT with
@@ -103,9 +109,9 @@ that pushes and the token that reads are separate and revocable one at a time. A
 
 - **One run per PR.** A slot keyed to the PR; a second request is queued, costs nothing, and starts
   when a slot frees. Slots expire, so a crashed run cannot wedge a loop.
-- **Parallel only when it is safe.** `concurrency: 1` serializes (the default). Above that, each PR
+- **Parallel only when it is safe.** `concurrency: 1` serializes (the default); above that, each PR
   gets its own clone and its own build/temp dirs — a run that cannot be isolated is queued, never
-  started beside another.
+  started beside another. Change it with `hermes review-loop set --concurrency N`.
 - **The cap is a wall, not a suggestion.** `cap` verdicts, `cap - 1` fix turns. The verdict that
   reaches the cap escalates instead of buying another round. The human is the veto, not the
   reviewer: the adjudicator rules and reports, and never merges or pushes.
@@ -122,9 +128,10 @@ that pushes and the token that reads are separate and revocable one at a time. A
 
 Exercised and passing:
 
-- `python3 tests/run_tests.py` — 104 checks, no network: every gate branch, the cap, seat capacity
+- `python3 tests/run_tests.py` — 124 checks, no network: every gate branch, the cap, seat capacity
   and queueing, **real isolation** (a real second clone, checked out at the head, with no token in
-  it), all four watchdog stall shapes, and the cleanup rails against a real git clone.
+  it), the `set` verb's rails (including the round trip a stranger's install depends on), all four
+  watchdog stall shapes, and the cleanup rails against a real git clone.
 - Live use on a private repository: two seats, dozens of PRs, review → verdict → fix → cleanup.
 
 Not proven, and worth knowing before you trust it:

@@ -161,6 +161,7 @@ def cmd_init(args) -> int:
     raw = {
         "id": args.id or args.repo.split("/")[-1],
         "repo": args.repo, "base": args.base, "cap": args.cap,
+        "concurrency": args.concurrency,
         "fixers": args.fixer, "reviewers": args.reviewer,
         "reviewer_seat": args.reviewer_seat or (args.reviewer[0] if len(args.reviewer) == 1 else ""),
         "seats": {
@@ -205,6 +206,53 @@ def cmd_init(args) -> int:
     return 0
 
 
+def cmd_set(args) -> int:
+    """Change a loop's settings in place, through the same validation ``init`` uses.
+
+    Nothing route-side needs re-writing: prompts are rendered from the payload at fire time, so a
+    new cap or concurrency takes effect on the next event. The rails still apply — ``concurrency``
+    above 1 without a ``clone`` is refused here exactly as it is at init, because a parallel run
+    that cannot be isolated would share a checkout.
+    """
+    try:
+        loop = config.load_id(args.loop)
+    except config.ConfigError as exc:
+        print(f"no such loop: {exc}")
+        return 2
+
+    wanted = {"concurrency": args.concurrency, "cap": args.cap, "base": args.base,
+              "clone": args.clone, "grace_min": args.grace_min,
+              "marker_grace_min": args.marker_grace_min, "ttl_min": args.ttl_min,
+              "inflight_ttl_min": args.inflight_ttl_min, "host": args.host}
+    changes = {k: v for k, v in wanted.items()
+               if v is not None and v != "" and v != loop.get(k)}
+    if not changes:
+        print("nothing to change — pass at least one setting "
+              "(--concurrency, --cap, --clone, --base, --grace-min, ...)")
+        return 0
+
+    try:
+        updated = config.normalize({**loop, **changes})
+    except config.ConfigError as exc:
+        print(f"refused: {exc}")
+        return 2
+
+    path = _write_config(updated)
+    for key, value in changes.items():
+        was = loop.get(key)
+        print(f"  {key}: {was!r} → {value!r}"
+              + ("   (each seat runs this many PRs at once)" if key == "concurrency" else ""))
+    print(f"loop config updated: {path}")
+    if "concurrency" in changes:
+        capacity = updated["concurrency"]
+        if capacity > 1:
+            print(f"parallel: up to {capacity} PRs per seat, each in its own clone under "
+                  f"{config.artifacts_dir(updated, 0).parent}")
+        else:
+            print("serialized: one run per seat; a second request queues")
+    return 0
+
+
 def cmd_list(args) -> int:
     loops = config.all_loops()
     if not loops:
@@ -212,6 +260,7 @@ def cmd_list(args) -> int:
         return 0
     for loop in loops:
         print(f"{loop['id']:<20} {loop['repo']:<30} cap={loop['cap']} "
+              f"parallel={loop.get('concurrency', 1)} "
               f"fixers={','.join(loop['fixers'])} reviewers={','.join(loop['reviewers'])}")
     return 0
 
@@ -222,7 +271,11 @@ def cmd_status(args) -> int:
         from . import state as state_mod
 
         st = state_mod.state_for(loop)
-        print(f"\n[{loop['id']}] {loop['repo']}  (cap {loop['cap']}, base {loop['base']})")
+        print()
+        print(f"[{loop['id']}] {loop['repo']}  (cap {loop['cap']}, base {loop['base']})")
+        capacity = int(loop.get("concurrency") or 1)
+        print(f"  parallel:   {capacity} PR(s) per seat"
+              + ("" if capacity > 1 else " — serialized; a second request queues"))
         print(f"  clone:      {loop['clone'] or '(none)'}")
         print(f"  state:      {st.dir}")
         print(f"  seats:      reviewer={loop['seats']['reviewer']['login']} "
@@ -307,6 +360,9 @@ def register_cli(ctx) -> None:
         init.add_argument("--reviewer-agent", default="", help="display name for the reviewer (default: profile)")
         init.add_argument("--fixer-agent", default="", help="display name for the fixer")
         init.add_argument("--cap", type=int, default=3, help="verdicts allowed before adjudication")
+        init.add_argument("--concurrency", type=int, default=1,
+                          help="PRs this seat may work at once: 1 = serialized (default). "
+                               "Above 1 needs --clone, because each PR then gets its own clone.")
         init.add_argument("--base", default="main")
         init.add_argument("--clone", default="", help="local clone the runs may use")
         init.add_argument("--root", action="append", default=[], help="a directory reviews may clean (repeatable)")
@@ -327,6 +383,21 @@ def register_cli(ctx) -> None:
         status = sub.add_parser("status", help="Show a loop's config and live state")
         status.add_argument("--loop")
         status.set_defaults(func=cmd_status)
+
+        change = sub.add_parser("set", help="Change a loop's settings in place")
+        change.add_argument("--loop", required=True)
+        change.add_argument("--concurrency", type=int,
+                            help="how many PRs each seat may work at once (1 = serialized; "
+                                 "above 1 needs a clone, since each PR gets its own)")
+        change.add_argument("--cap", type=int, help="verdicts allowed before adjudication")
+        change.add_argument("--clone", help="local clone the runs isolate from")
+        change.add_argument("--base", help="base branch the loop watches")
+        change.add_argument("--grace-min", type=int, help="quiet minutes before the watchdog speaks")
+        change.add_argument("--marker-grace-min", type=int)
+        change.add_argument("--ttl-min", type=int, help="how long a run may hold its slot")
+        change.add_argument("--inflight-ttl-min", type=int)
+        change.add_argument("--host", help="gateway webhook host")
+        change.set_defaults(func=cmd_set)
 
         arm = sub.add_parser("arm", help="Activate the loop's GitHub hooks")
         arm.add_argument("--loop")

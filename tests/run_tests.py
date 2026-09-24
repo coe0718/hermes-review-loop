@@ -389,6 +389,91 @@ def group_reviewer_gate() -> None:
     check("  and it says why", "not guessing" in err, True)
 
 
+def group_settings() -> None:
+    """`hermes review-loop set` — changing the knobs without hand-editing JSON."""
+    import contextlib
+    import io
+    from types import SimpleNamespace
+
+    from review_loop import cli, config
+
+    section("settings — how many PRs a seat may work at once")
+
+    def ns(**kw):
+        base = dict(loop="widgets", concurrency=None, cap=None, clone=None, base=None,
+                    grace_min=None, marker_grace_min=None, ttl_min=None,
+                    inflight_ttl_min=None, host=None)
+        base.update(kw)
+        return SimpleNamespace(**base)
+
+    def call(**kw) -> tuple[int, str]:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli.cmd_set(ns(**kw))
+        return rc, buf.getvalue()
+
+    def file_loop() -> dict:
+        return json.loads((LOOPS_DIR / "widgets.json").read_text())
+
+    reset(prs={})
+    set_concurrency(1)
+    check("starts serialized", file_loop().get("concurrency"), 1)
+
+    rc, out = call(concurrency=2)
+    check("set 2 → accepted", rc, 0)
+    check("  written to the config", file_loop().get("concurrency"), 2)
+    check("  and it says what changed", "concurrency: 1 → 2" in out, True)
+    check("  and where the sandboxes go", "own clone under" in out, True)
+
+    rc, out = call(cap=4)
+    check("set cap → accepted", rc, 0)
+    check("  cap written", file_loop().get("cap"), 4)
+    check("  concurrency untouched", file_loop().get("concurrency"), 2)
+
+    rc, out = call(concurrency=0)
+    check("set 0 → refused", rc, 2)
+    check("  with the reason", "must be >= 1" in out, True)
+    check("  nothing written", file_loop().get("concurrency"), 2)
+
+    rc, out = call()
+    check("set with nothing → says so", "nothing to change" in out, True)
+
+    # the rail that matters: no clone, so no parallel
+    solo = config.normalize({"id": "solo", "repo": "acme/solo", "fixers": [FIXER],
+                             "reviewers": [REVIEWER], "reviewer_seat": SEAT,
+                             "seats": {"reviewer": {"profile": "r", "route": "solo-review"},
+                                       "fixer": {"profile": "f", "route": "solo-fix"}},
+                             "state_dir": str(STATE_DIR / "solo")})
+    (LOOPS_DIR / "solo.json").write_text(json.dumps(solo))
+    rc, out = call(loop="solo", concurrency=3)
+    check("parallel without a clone → refused", rc, 2)
+    check("  and it says why", "requires 'clone'" in out, True)
+    check("  the loop still says serialized",
+          json.loads((LOOPS_DIR / "solo.json").read_text())["concurrency"], 1)
+
+    # the round trip that a stranger's install depends on: what we write must read back
+    rt = config.normalize({"id": "rt", "repo": "acme/rt", "fixers": [FIXER],
+                           "reviewers": [REVIEWER], "reviewer_seat": SEAT,
+                           "seats": {"reviewer": {"profile": "r", "route": "rt-review"},
+                                     "fixer": {"profile": "f", "route": "rt-fix"}}})
+    (LOOPS_DIR / "rt.json").write_text(json.dumps(rt))
+    check("a normalized loop reads back", config.load_id("rt")["concurrency"], 1)
+    check("  its empty adjudicator survives the round trip",
+          config.load_id("rt")["adjudicator"], {})
+
+    rc, out = call(loop="nope", concurrency=2)
+    check("unknown loop → refused", rc, 2)
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        cli.cmd_status(ns(loop="widgets"))
+    check("status reports the setting", "parallel:   2 PR(s) per seat" in buf.getvalue(), True)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        cli.cmd_list(ns())
+    check("list reports it too", "parallel=2" in buf.getvalue(), True)
+
+
 def group_budget() -> None:
     section("budget — the cap is a wall, not a suggestion")
 
@@ -729,7 +814,7 @@ def group_cleanup() -> None:
 
 GROUPS = {"config": group_config, "reviewer": group_reviewer_gate, "budget": group_budget,
           "fixer": group_fixer_gate, "seats": group_seats, "parallel": group_parallel,
-          "watchdog": group_watchdog, "cleanup": group_cleanup}
+          "settings": group_settings, "watchdog": group_watchdog, "cleanup": group_cleanup}
 
 
 def main() -> int:

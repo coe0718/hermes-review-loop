@@ -122,10 +122,16 @@ def normalize(raw: dict, source: pathlib.Path | None = None) -> dict:
     if not loop["reviewer_seat"]:
         raise ConfigError(f"{where}: 'reviewer_seat' (or seats.reviewer.login) is required")
 
-    adj = dict(loop.get("adjudicator") or {})
+    adj = {k: v for k, v in (loop.get("adjudicator") or {}).items()}
+    if adj and not adj.get("route") and set(adj) <= {"profile"}:
+        # A route-less adjudicator carries no configuration at all — it is exactly what the
+        # normalized form writes. Dropping it is what lets our own output be read back; anything
+        # with more than a profile and still no route is a real mistake and raises below.
+        adj = {}
     if adj and not adj.get("route"):
         raise ConfigError(f"{where}: adjudicator.route is required when adjudicator is set")
-    adj.setdefault("profile", "default")
+    if adj:
+        adj.setdefault("profile", "default")
     loop["adjudicator"] = adj
 
     loop["cap"] = int(loop["cap"])
@@ -136,9 +142,14 @@ def normalize(raw: dict, source: pathlib.Path | None = None) -> dict:
     loop["read_token"] = str(loop.get("read_token") or (next(iter(loop["tokens"]), "")))
     loop["roots"] = [str(p) for p in (loop.get("roots") or [])]
 
-    loop["concurrency"] = int(loop.get("concurrency") or 1)
+    # `or 1` here would swallow a literal 0 into "serialized", which is the worst kind of silent
+    # correction: the operator asked for something invalid and got a loop that looks configured.
+    raw_capacity = loop.get("concurrency")
+    if raw_capacity is None or raw_capacity == "":
+        raw_capacity = 1
+    loop["concurrency"] = int(raw_capacity)
     if loop["concurrency"] < 1:
-        raise ConfigError(f"{where}: 'concurrency' must be >= 1")
+        raise ConfigError(f"{where}: 'concurrency' must be >= 1 (1 = serialized)")
     if loop["concurrency"] > 1 and not loop.get("clone"):
         # Above one run per seat, isolation is not a preference: without a clone to isolate from,
         # two runs would share whatever checkout they find, which is the wrong-verdict bug.

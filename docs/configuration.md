@@ -37,7 +37,7 @@ configuration error, not a run that guesses.
 | `read_token` | first token | login whose token performs reads |
 | `clone` | — | the local clone reviews may use; cleanup prunes its worktrees |
 | `roots` | `[]` | directories the cleanup may ever touch. Anything outside them is out of scope. |
-| `concurrency` | `1` | runs allowed at once per seat. `1` = serialized; `2+` = parallel, which requires `clone` because each PR then gets its own isolated clone (and an unisolatable run is queued, not shared). |
+| `concurrency` | `1` | runs allowed at once per seat. `1` = serialized; `2+` = parallel, which requires `clone` because each PR then gets its own isolated clone (and an unisolatable run is queued, not shared). Change it with `hermes review-loop set --concurrency N`. |
 | `state_dir` | `~/.hermes/state/review-loops/<id>` | locks, queue, in-flight marks, breach markers, artifacts, watchdog memory |
 | `host` | `https://hooks.coemedia.us` | gateway webhook host |
 | `grace_min` | `25` | how long a quiet head is allowed to sit before the watchdog speaks |
