@@ -678,8 +678,8 @@ def group_budget() -> None:
 
     section("fixer gate — the cap stops the fix, not just the review")
     # the fixer gate counts the OTHER verdicts; 2 prior + this one = the cap → adjudication
-    reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, rid=8),
-                                          review(REVIEWER, rid=9),
+    reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, rid=3),
+                                          review(REVIEWER, rid=4),
                                           review(REVIEWER, rid=5)]}})
     kind, out, err = run("gate_fixer.py", review_payload(rid=5))
     check("verdict that hits the cap → no fix run", kind, "SILENT")
@@ -832,14 +832,16 @@ def group_adjudicator() -> None:
     check("B wake remains claimable", run(route["script"],
           json.loads(RECEIVED[-1]["body"]))[0], "FIRE")
 
-    # The fixer gate takes its head from an old webhook, so unlike the
-    # reviewer request it has no earlier fresh-PR guard.
-    reset(prs={"7": {**pr(7, head=HEAD_A), "reviews": reviews}})
-    run("gate_fixer.py", review_payload(head=HEAD_A, rid=3))
-    set_prs({"7": {**pr(7, head=HEAD_B), "reviews": reviews}})
-    run("gate_fixer.py", review_payload(head=HEAD_B, rid=3))
+    # The fixer gate takes its head from an old webhook; the live PR and review list are what
+    # it must agree with (each verdict is in GitHub's list, as it would be).
+    at_a = review(REVIEWER, head=HEAD_A, rid=4)
+    at_b = {**review(REVIEWER, head=HEAD_B, rid=5), "submitted_at": "2026-01-02T00:00:00Z"}
+    reset(prs={"7": {**pr(7, head=HEAD_A), "reviews": reviews + [at_a]}})
+    run("gate_fixer.py", review_payload(head=HEAD_A, rid=4))
+    set_prs({"7": {**pr(7, head=HEAD_B), "reviews": reviews + [at_a, at_b]}})
+    run("gate_fixer.py", review_payload(head=HEAD_B, rid=5))
     before = len(RECEIVED)
-    run("gate_fixer.py", review_payload(head=HEAD_A, rid=3))
+    run("gate_fixer.py", review_payload(head=HEAD_A, rid=4))
     check("delayed fixer A cannot replace B",
           load_state("breach.json")[f"{REPO}#7"]["head"], HEAD_B)
     check("delayed fixer A does not deliver", len(RECEIVED) - before, 0)
@@ -922,6 +924,46 @@ def group_fixer_gate() -> None:
     run("gate_fixer.py", review_payload(rid=5))
     check("same head twice → second is silent",
           run("gate_fixer.py", review_payload(rid=5))[0], "SILENT")
+
+    # The payload's head is a snapshot: the live PR is what authorizes a fix run.
+    reset(prs={"7": {**pr(7, head=HEAD_B), "reviews": [review(REVIEWER, rid=5)]}})
+    check("live PR moved past the verdict's head → silent",
+          run("gate_fixer.py", review_payload(rid=5))[0], "SILENT")
+    reset(prs={"7": {**pr(7, state="closed"), "reviews": [review(REVIEWER, rid=5)]}})
+    check("live PR closed → silent", run("gate_fixer.py", review_payload(rid=5))[0], "SILENT")
+    reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, rid=5)]}})
+    check("unreadable live PR → silent", run("gate_fixer.py", review_payload(rid=5),
+          extra_env={"REVIEW_LOOP_GH_STUB": "/bin/false"})[0], "SILENT")
+    later_approval = {**review(REVIEWER, state="APPROVED", rid=6),
+                      "submitted_at": "2026-01-02T00:00:00Z"}
+    reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, rid=5), later_approval]}})
+    check("changes-requested superseded by a same-head approval → silent",
+          run("gate_fixer.py", review_payload(rid=5))[0], "SILENT")
+    check("  and no fixer seat is claimed", "fixer" in load_state("locks.json"), False)
+    dismissed = {**review(REVIEWER, state="DISMISSED", rid=5)}
+    reset(prs={"7": {**pr(7), "reviews": [dismissed]}})
+    check("changes-requested dismissed since → silent",
+          run("gate_fixer.py", review_payload(rid=5))[0], "SILENT")
+
+    # An approval always ends the reviewer's turn, even when GitHub cannot be read back:
+    # only the merge handoff waits on the live read, never the seat release.
+    reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, state="approved", rid=9)]}})
+    state_file("locks.json").write_text(json.dumps(
+        {"reviewer": {f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "why": "review"}}}))
+    run("gate_fixer.py", review_payload(state="approved", rid=9),
+        extra_env={"REVIEW_LOOP_GH_STUB": "/bin/false"})
+    check("approval with an unreadable PR still frees the reviewer seat",
+          "reviewer" in load_state("locks.json"), False)
+
+    # The drain re-reads GitHub: an older changes-requested at the head is not a work order
+    # once a later approval landed at that same head.
+    reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, rid=5), later_approval]}})
+    state_file("pending.json").write_text(json.dumps({"fixer": {
+        f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "url": "u", "reason": "busy"}}}))
+    before = len(RECEIVED)
+    run("watchdog.py", None, "--loop", "widgets", "--drain", "--seat", "fixer")
+    check("drain never wakes the fixer past a later approval", len(RECEIVED) - before, 0)
+    check("  and the stale queue entry is dropped", load_state("pending.json"), {})
 
 
 def group_seats() -> None:
@@ -1077,6 +1119,9 @@ def group_parallel() -> None:
     check("reviewer 2 → first review runs", kind_r7, "FIRE")
     check("reviewer 2 → second review runs too",
           run("gate_reviewer.py", pr_payload(9, head=newer))[0], "FIRE")
+    # The verdicts the fixer answers are in GitHub's live list at the head they name.
+    set_prs({"7": {**pr(7, head=newer), "reviews": [review(REVIEWER, head=newer, rid=5)]},
+             "9": {**pr(9, head=newer), "reviews": [review(REVIEWER, head=newer, rid=6)]}})
     kind_f7, out_f7, _ = run("gate_fixer.py", review_payload(7, head=newer, rid=5))
     check("fixer 1 → its fix runs", kind_f7, "FIRE")
     check("  the fix released that PR's review slot",
@@ -2868,7 +2913,7 @@ def group_observer() -> None:
           "on an older head" in notice(observer_posts()[0])["message"], True)
 
     # -- escalation reports a durable pending marker before adjudicator delivery -----
-    reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, rid=8), review(REVIEWER, rid=9),
+    reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, rid=3), review(REVIEWER, rid=4),
                                           review(REVIEWER, rid=5)]}})
     observer_route()
     kind, out, err = run("gate_fixer.py", review_payload(rid=5))
