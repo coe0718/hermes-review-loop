@@ -4364,6 +4364,28 @@ def group_doctor() -> None:
     rc, out = run_doctor("--loop", "widgets")
     check("wrong adjudicator gate fails", rc, 1)
     check("  requires gate_adjudicator.py", "gate_adjudicator.py" in out, True)
+    # A pre-#21 loop: `init` refuses an existing loop, so the hint must name apply, and apply
+    # must actually rebind the route it names.
+    check("  and names the command that repairs it",
+          "hermes review-loop apply --loop widgets" in out and "re-run init" not in out, True)
+    from review_loop import prompts as prompts_mod
+    edit_subs(lambda subs: subs["widgets-breach"].update(prompt=prompts_mod.ADJUDICATOR))
+    secret = json.loads(SUBS.read_text())["widgets-breach"]["secret"]
+    rc, out = run_cli(parser_for({}).parse_args(["apply", "--loop", "widgets", "--dry-run"]))
+    check("apply --dry-run shows the legacy gate repair",
+          (rc, "script gate_reviewer.py → gate_adjudicator.py" in out), (0, True))
+    rc, out = run_cli(parser_for({}).parse_args(["apply", "--loop", "widgets"]))
+    breach = json.loads(SUBS.read_text())["widgets-breach"]
+    check("apply rebinds a legacy breach route", (rc, breach["script"]), (0, "gate_adjudicator.py"))
+    check("  keeping its secret", breach["secret"], secret)
+    check("  and doctor is satisfied", "❌ route:widgets-breach" in run_doctor("--loop", "widgets")[1],
+          False)
+    check("  a second apply is a no-op", "already matches" in
+          run_cli(parser_for({}).parse_args(["apply", "--loop", "widgets"]))[1], True)
+    edit_subs(lambda subs: subs["widgets-breach"].update(script="someone_elses.py"))
+    run_cli(parser_for({}).parse_args(["apply", "--loop", "widgets"]))
+    check("apply never rebinds a foreign script",
+          json.loads(SUBS.read_text())["widgets-breach"]["script"], "someone_elses.py")
 
     install_doctor_fixture()
     profile_env("reviewer-profile").write_text("GH_TOKEN=  # unset\n")

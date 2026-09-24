@@ -115,6 +115,11 @@ LOGIN_SETTINGS: dict = {"reviewer": "reviewer_login", "fixer": "fixer_login"}
 # Every role that can own a webhook route. The adjudicator is here but not in ``SEAT_KEYS``: it has
 # a route and a profile, and no login or allowlist of its own.
 ROUTE_ROLES = ("reviewer", "fixer", "adjudicator")
+# Gate scripts an older release of *this* plugin installed for a role. Before the dedicated
+# adjudicator gate (PR #21) the breach route ran gate_reviewer.py. Such a route is still ours —
+# its prompt proves it — so ``apply`` rebinds it in place instead of refusing it as foreign, and
+# ``doctor`` points there rather than at ``init``, which refuses an existing loop.
+LEGACY_GATE_SCRIPTS: dict = {"adjudicator": frozenset({"gate_reviewer.py"})}
 
 # A Hermes profile name is a directory name under ``profiles/``. Refusing separators and dots-only
 # names here is what keeps a typo from resolving to somewhere outside the profiles root.
