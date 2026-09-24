@@ -1017,6 +1017,62 @@ def group_webhook_host() -> None:
         (LOOPS_DIR / "widgets.json").write_text(json.dumps(legacy))
         check("existing explicit host loads unchanged except trailing slash",
               config.load_id("widgets")["host"], "https://existing.example")
+        # A legacy route without a host must not produce a relative URL, even when
+        # the gateway subscription still carries a valid secret.
+        from review_loop import routes
+        import urllib.request
+        subs = json.loads(SUBS.read_text())
+        subs["widgets-review"].pop("host", None)
+        SUBS.write_text(json.dumps(subs))
+        check("hostless route has no URL", routes.url_for("widgets-review"), None)
+        check("hostless route has no target", routes.target("widgets-review"), None)
+        original_urlopen = urllib.request.urlopen
+        def forbidden_urlopen(*args, **kwargs):
+            raise AssertionError("hostless route attempted a webhook POST")
+        urllib.request.urlopen = forbidden_urlopen
+        try:
+            check("hostless route cannot fire", routes.fire("widgets-review", "pull_request", {}, "probe"), False)
+        finally:
+            urllib.request.urlopen = original_urlopen
+        check("explicit host resolves legacy route", routes.url_for("widgets-review", HOST),
+              f"{HOST}/p/reviewer-profile/webhooks/widgets-review")
+        check("existing route host still resolves", routes.url_for("widgets-fix"),
+              f"{HOST}/p/fixer-profile/webhooks/widgets-fix")
+        check("existing host yields a target", routes.target("widgets-fix"),
+              (f"{HOST}/p/fixer-profile/webhooks/widgets-fix",
+               subs["widgets-fix"]["secret"].encode()))
+        check("existing host can fire", routes.fire("widgets-fix", "pull_request_review", {}, "probe"), True)
+        check("existing host delivered to the sink", RECEIVED[-1]["path"],
+              "/p/fixer-profile/webhooks/widgets-fix")
+        calls.clear()
+        try:
+            cli._install_hooks({**config.load_id("widgets"), "host": ""}, None)
+        except config.ConfigError:
+            check("install refuses absent loop host", True, True)
+        else:
+            check("install refuses absent loop host", False, True)
+        check("absent loop host made no API calls", calls, [])
+        try:
+            routes.url_for("widgets-review", "https://own.example/foreign")
+        except config.ConfigError:
+            check("invalid route host rejected", True, True)
+        else:
+            check("invalid route host rejected", False, True)
+        subs["widgets-review"]["host"] = "https://own.example/foreign"
+        SUBS.write_text(json.dumps(subs))
+        check("invalid stored origin has no target", routes.target("widgets-review"), None)
+        check("invalid stored origin cannot fire", routes.fire("widgets-review", "pull_request", {}, "probe"), False)
+        # The second missing route must be caught before the first hook is posted.
+        subs.pop("widgets-fix")
+        SUBS.write_text(json.dumps(subs))
+        calls.clear()
+        try:
+            cli._install_hooks(config.load_id("widgets"), None)
+        except config.ConfigError as exc:
+            check("install refuses missing route before API", "route" in str(exc), True)
+        else:
+            check("install refuses missing route before API", False, True)
+        check("missing route made no API calls", calls, [])
     finally:
         gh.api = original_api
 

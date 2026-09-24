@@ -78,11 +78,17 @@ def _install_hooks(loop: dict, token_login: str | None) -> list[str]:
     """Create the two repo hooks via the API. Needs a token with admin:repo_hook on the repo."""
     names = routes_for(loop)
     host = config.webhook_host(loop.get("host"), required=True)
-    made = []
+    # Validate both destinations and secrets before creating either external hook.
+    hooks = []
     for seat, event in (("reviewer", "pull_request"), ("fixer", "pull_request_review")):
         route_name = names[seat]
         url = routes.url_for(route_name, host)
         secret = (routes.route(route_name) or {}).get("secret", "")
+        if not url or not secret:
+            raise config.ConfigError(f"route {route_name!r} needs a valid webhook URL and secret before installing hooks")
+        hooks.append((event, url, secret))
+    made = []
+    for event, url, secret in hooks:
         body = {"name": "web", "active": True, "events": [event],
                 "config": {"url": url, "content_type": "json", "secret": secret,
                            "insecure_ssl": "0"}}

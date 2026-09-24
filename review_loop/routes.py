@@ -43,7 +43,11 @@ def url_for(name: str, host: str | None = None) -> str | None:
     entry = route(name)
     if not entry:
         return None
-    base = (host or entry.get("host") or config.DEFAULTS["host"]).rstrip("/")
+    # Never invent a relative webhook URL when neither the caller nor the route
+    # names an operator-owned gateway. Reject malformed origins at this boundary.
+    base = config.webhook_host(host or entry.get("host"))
+    if not base:
+        return None
     profile = entry.get("profile", "default")
     if profile == "default":
         return f"{base}/webhooks/{name}"
@@ -57,7 +61,11 @@ def target(name: str, host: str | None = None):
         log(f"route {name!r} not found in {subs_path().name}")
         return None
     secret = entry.get("secret") or ""
-    url = url_for(name, host)
+    try:
+        url = url_for(name, host)
+    except config.ConfigError as exc:
+        log(f"route {name!r} has invalid webhook host: {exc}")
+        return None
     if not secret or not url:
         log(f"route {name!r} has no secret/url")
         return None
