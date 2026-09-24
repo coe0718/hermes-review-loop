@@ -19,7 +19,8 @@ HEAD_B = "b" * 40
 
 def pr(head=HEAD_A, state="open"):
     return {"number": 7, "state": state, "head": {"sha": head},
-            "base": {"ref": "main"}, "user": {"login": "fixer"}}
+            "base": {"ref": "main", "sha": HEAD_B,
+                     "repo": {"full_name": "acme/widgets"}}, "user": {"login": "fixer"}}
 
 
 class NotificationFreshnessTest(unittest.TestCase):
@@ -39,6 +40,8 @@ class NotificationFreshnessTest(unittest.TestCase):
               mock.patch.object(module.gate, "context", return_value=(self.loop, self.state)),
               mock.patch.object(module.gh, "pr", return_value=current) as live,
               mock.patch.object(module.gh, "reviews", return_value=reviews),
+              mock.patch.object(module.gh, "api", return_value={
+                  "ref": "refs/heads/main", "object": {"type": "commit", "sha": HEAD_B}}),
               mock.patch.object(module.gate, "reclaim") as reclaim,
               mock.patch.object(module.gate, "drain_seat") as drain,
               mock.patch.object(module.observer, "notify") as notify):

@@ -19,7 +19,7 @@ import stat
 import threading
 from dataclasses import dataclass
 
-from . import broker, safe_push
+from . import broker, config, safe_push
 
 MAX_REQUEST = 16 * 1024
 MAX_BODY = 12 * 1024
@@ -149,12 +149,74 @@ class RunBroker:
                 raise ProtocolError("operation out of scope")
             if self._used:
                 raise ProtocolError("run capability already used")
+            # The socket request and launch-time loop snapshot are not policy sources.
+            # Reload the host-owned repository configuration at the write boundary.
+            current_loop = config.by_repo(self.scope.repo)
+            if current_loop is None or not config.unattended_fixer_push_enabled(current_loop):
+                raise ProtocolError("unattended fixer push is not enabled by the host operator")
+            if (self._loop.get("repo") != current_loop.get("repo")
+                    or self._loop.get("id") != current_loop.get("id")
+                    or self._loop.get("state_dir") != current_loop.get("state_dir")):
+                raise ProtocolError("run configuration changed")
             # Validation precedes consuming the capability, but no write can be replayed.
             safe_push._manifest(request["manifest"])
             self._used = True
-            result = safe_push.push(self._loop, repo=self.scope.repo, number=self.scope.number,
-                                    head=self.scope.head, role=self.scope.role,
-                                    branch=self.scope.branch, manifest=request["manifest"])
+            try:
+                # Lock covers the final host policy read and the complete ref operation.
+                # Disable cannot return while an authorized push is still in progress.
+                with config.push_policy_lock():
+                    current_loop = config.by_repo(self.scope.repo)
+                    if (current_loop is None or
+                            not config.unattended_fixer_push_enabled(current_loop) or
+                            current_loop.get('id') != self._loop.get('id') or
+                            current_loop.get('state_dir') != self._loop.get('state_dir')):
+                        raise ProtocolError('unattended fixer push policy changed before write')
+                    # A newly enabled config must not authorize a worker that
+                    # was admitted while the policy was off (or a legacy row).
+                    if not self.scope.run_id or not self.scope.ledger_db:
+                        raise ProtocolError('host run admission unavailable')
+                    from .run_supervisor import Supervisor
+                    supervisor = Supervisor(self.scope.ledger_db)
+                    if not supervisor.push_admitted(
+                            self.scope.run_id, self.scope.repo, self.scope.number,
+                            self.scope.head):
+                        raise ProtocolError('fixer push not authorized at run admission')
+                    # Durable write-ahead intent precedes the external Git operation.
+                    # If this commit fails, safe_push (and Git) are never called.
+                    supervisor.begin_push(self.scope.run_id, self.scope.repo,
+                                          self.scope.number, self.scope.head)
+                    try:
+                        result = safe_push.push(current_loop, repo=self.scope.repo,
+                                                number=self.scope.number, head=self.scope.head,
+                                                role=self.scope.role, branch=self.scope.branch,
+                                                manifest=request["manifest"])
+                        # safe_push returns only after exact ref + PR readback and
+                        # durable audit. Failure to commit completion leaves intent.
+                        supervisor.confirm_push(self.scope.run_id, self.scope.repo,
+                                                self.scope.number, self.scope.head)
+                    except Exception as exc:
+                        # An explicit attempt boundary, not exception text, determines
+                        # whether a failed push must occupy the host-side hold.
+                        if isinstance(exc, safe_push.PushFailure) or not isinstance(
+                                exc, (broker.BrokerDenied, ProtocolError)):
+                            if not self.scope.run_id or not self.scope.ledger_db:
+                                raise ProtocolError('post-write hold has no host ledger') from exc
+                            from .run_supervisor import Supervisor
+                            outcome = (exc.outcome if isinstance(exc, safe_push.PushFailure)
+                                       and exc.outcome == 'published_pr_unverified' else 'unknown')
+                            try:
+                                Supervisor(self.scope.ledger_db).quarantine_push(
+                                    self.scope.run_id, self.scope.repo, self.scope.number,
+                                    self.scope.head, outcome)
+                            except Exception as persistence_error:
+                                raise ProtocolError('post-write quarantine persistence failed') from persistence_error
+                        raise
+            except (broker.BrokerDenied, ProtocolError):
+                raise
+            except Exception:
+                # Failure to obtain the policy lock or reload configuration is
+                # pre-write; the capability was consumed but Git was not called.
+                raise
             self._pushed_head = result["new_head"]
             return result
         if not isinstance(request, dict) or set(request) != {"operation", "verdict", "body"}:

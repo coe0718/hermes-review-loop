@@ -18,7 +18,7 @@ import tempfile
 import time
 from urllib.parse import quote
 
-from . import broker, gh
+from . import broker, config, gh
 
 MAX_FILES = 24
 MAX_CONTENT = 128 * 1024
@@ -26,6 +26,18 @@ MAX_FILE = 64 * 1024
 MAX_MESSAGE = 240
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 SEGMENT = re.compile(r"[A-Za-z0-9_.-]{1,128}\Z")
+
+
+class PushFailure(broker.BrokerDenied):
+    """A failed push with a durable attempt boundary; never infer this from text.
+
+    Once attempt journaling begins, even a failed journal or an unchanged ref
+    needs a host hold: the write/verification path was entered but did not finish.
+    """
+
+    def __init__(self, outcome: str):
+        self.outcome = outcome
+        super().__init__(f"Git ref update not confirmed ({outcome})")
 
 
 def _sha(value: object) -> str:
@@ -212,6 +224,8 @@ def push(loop: dict, *, repo: str, number: int, head: str, role: str,
     """
     base, files = _manifest(manifest)
     assert isinstance(manifest, dict)  # _manifest rejects any other shape
+    if not config.unattended_fixer_push_enabled(loop):
+        raise broker.BrokerDenied("unattended fixer push disabled")
     if base != head:
         raise broker.BrokerDenied("manifest base differs from scoped PR head")
     login = broker.authorize(loop, repo=repo, number=number, head=head,
@@ -249,13 +263,15 @@ def push(loop: dict, *, repo: str, number: int, head: str, role: str,
                "paths": [path for path, _ in files], "operation": "push"}
     error = None
     new_head = None
+    attempt_started = False
     def before_push(created: str) -> None:
-        nonlocal new_head
+        nonlocal new_head, attempt_started
         # Object construction/fetch may take time; the initial PR check cannot
         # authorize a later write. Recheck as close to the Git push as possible.
         broker.authorize(loop, repo=repo, number=number, head=head,
                          role=role, branch=branch, operation="push")
         check_ref()
+        attempt_started = True
         _audit(loop, {**receipt, "new_head": created, "phase": "attempt"})
         new_head = created
     try:
@@ -263,25 +279,33 @@ def push(loop: dict, *, repo: str, number: int, head: str, role: str,
                  before_push=before_push)
     except Exception as exc:
         error = exc
-    # Read back independently even on timeout, rejection, or lost response.
+    outcome = "unknown"
     try:
-        ref = _api(loop, ref_path, login=login)
-        observed = _sha((ref.get("object") or {}).get("sha")) if ref.get("ref") == f"refs/heads/{branch}" else None
-    except Exception:
-        observed = None
-    outcome = "published" if new_head is not None and observed == new_head else ("unchanged" if observed == head else "unknown")
-    if outcome == "published" and new_head is not None:
+        # Read back independently even on timeout, rejection, or lost response.
         try:
-            # Git's lease verifies only the ref. The PR may have closed during
-            # receive-pack without changing that ref; never acknowledge it as
-            # a successful authorized push in that case.
-            broker.authorize(loop, repo=repo, number=number, head=new_head,
-                             role=role, branch=branch, operation="push",
-                             require_verdict=False)
+            ref = _api(loop, ref_path, login=login)
+            observed = _sha((ref.get("object") or {}).get("sha")) if ref.get("ref") == f"refs/heads/{branch}" else None
         except Exception:
-            outcome = "published_pr_unverified"
-    _audit(loop, {**receipt, "new_head": new_head, "phase": "reconciled",
-                  "outcome": outcome, "observed_head": observed})
+            observed = None
+        outcome = "published" if new_head is not None and observed == new_head else ("unchanged" if observed == head else "unknown")
+        if outcome == "published" and new_head is not None:
+            try:
+                # Git's lease verifies only the ref. The PR may have closed during
+                # receive-pack without changing that ref; never acknowledge it as
+                # a successful authorized push in that case.
+                broker.authorize(loop, repo=repo, number=number, head=new_head,
+                                 role=role, branch=branch, operation="push",
+                                 require_verdict=False)
+            except Exception:
+                outcome = "published_pr_unverified"
+        _audit(loop, {**receipt, "new_head": new_head, "phase": "reconciled",
+                      "outcome": outcome, "observed_head": observed})
+    except Exception as exc:
+        if attempt_started:
+            raise PushFailure(outcome) from exc
+        raise
     if error is not None or outcome != "published":
-        raise broker.BrokerDenied(f"Git ref update not confirmed ({outcome})") from error
+        failure = PushFailure(outcome) if attempt_started else broker.BrokerDenied(
+            f"Git ref update not confirmed ({outcome})")
+        raise failure from error
     return {**receipt, "new_head": new_head, "outcome": outcome}

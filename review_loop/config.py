@@ -47,6 +47,8 @@ is dropped with its reason kept under ``misconfigured`` for ``status`` to report
 
 from __future__ import annotations
 
+import contextlib
+
 import ipaddress
 import json
 import os
@@ -287,7 +289,16 @@ DEFAULTS: dict = {
     "ttl_min": 45,            # seat lock lifetime: past this a crashed run has lost its seat
     "inflight_ttl_min": 10,
     "host": "",
+    "unattended_fixer_push": False,  # per-repository; never inherited from plugin settings
 }
+
+def unattended_fixer_push_enabled(loop: dict) -> bool:
+    """Only a literal opt-in in a trusted loop config authorizes unattended fixer pushes.
+
+    Callers must load the loop from the host-owned config file, not an event payload or
+    sandbox-supplied mapping. Hook arming, seat assignment and a legacy config are not consent.
+    """
+    return isinstance(loop, dict) and loop.get("unattended_fixer_push") is True
 
 SEAT_KEYS = ("reviewer", "fixer")
 
@@ -565,6 +576,23 @@ def config_dir() -> pathlib.Path:
     return pathlib.Path(override).expanduser() if override else home() / "review-loops.d"
 
 
+@contextlib.contextmanager
+def push_policy_lock():
+    """Serialize host CLI policy writes and a broker's final push attempt.
+
+    Manual config edits outside this lock are not an authorization mechanism.
+    """
+    import fcntl
+    directory = config_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / '.fixer-push-policy.lock').open('a+b') as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(stream, fcntl.LOCK_UN)
+
+
 def _path(value: str) -> pathlib.Path:
     return pathlib.Path(str(value)).expanduser()
 
@@ -575,6 +603,9 @@ def normalize(raw: dict, source: pathlib.Path | None = None) -> dict:
         raise ConfigError(f"{source or 'config'}: expected a JSON object")
     loop = {**DEFAULTS, **raw}
     where = f"{source or loop.get('id', '<inline>')}"
+    if type(loop["unattended_fixer_push"]) is not bool:
+        raise ConfigError(f"{where}: 'unattended_fixer_push' must be a JSON boolean; "
+                          "only explicit true authorizes unattended fixer pushes")
 
     repo = str(loop.get("repo") or "").strip()
     if repo.count("/") != 1:
@@ -671,10 +702,17 @@ def load_file(path: pathlib.Path) -> dict:
 
 
 def load_id(loop_id: str) -> dict:
+    if not loop_id or pathlib.Path(loop_id).name != loop_id or loop_id in ('.', '..'):
+        raise ConfigError('loop ID must name one config file')
     path = config_dir() / f"{loop_id}.json"
-    if not path.exists():
+    if path.is_symlink():
+        raise ConfigError(f"{path}: symlinked loop configs are not allowed")
+    if not path.is_file():
         raise ConfigError(f"no loop config named {loop_id!r} in {config_dir()}")
-    return load_file(path)
+    loop = load_file(path)
+    if loop['id'] != loop_id:
+        raise ConfigError(f"{path}: loop ID does not match filename")
+    return loop
 
 
 def all_loops() -> list[dict]:
@@ -683,15 +721,15 @@ def all_loops() -> list[dict]:
     directory = config_dir()
     if not directory.exists():
         return []
-    return [load_file(p) for p in sorted(directory.glob("*.json"))]
+    return [load_id(p.stem) for p in sorted(directory.glob("*.json"))]
 
 
 def by_repo(full_name: str) -> dict | None:
     want = str(full_name or "").lower()
-    for loop in all_loops():
-        if loop["repo"] == want:
-            return loop
-    return None
+    matches = [loop for loop in all_loops() if loop['repo'] == want]
+    if len(matches) > 1:
+        raise ConfigError(f"duplicate loop configs for {want}: unattended writes denied")
+    return matches[0] if matches else None
 
 
 def artifacts_dir(loop: dict, number: int) -> pathlib.Path:

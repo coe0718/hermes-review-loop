@@ -105,7 +105,8 @@ def pr(number: int, head: str = HEAD_A, state: str = "open", draft: bool = False
     """
     return {"number": number, "state": state, "draft": draft, "merged_at": merged,
             "title": title, "html_url": f"https://github.com/{REPO}/pull/{number}",
-            "base": {"ref": base}, "user": {"login": author},
+            "base": {"ref": base, "sha": "c" * 40,
+                     "repo": {"full_name": REPO}}, "user": {"login": author},
             "head": {"sha": head, "ref": "fix-thing"},
             "requested_reviewers": [{"login": requested}] if requested else []}
 
@@ -142,6 +143,8 @@ elif path.endswith("/reviews?per_page=100"):
 elif "/commits/" in path:
     sha = path.rsplit("/", 1)[1]
     print(json.dumps({"commit": {"committer": {"date": world.get("commit_dates", {}).get(sha, "2026-01-01T00:00:00Z")}}}))
+elif path.endswith("/git/ref/heads/main"):
+    print(json.dumps({"ref": "refs/heads/main", "object": {"type": "commit", "sha": "c" * 40}}))
 elif "/pulls?" in path:
     print(json.dumps([p for p in world["prs"].values() if p.get("state") == "open"]))
 elif n_of(path) is not None:

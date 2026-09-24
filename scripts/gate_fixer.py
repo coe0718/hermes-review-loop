@@ -53,6 +53,15 @@ def main() -> None:
     number = gate.number_of(payload, pr)
     key = gate.seat_key(loop, number)
 
+    # A ref may have advanced while PR metadata became unverifiable. Its
+    # supervisor hold is authoritative even if a later webhook says approved:
+    # neither a merge handoff nor another fixer turn may bypass inspection.
+    from review_loop import config
+    from review_loop.run_supervisor import Supervisor
+    ledger = config.home() / 'state' / 'review-loop-runs.sqlite'
+    if ledger.exists() and Supervisor(ledger).post_write_hold(loop['repo'], number):
+        silence('post-write push quarantined — operator inspection required; no merge handoff')
+
     state = str(review.get("state", "")).upper()
     if state == "APPROVED":
         # An approval ends the reviewer's turn exactly as a rejection does, and nothing else would
@@ -68,6 +77,10 @@ def main() -> None:
         if live_open and isinstance(current, dict):
             current_head = ((current.get("head") or {}).get("sha") or "")
         snapshot_matches = approved_head == ((pr.get("head") or {}).get("sha") or "")
+        # The review commit pins only the child. A retarget or base advance can
+        # change the reviewed diff without changing that child SHA.
+        base_sha = observer.verified_base_sha(loop, current) if live_open else ""
+        base_matches = bool(base_sha and observer.base_identity(loop, pr) == base_sha)
         # The webhook is not evidence of the review's *current* verdict: GitHub can dismiss
         # the same review id after submitting it. A failed/partial live read is not approval.
         reviews = gh.reviews(loop, number) if live_open and current_head == approved_head else None
@@ -78,7 +91,8 @@ def main() -> None:
                          and gate.reviewer_login(latest) == gate.reviewer_login(review))
         if live_open and current_head and approved_head and approved_head != current_head:
             outcome, next_turn = "on an older head — the PR moved since", "the reviewer, on this head"
-        elif live_open and current_head and approved_head == current_head and snapshot_matches and live_approval:
+        elif (live_open and current_head and approved_head == current_head
+              and snapshot_matches and base_matches and live_approval):
             outcome, next_turn = "", "you merge"
         else:
             outcome, next_turn = "current approval/head unverified — no merge handoff", "check current PR state"
@@ -88,7 +102,8 @@ def main() -> None:
             gate.drain_seat(loop, "reviewer")
         observer.notify(loop, st, "approved", number, approved_head,
                         identity=review.get("id"), actor=gate.reviewer_login(review),
-                        outcome=outcome, next_turn=next_turn)
+                        outcome=outcome, next_turn=next_turn,
+                        base_sha=base_sha if base_matches else "")
         silence(f"#{number} approval event — no fixer dispatch")
     if state != "CHANGES_REQUESTED":
         silence(f"verdict state {review.get('state')!r} needs no fix")

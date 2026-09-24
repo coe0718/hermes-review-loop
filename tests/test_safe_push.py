@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -14,7 +15,8 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from review_loop import broker, broker_ipc, gh, safe_push
+from review_loop import broker, broker_ipc, config, gh, safe_push
+from review_loop.run_supervisor import Supervisor
 
 HEAD = "a" * 40
 REPO = "acme/widgets"
@@ -60,6 +62,15 @@ class FakeGitHub:
         raise AssertionError(f"unexpected API call {method} {path}")
 
 class SafePushTests(unittest.TestCase):
+    def admitted_scope(self):
+        db = self.root / 'runs.sqlite'
+        sup = Supervisor(db)
+        sup.enqueue('fix', REPO, 7, HEAD, 'fixer')
+        with sqlite3.connect(db) as con:
+            con.execute("UPDATE runs SET state='running',launch_intent=1,push_admitted=1")
+        return broker_ipc.RunScope(REPO, 7, HEAD, 'fixer', 'fix-7',
+                                   sup.get('fix')['id'], str(db))
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR"))
         self.addCleanup(tmp.cleanup)
@@ -70,6 +81,7 @@ class SafePushTests(unittest.TestCase):
             path.write_text("DUMMY_SECRET_" + login)
             tokens[login] = str(path)
         self.loop = {"repo": REPO, "base": "main", "state_dir": str(self.root),
+                     "unattended_fixer_push": True,
                      "fixers": ["fix"], "reviewers": ["review"],
                      "tokens": tokens, "read_token": "read", "reviewer_seat": "review",
                      "seats": {"reviewer": {"login": "review"}, "fixer": {"login": "fix"}}}
@@ -114,6 +126,18 @@ class SafePushTests(unittest.TestCase):
         self.assertEqual(receipt["new_head"], NEW_HEAD)
         self.assertFalse(any(method != "GET" for _, method, *_ in self.fake.calls))
         self.assertNotIn("DUMMY_SECRET", (self.root / "broker-audit.jsonl").read_text())
+
+    def test_absent_or_invalid_opt_in_denied_before_any_git_or_api(self):
+        for value in (None, False, "true", 1):
+            with self.subTest(value=value):
+                candidate = {**self.loop, "unattended_fixer_push": value}
+                with mock.patch.object(safe_push, "_git_cas") as git:
+                    with self.assertRaises(broker.BrokerDenied):
+                        safe_push.push(candidate, repo=REPO, number=7, head=HEAD,
+                                       role="fixer", branch="fix-7", manifest=manifest())
+                    git.assert_not_called()
+                self.assertEqual(self.fake.calls, [])
+        self.assertFalse((self.root / "broker-audit.jsonl").exists())
 
     def test_pr_closes_during_object_construction_before_remote_push(self):
         def close_before_push(*args, before_push):
@@ -262,8 +286,8 @@ class SafePushTests(unittest.TestCase):
         self.assertEqual(self.records()[-1]["outcome"], "published")
 
     def test_ipc_token_not_exposed_and_one_use(self):
-        scope = broker_ipc.RunScope(REPO, 7, HEAD, "fixer", "fix-7")
-        with broker_ipc.RunBroker(self.loop, scope, self.root) as server:
+        scope = self.admitted_scope()
+        with mock.patch.object(config, "by_repo", return_value=self.loop), broker_ipc.RunBroker(self.loop, scope, self.root) as server:
             thread = broker_ipc.serve_in_thread(server)
             try:
                 def send(value):
@@ -281,6 +305,22 @@ class SafePushTests(unittest.TestCase):
             finally:
                 server.close()
                 thread.join(2)
+
+    def test_broker_reloads_host_policy_and_consumes_one_attempt(self):
+        scope = self.admitted_scope()
+        server = broker_ipc.RunBroker(self.loop, scope, self.root)
+        payload = json.dumps({"operation": "push", "manifest": manifest()}).encode()
+        with mock.patch.object(config, "by_repo", return_value=None), mock.patch.object(safe_push, "_git_cas") as git:
+            with self.assertRaises(broker_ipc.ProtocolError):
+                server._dispatch(payload)
+            git.assert_not_called()
+        with mock.patch.object(config, "by_repo", return_value={**self.loop, "unattended_fixer_push": False}):
+            with self.assertRaises(broker_ipc.ProtocolError):
+                server._dispatch(payload)
+        with mock.patch.object(config, "by_repo", return_value=self.loop):
+            self.assertEqual(server._dispatch(payload)["outcome"], "published")
+            with self.assertRaises(broker_ipc.ProtocolError):
+                server._dispatch(payload)
 
 class RealBareCAS(unittest.TestCase):
     def test_local_object_construction_and_lease_races(self):

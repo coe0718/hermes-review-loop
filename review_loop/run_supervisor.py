@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import nullcontext
 
 SILENT = "[SILENT]"
 SCHEMA = """
@@ -82,6 +83,13 @@ class Supervisor:
                 con.execute("ALTER TABLE runs ADD COLUMN turn_key TEXT NOT NULL DEFAULT ''")
                 con.execute('DROP INDEX IF EXISTS runs_turn')
                 con.execute('CREATE UNIQUE INDEX runs_turn ON runs(repo,pr,head,seat,turn_key)')
+            if 'push_admitted' not in {r[1] for r in con.execute('PRAGMA table_info(runs)')}:
+                # Legacy rows cannot acquire permission from a later policy toggle.
+                con.execute('ALTER TABLE runs ADD COLUMN push_admitted INTEGER NOT NULL DEFAULT 0')
+            if 'push_intent' not in {r[1] for r in con.execute('PRAGMA table_info(runs)')}:
+                con.execute('ALTER TABLE runs ADD COLUMN push_intent REAL')
+            if 'push_confirmed' not in {r[1] for r in con.execute('PRAGMA table_info(runs)')}:
+                con.execute('ALTER TABLE runs ADD COLUMN push_confirmed REAL')
             con.execute('COMMIT')
 
     def _connect(self):
@@ -106,6 +114,74 @@ class Supervisor:
                 "ON n.run_id=r.id WHERE r.state IN ('failed','uncertain') "
                 "ORDER BY r.created,r.id LIMIT 100")]
 
+    def quarantine_push(self, run_id: str, repo: str, pr: int, head: str,
+                        outcome: str) -> None:
+        """Persist an ambiguous post-write push before answering the sandbox.
+
+        Keep the uncertain seat occupied even after the worker exits; only an
+        operator may reconcile it after inspecting the remote ref and PR.
+        """
+        if outcome not in ('unknown', 'published_pr_unverified'):
+            raise ValueError('not a post-write hold outcome')
+        with self._connect() as con:
+            con.execute('BEGIN IMMEDIATE')
+            row = con.execute('SELECT repo,pr,head,seat,state,launch_intent FROM runs WHERE id=?',
+                              (run_id,)).fetchone()
+            if (row is None or (row['repo'], row['pr'], row['head'], row['seat']) !=
+                    (repo, pr, head, 'fixer') or row['launch_intent'] is None or
+                    row['state'] not in ('launching', 'running', 'uncertain')):
+                raise ValueError('post-write run identity unavailable')
+            con.execute("UPDATE runs SET state='uncertain',error=?,updated=? WHERE id=?",
+                        (f'post-write push quarantine: {outcome}', time.time(), run_id))
+            con.execute('COMMIT')
+
+    def begin_push(self, run_id: str, repo: str, pr: int, head: str) -> None:
+        """Commit the push intent before any external ref mutation."""
+        with self._connect() as con:
+            con.execute('BEGIN IMMEDIATE')
+            row = con.execute('SELECT repo,pr,head,seat,state,launch_intent,push_admitted,'
+                              'push_intent,push_confirmed FROM runs WHERE id=?', (run_id,)).fetchone()
+            if (row is None or (row['repo'], row['pr'], row['head'], row['seat']) !=
+                    (repo, pr, head, 'fixer') or row['state'] not in ('launching', 'running')
+                    or row['launch_intent'] is None or row['push_admitted'] != 1
+                    or row['push_intent'] is not None or row['push_confirmed'] is not None):
+                raise ValueError('push intent unavailable or already consumed')
+            con.execute('UPDATE runs SET push_intent=?,updated=? WHERE id=?',
+                        (time.time(), time.time(), run_id))
+            con.execute('COMMIT')
+
+    def confirm_push(self, run_id: str, repo: str, pr: int, head: str) -> None:
+        """Clear hold only after exact ref and PR readback succeeded."""
+        with self._connect() as con:
+            con.execute('BEGIN IMMEDIATE')
+            row = con.execute('SELECT repo,pr,head,seat,state,push_intent,push_confirmed '
+                              'FROM runs WHERE id=?', (run_id,)).fetchone()
+            if (row is None or (row['repo'], row['pr'], row['head'], row['seat']) !=
+                    (repo, pr, head, 'fixer') or row['state'] not in ('launching', 'running')
+                    or row['push_intent'] is None or row['push_confirmed'] is not None):
+                raise ValueError('push completion identity unavailable')
+            con.execute('UPDATE runs SET push_intent=NULL,push_confirmed=?,updated=? WHERE id=?',
+                        (time.time(), time.time(), run_id))
+            con.execute('COMMIT')
+
+    def post_write_hold(self, repo: str, pr: int) -> bool:
+        """A PR with an unresolved push cannot receive a merge handoff."""
+        with self._connect() as con:
+            return con.execute("SELECT 1 FROM runs WHERE repo=? AND pr=? "
+                               "AND (push_intent IS NOT NULL OR "
+                               "(state='uncertain' AND error LIKE 'post-write push quarantine:%')) "
+                               "LIMIT 1", (repo, pr)).fetchone() is not None
+
+    def push_admitted(self, run_id: str, repo: str, pr: int, head: str) -> bool:
+        """Host-owned admission snapshot; missing and legacy rows fail closed."""
+        with self._connect() as con:
+            row = con.execute('SELECT repo,pr,head,seat,state,launch_intent,push_admitted '
+                              'FROM runs WHERE id=?', (run_id,)).fetchone()
+        return (row is not None and row['repo'] == repo and row['pr'] == pr and
+                row['head'] == head and row['seat'] == 'fixer' and
+                row['state'] in ('launching', 'running') and
+                row['launch_intent'] is not None and row['push_admitted'] == 1)
+
     def notify(self, deliver) -> int:
         """One bounded alert per failed/uncertain run, retried if delivery fails.
 
@@ -119,7 +195,7 @@ class Supervisor:
                         "SELECT id,'pending',? FROM runs WHERE state IN ('failed','uncertain')",
                         (time.time(),))
             con.execute('COMMIT')
-            rows = con.execute("SELECT r.id,r.repo,r.pr,r.head,r.seat,r.state "
+            rows = con.execute("SELECT r.id,r.repo,r.pr,r.head,r.seat,r.state,r.error "
                                "FROM operator_notices n JOIN runs r ON r.id=n.run_id "
                                "WHERE n.state='pending' ORDER BY n.created,n.run_id LIMIT 20").fetchall()
         count = 0
@@ -130,7 +206,7 @@ class Supervisor:
                 pending = con.execute("SELECT 1 FROM operator_notices WHERE run_id=? "
                                       "AND state='pending'", (row['id'],)).fetchone()
                 if pending:
-                    current = con.execute("SELECT state FROM runs WHERE id=?",
+                    current = con.execute("SELECT state,error FROM runs WHERE id=?",
                                           (row['id'],)).fetchone()
                     if current is None or current['state'] not in ('failed', 'uncertain'):
                         con.execute("UPDATE operator_notices SET state='resolved' WHERE run_id=?",
@@ -140,6 +216,7 @@ class Supervisor:
                     message = (f"⚠️ Review-loop worker {current['state']}: "
                                f"https://github.com/{row['repo']}/pull/{row['pr']} "
                                f"seat={row['seat']} head={row['head']} run={row['id']}. "
+                               f"Reason: {current['error'] or 'worker outcome unavailable'}. "
                                "Do not replay this turn or release its seat based on a lease alone. "
                                "Inspect the worker PID and external GitHub writes; use "
                                "`python -m review_loop.run_supervisor status DB` and "
@@ -177,7 +254,16 @@ class Supervisor:
         if seat not in self.capacity:
             raise ValueError("unconfigured seat")
         now = time.time()
-        with self._connect() as con:
+        # Serialize policy snapshot and durable enqueue with explicit toggles.
+        # Re-delivery of an old row never upgrades its admission.
+        from . import config
+        lock = config.push_policy_lock() if self.production_config and seat == 'fixer' else nullcontext()
+        with lock, self._connect() as con:
+            admitted = 0
+            if self.production_config and seat == 'fixer':
+                loop = config.by_repo(repo)
+                if loop is not None and config.unattended_fixer_push_enabled(loop):
+                    admitted = 1
             con.execute("BEGIN IMMEDIATE")
             prior = con.execute("SELECT * FROM runs WHERE delivery=?", (delivery,)).fetchone()
             if prior:
@@ -187,10 +273,10 @@ class Supervisor:
                 prior = con.execute("SELECT * FROM runs WHERE repo=? AND pr=? AND head=? AND seat=? AND turn_key=?",
                                     (repo, pr, head, seat, turn_key)).fetchone()
                 if not prior:
-                    con.execute("INSERT INTO runs(id,delivery,repo,pr,head,seat,turn_key,state,created,updated) "
-                                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    con.execute("INSERT INTO runs(id,delivery,repo,pr,head,seat,turn_key,state,created,updated,push_admitted) "
+                                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                                 (uuid.uuid4().hex, delivery, repo, pr, head, seat, turn_key,
-                                 "pending" if self.fixture_mode or self.production_config else "blocked", now, now))
+                                 "pending" if self.fixture_mode or self.production_config else "blocked", now, now, admitted))
             con.execute("COMMIT")
         # A redelivery of an unclaimed run must rearm the worker after a
         # transient generation/read outage; active or completed runs stay deduped.
@@ -224,7 +310,10 @@ class Supervisor:
         with self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
             # Never retry an attempt whose child may have been launched.
-            con.execute("UPDATE runs SET state='uncertain', error='worker lost after launch intent', "
+            con.execute("UPDATE runs SET state='uncertain', "
+                        "error=CASE WHEN push_intent IS NOT NULL THEN "
+                        "'post-write push quarantine: worker lost with push intent' "
+                        "ELSE 'worker lost after launch intent' END, "
                         "updated=? WHERE state IN ('launching','running') AND lease<?",
                         (now, now))
             con.execute("UPDATE runs SET state='pending', owner=NULL, lease=NULL, updated=? "
@@ -303,7 +392,8 @@ class Supervisor:
                     continue
                 # Recheck both capacity and PR occupancy under the writer lock.
                 occupied = con.execute("SELECT 1 FROM runs WHERE repo=? AND pr=? "
-                                       "AND state IN ('claimed','launching','running','uncertain')",
+                                       "AND (state IN ('claimed','launching','running','uncertain') "
+                                       "OR push_intent IS NOT NULL)",
                                        (row['repo'], row['pr'])).fetchone()
                 used = con.execute("SELECT COUNT(*) FROM runs WHERE seat=? AND "
                                    "state IN ('claimed','launching','running','uncertain')",
@@ -360,12 +450,20 @@ class Supervisor:
             con.execute("BEGIN IMMEDIATE")
             ambiguous = con.execute("SELECT 1 FROM review_receipts WHERE run_id=? AND state='claimed'",
                                     (run_id,)).fetchone()
+            held = con.execute("SELECT error FROM runs WHERE id=? AND owner=? AND state='uncertain'",
+                               (run_id, owner)).fetchone()
+            intent = con.execute('SELECT push_intent FROM runs WHERE id=? AND owner=?',
+                                 (run_id, owner)).fetchone()
+            quarantined = held is not None and (held['error'] or '').startswith('post-write push quarantine: ')
+            post_write = quarantined or (intent is not None and intent['push_intent'] is not None)
             con.execute("UPDATE runs SET state=?, outcome=?, error=?, lease=NULL, "
                         "updated=? WHERE id=? AND owner=? AND state IN "
                         "('launching','running','uncertain')",
-                        ("uncertain" if not stopped or ambiguous else
+                        ("uncertain" if not stopped or ambiguous or post_write else
                          "succeeded" if rc == 0 and error is None else "failed",
-                         rc, error, time.time(), run_id, owner))
+                         rc, (held['error'] if quarantined else
+                              'post-write push quarantine: unresolved push intent') if post_write else error,
+                         time.time(), run_id, owner))
             con.execute("COMMIT")
 
     def reconcile_uncertain(self, run_id: str, *, reason: str,
@@ -394,7 +492,8 @@ class Supervisor:
                     raise ValueError('worker PID exists; cannot release uncertain run')
             if row['launch_intent'] is None:
                 raise ValueError('missing launch intent; cannot establish worker identity')
-            con.execute("UPDATE runs SET state='failed', error=?, lease=NULL, updated=? "
+            con.execute("UPDATE runs SET state='failed', error=?, lease=NULL, "
+                        "push_intent=NULL,updated=? "
                         "WHERE id=? AND state='uncertain'",
                         ('operator reconciliation: ' + reason, time.time(), run_id))
             con.execute('COMMIT')
