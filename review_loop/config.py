@@ -38,10 +38,13 @@ a base branch and two seats is a configuration error, not a run that guesses.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import pathlib
+import re
 from urllib.parse import urlsplit
+from urllib.request import Request
 
 # Plugin-level settings. The desktop's Capabilities → Plugins form renders `config_schema` from
 # plugin.yaml; this table mirrors it so the CLI can use the same defaults without a YAML parser
@@ -162,27 +165,61 @@ def seat_concurrency(loop: dict, seat: str) -> int:
 class ConfigError(Exception):
     """A loop file that cannot be trusted to drive a run."""
 
+_DNS_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
+
+
 def webhook_host(value: str | None, *, required: bool = False) -> str:
-    """Accept only a gateway origin, never a relative URL or another route prefix."""
-    host = str(value or "").strip().rstrip("/")
+    """Accept only a gateway origin that urllib.request will send to that authority."""
+    host = str(value or "").strip()
     if not host:
         if required:
             raise ConfigError("webhook host required to install routes/hooks: pass --host https://your-gateway.example "
                               "or set your own webhook host in the plugin settings")
         return ""
     try:
+        # urlsplit alone accepts empty userinfo/ports and percent-escaped host delimiters.
+        # urllib.request then unquotes parts of the authority, so inspect the raw syntax too.
         parsed = urlsplit(host)
-        valid = (parsed.scheme in ("http", "https") and bool(parsed.hostname)
-                 and (parsed.port is None or 1 <= parsed.port <= 65535)
-                 and not parsed.username and not parsed.password
-                 and not parsed.path and "?" not in host and "#" not in host
-                 and not any(char.isspace() for char in host))
-    except ValueError:
+        authority = parsed.netloc
+        valid = (parsed.scheme in ("http", "https")
+                 and host[:len(parsed.scheme) + 3].lower() == parsed.scheme + "://"
+                 and bool(authority) and parsed.path in ("", "/")
+                 and "?" not in host and "#" not in host
+                 and not any(ord(char) < 33 or ord(char) == 127 for char in host)
+                 and not any(char in authority for char in "@%\\"))
+        if valid:
+            if authority.startswith("["):
+                bracket = authority.find("]")
+                ipaddress.IPv6Address(authority[1:bracket])
+                suffix = authority[bracket + 1:]
+            else:
+                address, sep, port_text = authority.partition(":")
+                suffix = sep + port_text
+                if not address or len(address.rstrip(".")) > 253:
+                    valid = False
+                elif re.fullmatch(r"[0-9.]+", address):
+                    ipaddress.IPv4Address(address)
+                else:
+                    labels = address.removesuffix(".").split(".")
+                    valid = all(_DNS_LABEL.fullmatch(label) for label in labels)
+            if suffix:
+                valid = (valid and suffix.startswith(":") and bool(suffix[1:])
+                         and suffix[1:].isascii() and suffix[1:].isdecimal()
+                         and 1 <= int(suffix[1:]) <= 65535)
+            valid = valid and parsed.hostname is not None
+            if suffix and valid:
+                valid = parsed.port is not None
+        if valid:
+            origin = host.removesuffix("/")
+            request = Request(f"{origin}/webhooks/test")
+            valid = (request.type == parsed.scheme and request.host == authority
+                     and request.selector == "/webhooks/test")
+    except (ValueError, IndexError):
         valid = False
     if not valid:
         raise ConfigError(f"invalid webhook host {value!r}: --host must be an http(s) gateway "
                           "origin without a path, query, or credentials")
-    return host
+    return host.removesuffix("/")
 
 
 def home() -> pathlib.Path:

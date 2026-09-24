@@ -971,9 +971,26 @@ def group_webhook_host() -> None:
                             ("invalid URL", ["--host", "https://"]),
                             ("path", ["--host", "https://own.example/someone-else"]),
                             ("credentials", ["--host", "https://user:pass@own.example"]),
+                            ("empty userinfo", ["--host", "https://@own.example"]),
+                            ("empty password", ["--host", "https://user:@own.example"]),
+                            ("encoded slash in hostname", ["--host", "https://own.example%2fattacker.example"]),
+                            ("encoded at in hostname", ["--host", "https://own.example%40attacker.example"]),
+                            ("backslash", ["--host", "https://own.example\\attacker.example"]),
                             ("bad port", ["--host", "https://own.example:wrong"]),
+                            ("empty port", ["--host", "https://own.example:"]),
+                            ("signed port", ["--host", "https://own.example:+80"]),
+                            ("unicode port", ["--host", "https://own.example:８０"]),
                             ("out-of-range port", ["--host", "https://own.example:65536"]),
-                            ("empty query", ["--host", "https://own.example?"])):
+                            ("empty query", ["--host", "https://own.example?"]),
+                            ("query", ["--host", "https://own.example/?foo=bar"]),
+                            ("empty fragment", ["--host", "https://own.example#"]),
+                            ("fragment", ["--host", "https://own.example#x"]),
+                            ("double trailing slash", ["--host", "https://own.example//"]),
+                            ("unbracketed IPv6", ["--host", "http://::1"]),
+                            ("bad bracketed IPv6", ["--host", "http://[2001:db8:::1]"]),
+                            ("invalid DNS label", ["--host", "https://own..example"]),
+                            ("invalid IPv4", ["--host", "http://999.999.999.999"])):
+            (LOOPS_DIR / "host-probe.json").unlink(missing_ok=True)
             before = (LOOPS_DIR / "widgets.json").read_bytes(), SUBS.read_bytes()
             calls.clear()
             buf = io.StringIO()
@@ -992,6 +1009,23 @@ def group_webhook_host() -> None:
             rc = parsed.func(parsed)
         check("without --hooks still refuses missing host before writes", rc, 2)
         check("  no config/route files added", (LOOPS_DIR / "host-probe.json").exists(), False)
+
+        from urllib.request import Request
+        for origin, expected in (
+                ("https://own.example:8443/", "https://own.example:8443"),
+                ("https://own.example", "https://own.example"),
+                ("HTTPS://OWN.example", "HTTPS://OWN.example"),
+                ("https://own.example.", "https://own.example."),
+                ("http://localhost:8080", "http://localhost:8080"),
+                ("http://127.0.0.1:8080", "http://127.0.0.1:8080"),
+                ("https://[2001:db8::1]:8443/", "https://[2001:db8::1]:8443"),
+                ("http://[::1]", "http://[::1]")):
+            actual = config.webhook_host(origin, required=True)
+            check(f"valid origin {origin}", actual, expected)
+            request = Request(f"{actual}/webhooks/test")
+            check(f"  urllib destination {origin}",
+                  (request.type, request.host, request.selector),
+                  (expected.split("://", 1)[0].lower(), expected.split("://", 1)[1], "/webhooks/test"))
 
         for label, settings, extra, host in (
                 ("explicit --host", {}, ["--host", "https://own.example:8443/"], "https://own.example:8443"),
