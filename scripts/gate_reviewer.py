@@ -80,12 +80,16 @@ def main() -> None:
                     f"would loop forever")
         silence(f"cap reached on #{number} — handed to adjudication")
 
-    workspace = gate.take_seat(loop, st, seat, number, head, f"review #{number} @ {head[:7]}",
-                               login=(loop["seats"][seat].get("login") or ""))
-    # The fixer pushed and asked: their turn is over, and anything queued behind them can start.
-    if st.release_if("fixer", gate.seat_key(loop, number)):
+    # A request *is* the handoff: the fixer pushes, then asks. That is the only signal that means
+    # the fixer is finished with this PR, so it is what frees the fixer's slot. A review must never
+    # start against a PR the fixer is still working — and everything else (opened, ready_for_review,
+    # reopened) is *not* a handoff, so if the fixer still holds this PR the claim below queues us.
+    if action == "review_requested" and st.release_if("fixer", gate.seat_key(loop, number)):
         log(f"released fixer seat for {gate.seat_key(loop, number)}")
     gate.drain_seat(loop, "fixer")
+
+    workspace = gate.take_seat(loop, st, seat, number, head, f"review #{number} @ {head[:7]}",
+                               login=(loop["seats"][seat].get("login") or ""))
 
     payload["_loop"] = gate.loop_block(loop, number, head, workspace, seat=seat, round=rounds + 1,
                                        role="reviewer")

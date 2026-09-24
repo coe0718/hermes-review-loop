@@ -77,6 +77,9 @@ directly rather than trusting anyone's summary. That means three things for how 
 * a seat has a limit (the reviewer's and the fixer's are set separately), so work above it waits in
   the queue — being queued is normal and costs nothing; a run that died mid-way leaves a slot that
   expires, so you never need to clean up after yourself for the loop to keep moving;
+* one PR is held by one seat at a time. A fix run hands the PR over by pushing and *asking* for the
+  review, and a review hands it over with its verdict — that handoff is what frees your seat, so
+  always end your turn with one of those two acts rather than falling silent;
 * your PR's workspace — one clone per PR *and per seat* — is reused if you are woken again on the
   same PR (a warm build directory is the point) and deleted when the PR closes. Anything you need to
   keep belongs on the PR, not on this disk.

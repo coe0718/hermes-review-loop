@@ -85,6 +85,22 @@ class LoopState:
     def is_active(self, seat: str, key: str) -> bool:
         return key in self.active(seat)
 
+    def held_by_other(self, seat: str, key: str) -> str | None:
+        """The other seat's name if it is working this PR right now, else ``None``.
+
+        One PR belongs to **one seat at a time**: a review must never run against a PR the fixer
+        is mid-fix on, and a fix must not start on a PR under review. This is a PR-level claim
+        that sits under the per-seat capacities, not a replacement for them — capacity says how
+        many PRs a seat may hold, this says a single PR may not be held by both.
+
+        It is deliberately keyed on PR rather than head: two different heads of the same PR are
+        still the same checkout's worth of trouble.
+        """
+        for other in ("reviewer", "fixer"):
+            if other != seat and key in self.active(other):
+                return other
+        return None
+
     def acquire(self, seat: str, key: str, head: str = "", why: str = "") -> None:
         data = self._load(self.locks, {}) or {}
         data.setdefault(seat, {})[key] = {"at": time.time(), "head": head, "why": why}

@@ -42,6 +42,35 @@ The ledger is keyed by **PR**, so the same PR never runs twice even with a free 
 *head* never runs twice at all (in-flight marks). A slot expires (`ttl_min`), so a crashed run
 cannot wedge a loop.
 
+### One PR, one seat — and who frees it
+
+Per-seat capacity answers *how many PRs a seat may hold*. A second, stricter rule sits under it:
+**one PR is held by one seat at a time.** A review must never run against a PR the fixer is mid-fix
+on, and a fix must not start on a PR under review — `held_by_other()` is that claim, and a gate that
+finds the other seat holding the PR queues itself instead of starting.
+
+Which raises the question the loop cannot answer directly: *when is a seat done with a PR?* The loop
+sees events, not process exits. So it uses the events that already mean the turn is over:
+
+| signal | what it ends |
+|---|---|
+| `review_requested` from the fixer | the fixer's turn — the push-then-ask handoff |
+| a verdict at the current head (approve **or** changes-requested) | the reviewer's turn |
+| `ttl_min` | a run that died without either. The backstop, not the mechanism. |
+
+That is also why **order matters inside each gate**: the gate frees the other seat *before* it claims
+its own. Claim first and the two gates deadlock against each other — the reviewer waits for the fixer
+to hand off, the fixer waits for the reviewer to hand off. Both gates therefore look like:
+
+```
+observe the peer's handoff → free the peer → claim own slot (queue if the peer still holds it)
+```
+
+An approval is the case worth naming: the fixer has nothing to do on an approved PR, but the
+reviewer's slot is still held, and a slot that leaks for `ttl_min` on a busy repo is the difference
+between ten review slots and nine. So the approval path frees the reviewer and drains the queue
+without waking anyone.
+
 ## Isolation (parallel without the shared-clone bug)
 
 Isolation is not a performance feature; it is the difference between a parallel loop and a loop that

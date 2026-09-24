@@ -733,6 +733,61 @@ def group_parallel() -> None:
                          capture_output=True, text=True).stdout.strip(), newer)
 
 
+def group_exclusive() -> None:
+    section("one seat per PR — Vex never reviews what Drey is fixing")
+    reset(prs={"7": pr(7)})
+    set_concurrency(2)          # capacity 2, so the only reason to queue is the other seat
+    head = real_head()
+    set_prs({"7": {**pr(7, head=head), "reviews": [review(REVIEWER, head=head, rid=5)]}})
+
+    check("the fixer takes PR #7 on the verdict",
+          run("gate_fixer.py", review_payload(7, head=head, rid=5))[0], "FIRE")
+    check("  and holds it", "acme/widgets#7" in load_state("locks.json").get("fixer", {}), True)
+
+    # A push and a review trigger that is *not* a handoff, while the fixer still works the PR.
+    subprocess.run(["git", "-C", str(CLONE), "commit", "--allow-empty", "-qm", "pushed"],
+                   capture_output=True, text=True)
+    newer = real_head()
+    set_prs({"7": {**pr(7, head=newer), "reviews": [review(REVIEWER, head=head, rid=5)]}})
+
+    kind, _, err = run("gate_reviewer.py", pr_payload(7, head=newer, action="ready_for_review"))
+    check("a non-handoff trigger while the fixer works it → queued", kind, "SILENT")
+    check("  and it says why", "the fixer seat is working this PR" in err, True)
+    check("  no reviewer slot was taken", load_state("locks.json").get("reviewer", {}), {})
+    check("  queued, not dropped",
+          "fixer seat is working" in load_state("pending.json")["reviewer"]["acme/widgets#7"]["reason"], True)
+    check("  the fixer still holds it", "acme/widgets#7" in load_state("locks.json").get("fixer", {}), True)
+
+    kind, out, _ = run("gate_reviewer.py", pr_payload(7, head=newer, action="review_requested"))
+    check("the fixer's request *is* the handoff → review starts", kind, "FIRE")
+    check("  and the fixer's slot is freed", "acme/widgets#7" in load_state("locks.json").get("fixer", {}), False)
+    check("  the stale queue entry is gone", load_state("pending.json").get("reviewer", {}), {})
+    check("  the payload names the newer head", json.loads(out)["_loop"]["head"], newer)
+
+    section("an approval frees the reviewer's slot — the queue keeps moving")
+    reset(prs={"7": pr(7), "9": pr(9), "11": pr(11)})
+    set_concurrency(2)                     # reviewer capacity 2, fixer capacity 2 (independently)
+    head = real_head()
+    set_prs({n: pr(n, head=head) for n in (7, 9, 11)})
+
+    check("review #7 starts", run("gate_reviewer.py", pr_payload(7, head=head, action="opened"))[0], "FIRE")
+    check("review #9 starts", run("gate_reviewer.py", pr_payload(9, head=head, action="opened"))[0], "FIRE")
+    kind, _, err = run("gate_reviewer.py", pr_payload(11, head=head, action="opened"))
+    check("review #11 queues (at capacity)", kind, "SILENT")
+    check("  it says capacity", "at capacity 2/2" in err, True)
+    check("  both slots are held", len(load_state("locks.json").get("reviewer", {})), 2)
+
+    before = len(RECEIVED)
+    kind, _, err = run("gate_fixer.py", review_payload(7, head=head, state="approved", rid=9))
+    check("an approval wakes no fix run", kind, "SILENT")
+    check("  it says the slot was freed", "reviewer's slot freed" in err, True)
+    check("  the reviewer is down to one hold", len(load_state("locks.json").get("reviewer", {})), 1)
+    check("  the queued PR was picked up", len(RECEIVED) - before, 1)
+    check("  and it was #11 that started", json.loads(RECEIVED[-1]["body"])["number"], 11)
+    check("  with a valid signature", verify_sig(RECEIVED[-1], "widgets-review"), True)
+    check("  the queue is empty again", load_state("pending.json").get("reviewer", {}), {})
+
+
 def group_watchdog() -> None:
     section("watchdog — quiet is not the same as nothing to do")
 
@@ -874,7 +929,8 @@ def group_cleanup() -> None:
 
 GROUPS = {"config": group_config, "reviewer": group_reviewer_gate, "budget": group_budget,
           "fixer": group_fixer_gate, "seats": group_seats, "parallel": group_parallel,
-          "settings": group_settings, "watchdog": group_watchdog, "cleanup": group_cleanup}
+          "exclusive": group_exclusive, "settings": group_settings, "watchdog": group_watchdog,
+          "cleanup": group_cleanup}
 
 
 def main() -> int:

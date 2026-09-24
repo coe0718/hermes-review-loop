@@ -12,9 +12,14 @@ The order of the guards matters and is the same in both gates:
 2. can we read the facts we need (never guess a round count from a failed API call);
 3. has this exact head already been handled (in-flight marks);
 4. is the budget spent (cap → hand the PR to adjudication, do not buy another round);
-5. is there a free slot for this seat (otherwise queue it and stay quiet);
-6. can this run be isolated (above ``concurrency 1`` a shared clone is not an option);
-7. only then: record, prepare the workspace, announce, fire.
+5. does the other seat already own this PR (one PR runs one seat at a time — queue, don't start);
+6. is there a free slot for this seat (otherwise queue it and stay quiet);
+7. can this run be isolated (above ``concurrency 1`` a shared clone is not an option);
+8. only then: record, prepare the workspace, announce, fire.
+
+A gate must free the *other* seat's turn **before** it claims its own (the fixer's request is what
+ends the fixer's turn, the reviewer's verdict is what ends the reviewer's) — claim first and the
+gates deadlock against each other, each waiting for the other's hold to clear.
 """
 
 from __future__ import annotations
@@ -279,6 +284,13 @@ def take_seat(loop: dict, st: state_mod.LoopState, seat: str, number: int, head:
         log(f"{seat} is already running {key} — refusing a second run at the same PR")
         silence()
 
+    other = st.held_by_other(seat, key)
+    if other:
+        st.queue_add(seat, key, head, pr_url(loop, number),
+                     f"the {other} seat is working this PR")
+        log(f"{other} holds #{number} — queued {seat} rather than running both on one PR")
+        silence(f"the {other} seat is working this PR — queued until it hands off")
+
     live = st.active(seat)
     if len(live) >= capacity:
         held = ", ".join(f"{k} ({int(time.time() - v.get('at', time.time()))}s)"
@@ -289,6 +301,7 @@ def take_seat(loop: dict, st: state_mod.LoopState, seat: str, number: int, head:
         silence()
 
     st.acquire(seat, key, head, why)
+    st.queue_pop(seat, key)        # a direct event can outrun the drain: the entry is stale now
 
     workspace = isolation.ensure(loop, number, seat, head, login=login or "")
     if workspace is None and capacity > 1:

@@ -85,6 +85,13 @@ def drain(loop: dict, st: state_mod.LoopState, seat: str, quiet: bool = False) -
             st.queue_pop(seat, key)
             continue
 
+        held = st.held_by_other(seat, key)
+        if held:
+            # The other seat owns this PR. Its handoff (or its slot expiring) is what frees it —
+            # the poller must not start a run on top of it, or it would just re-queue.
+            log(f"drain: the {held} seat holds {key} — left queued")
+            continue
+
         pr = gh.pr(loop, number)
         if not isinstance(pr, dict) or not pr:
             log(f"drain: PR #{number} unreadable — left queued")

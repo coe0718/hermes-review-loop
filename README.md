@@ -107,10 +107,33 @@ Each seat needs its own GitHub token, and that is deliberate: the token that rev
 that pushes and the token that reads are separate and revocable one at a time. A classic PAT with
 `repo` is enough for the seats; creating hooks additionally needs `admin:repo_hook`.
 
+### How it handles a burst
+
+Fifty PRs arrive in an hour. Ten of them wake the reviewer, and forty-one queue — the queue costs
+nothing but disk-less JSON. The moment a review ends, that slot is filled from the queue:
+
+```
+review #101 finishes (approve or changes-requested)
+  → its slot is freed
+  → the queue is drained immediately, up to the free slots
+  → the next queued PR's review starts
+```
+
+A slot is not freed by a timer. The **verdict** frees it, either kind; the fixer's **request** frees
+the fixer's. The watchdog sweep is only the backstop, and `ttl_min` is the last resort for a run that
+died without a verdict. Capacity is per seat, so `reviewer 10 · fixer 2` is a legitimate shape —
+reviews are cheap and parallel, fixes are not.
+
+Do the arithmetic before setting it high: each in-flight run is a whole agent plus its own clone and
+its own cold build. On a big Rust repo, ten at once is ten parallel builds — the machine, not GitHub,
+is what decides how high this number can go.
+
 ## What the loop guarantees
 
-- **One run per PR.** A slot keyed to the PR; a second request is queued, costs nothing, and starts
-  when a slot frees. Slots expire, so a crashed run cannot wedge a loop.
+- **One PR, one seat.** A PR is held by the reviewer *or* the fixer, never both: a review never
+  runs against a PR the fixer is mid-fix on. The handoff is what frees the other seat — the fixer's
+  `review_requested` ends the fixer's turn, the reviewer's verdict ends the reviewer's. Any other
+  trigger that arrives while the other seat holds the PR queues instead of starting.
 - **Capacity is per seat.** `reviewer 2 · fixer 1` means two reviews in flight and one fix — Drey
   and Vex are different models on different budgets, and wanting two reviews rarely means wanting
   two fixes. Everything above a seat's limit queues, and starts when a slot frees.
@@ -133,11 +156,12 @@ that pushes and the token that reads are separate and revocable one at a time. A
 
 Exercised and passing:
 
-- `python3 tests/run_tests.py` — 145 checks, no network: every gate branch, the cap, per-seat
-  capacity and queueing, **real isolation** (real clones — one per PR *and* per seat — checked out
-  at the head, with no token in them), the `set` verb's rails (including the round trip a
-  stranger's install depends on), all four watchdog stall shapes, and the cleanup rails against a
-  real git clone.
+- `python3 tests/run_tests.py` — 168 checks, no network: every gate branch, the cap, the one-PR-one-
+  seat rule (including the handoff that must *not* deadlock the gates), per-seat capacity and
+  queueing, an approval freeing its slot and starting the next queued PR, **real isolation** (real
+  clones — one per PR *and* per seat — checked out at the head, with no token in them), the `set`
+  verb's rails (including the round trip a stranger's install depends on), all four watchdog stall
+  shapes, and the cleanup rails against a real git clone.
 - Live use on a private repository: two seats, dozens of PRs, review → verdict → fix → cleanup.
 
 Not proven, and worth knowing before you trust it:

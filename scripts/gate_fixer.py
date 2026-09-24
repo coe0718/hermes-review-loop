@@ -42,16 +42,26 @@ def main() -> None:
     # boundary — assuming one spelling is how the fixer leg of this loop died on arrival once.
     if gate.reviewer_login(review) not in set(loop["reviewers"]):
         silence(f"verdict author {gate.reviewer_login(review) or 'unknown'} is not a reviewer")
-    if str(review.get("state", "")).upper() != "CHANGES_REQUESTED":
+
+    seat = "fixer"
+    number = gate.number_of(payload, pr)
+    key = gate.seat_key(loop, number)
+
+    state = str(review.get("state", "")).upper()
+    if state == "APPROVED":
+        # An approval ends the reviewer's turn exactly as a rejection does, and nothing else would
+        # free that slot before it expired. A slot that leaks for `ttl_min` is a queue that stops
+        # moving — on a busy repo, that is the difference between ten review slots and nine.
+        if st.release_if("reviewer", key):
+            log(f"released reviewer seat for {key}")
+        gate.drain_seat(loop, "reviewer")
+        silence(f"#{number} approved — reviewer's slot freed, nothing for the fixer to do")
+    if state != "CHANGES_REQUESTED":
         silence(f"verdict state {review.get('state')!r} needs no fix")
 
     pr_head = gate.head_of(pr)
     if review.get("commit_id") != pr_head:
         silence("verdict is on an older head — superseded")
-
-    seat = "fixer"
-    number = gate.number_of(payload, pr)
-    key = gate.seat_key(loop, number)
 
     reviews = gate.fetch_reviews(loop, number)
     prior = len(gate.verdicts(reviews, loop, exclude_id=review.get("id")))
