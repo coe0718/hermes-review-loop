@@ -131,10 +131,9 @@ def drain(loop: dict, st: state_mod.LoopState, seat: str, quiet: bool = False) -
             continue
 
         reviews = gh.reviews(loop, number)
-        if reviews is None:
-            log(f"drain: cannot read reviews for #{number} — left queued")
+        if not isinstance(reviews, list):
+            log(f"drain: cannot read a valid review list for #{number} — left queued")
             continue
-        reviews = reviews if isinstance(reviews, list) else []
         short = {"number": number, "draft": False, "base": {"ref": base},
                  "user": {"login": author}, "head": {"sha": head, "ref": (pr.get("head") or {}).get("ref")},
                  "title": pr.get("title", ""), "html_url": pr.get("html_url", "")}

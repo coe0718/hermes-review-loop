@@ -1390,6 +1390,16 @@ def group_watchdog() -> None:
     check("fresh B request is woken", len(RECEIVED) - before, 1)
     check("fresh B wake carries B", json.loads(RECEIVED[-1]["body"])["pull_request"]["head"]["sha"], HEAD_B)
 
+    # A readable but malformed reviews response is not evidence of zero verdicts.
+    reset(prs={"7": {**pr(7), "reviews": {"message": "not a review list"}}})
+    state_file("pending.json").write_text(json.dumps({"reviewer": {
+        f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "url": "u", "reason": "busy"}}}))
+    before = len(RECEIVED)
+    run("watchdog.py", None, "--loop", "widgets", "--drain", "--seat", "reviewer")
+    check("malformed review list never wakes queued reviewer", len(RECEIVED) - before, 0)
+    check("malformed review list retains queue for retry",
+          f"{REPO}#7" in load_state("pending.json").get("reviewer", {}), True)
+
     # a queued request for a head that was already reviewed dies quietly
     reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER)]}})
     state_file("pending.json").write_text(json.dumps(
