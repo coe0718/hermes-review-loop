@@ -51,21 +51,6 @@ def valid_clock(value: object, now: float) -> float | None:
     return clock if math.isfinite(clock) and 0 < clock <= now else None
 
 
-# -- is the loop actually live? -------------------------------------------------
-
-
-def hooks_armed(loop: dict) -> bool:
-    """Both seat routes must exist as active repo hooks, or the loop is parked."""
-    hooks = gh.api(loop, f"/repos/{loop['repo']}/hooks?per_page=100")
-    if not isinstance(hooks, list):
-        return False
-    wanted = {loop["seats"]["reviewer"]["route"], loop["seats"]["fixer"]["route"]}
-    found = [h for h in hooks
-             if isinstance(h, dict) and any(name in (h.get("config") or {}).get("url", "")
-                                            for name in wanted)]
-    return bool(found) and all(h.get("active") for h in found)
-
-
 # -- draining ------------------------------------------------------------------
 
 
@@ -218,7 +203,7 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
     watch = st.watch()
     now = time.time()
 
-    if not TEST and not hooks_armed(loop):
+    if not TEST and not gate.hooks_armed(loop):
         return lines                              # parked on purpose: say nothing, ever
 
     prs = gh.open_prs(loop)
@@ -390,7 +375,7 @@ def main() -> None:
     if args.drain:
         for loop in loops:
             st = state_mod.state_for(loop)
-            if not TEST and not hooks_armed(loop):
+            if not TEST and not gate.hooks_armed(loop):
                 if args.loop:
                     print(f"{loop['id']}: hooks are paused — nothing drained")
                 continue

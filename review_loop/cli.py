@@ -16,7 +16,7 @@ import subprocess
 import sys
 import time
 
-from . import config, gh, prompts, routes
+from . import config, gate, gh, prompts, routes
 
 SHIM_NAME = "review-loop-watchdog.py"
 
@@ -395,6 +395,60 @@ def cmd_status(args) -> int:
     return 0
 
 
+def cmd_explain(args) -> int:
+    """Why one PR is not moving, and the one event that would move it.
+
+    Read-only all the way down: it reads GitHub and the loop's own state files and writes neither —
+    no claim, no queue entry, no drain, no webhook POST, no token printed. The conclusions come
+    from ``gate.explain``, so they are the predicates the live gates run rather than a second
+    opinion about them.
+
+    Exit 2 only when the question cannot be asked at all (an unknown loop, or several loops and no
+    ``--loop``). A PR GitHub does not have, or cannot be read, is an *answer*: it is reported as
+    unknown, with the read to retry.
+    """
+    from . import state as state_mod
+
+    if args.loop:
+        try:
+            loops = [config.load_id(args.loop)]
+        except config.ConfigError as exc:
+            print(f"no such loop: {exc}")
+            return 2
+    else:
+        loops = config.all_loops()
+        if len(loops) > 1:
+            print(f"{len(loops)} loops are configured "
+                  f"({', '.join(loop['id'] for loop in loops)}) — name one with --loop")
+            return 2
+        if not loops:
+            print(f"no loops configured in {config.config_dir()}")
+            return 2
+
+    for loop in loops:
+        st = state_mod.state_for(loop)
+        report = gate.explain(loop, st, args.pr, gate.explain_facts(loop, args.pr))
+        print()
+        print(f"[{loop['id']}] {loop['repo']}#{args.pr} — why this PR is not moving")
+        print(f"  {'pr:':<12}{report['url']}")
+        print(f"  {'read:':<12}{report['read_at']} (GitHub pulls/reviews/hooks + local state; "
+              f"read once, nothing written)")
+        print(f"  {'state:':<12}{report['state_line']}")
+        print(f"  {'budget:':<12}{report['budget']}")
+        print(f"  {'seat:':<12}{report['seat']}")
+        print(f"  {'queue:':<12}{report['queue']}")
+        print(f"  {'in-flight:':<12}{report['inflight']}")
+        print(f"  {'escalation:':<12}{report['escalation']}")
+        print(f"  {'hooks:':<12}{report['hooks']}")
+        print(f"  {'sweep:':<12}{report['sweep']}")
+        for text in report["blockers"]:
+            print(f"  {'blocked:':<12}{text}")
+        if not report["blockers"]:
+            print(f"  {'blocked:':<12}nothing — no guard is holding this PR back")
+        print(f"  {'next:':<12}{report['next']['action']}")
+    return 0
+
+
 def cmd_arm(args) -> int:
     for loop in ([config.load_id(args.loop)] if args.loop else config.all_loops()):
         for line in _set_hooks(loop, not args.pause, args.admin_token):
@@ -518,6 +572,12 @@ def register_cli(ctx, settings: dict | None = None) -> None:
         status = sub.add_parser("status", help="Show a loop's config and live state")
         status.add_argument("--loop")
         status.set_defaults(func=cmd_status)
+
+        explain = sub.add_parser("explain",
+                                 help="Why one PR is not moving, and what has to happen next")
+        explain.add_argument("--loop", help="loop id (default: the only configured loop)")
+        explain.add_argument("--pr", type=int, required=True, help="pull request number to explain")
+        explain.set_defaults(func=cmd_explain)
 
         change = sub.add_parser("set", help="Change a loop's settings in place")
         change.add_argument("--loop", required=True)

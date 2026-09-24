@@ -102,6 +102,7 @@ registry is visible, but crash durability is unconfirmed; do not assume the oper
 ```bash
 hermes review-loop list                 # what is configured
 hermes review-loop status --loop name   # parallel setting, live runs, queue, breaches
+hermes review-loop explain --loop name --pr 123   # why that PR is not moving, and what is next
 hermes review-loop settings             # the plugin-level defaults, and where each came from
 hermes review-loop apply --loop name    # push those defaults onto an existing loop (--dry-run)
 hermes review-loop set --loop name --reviewer-concurrency 2   # two reviews at once, one fix at a time
@@ -121,6 +122,72 @@ change takes effect on the next event with nothing to re-install.
 Each seat needs its own GitHub token, and that is deliberate: the token that reviews, the token
 that pushes and the token that reads are separate and revocable one at a time. A classic PAT with
 `repo` is enough for the seats; creating hooks additionally needs `admin:repo_hook`.
+
+### Why isn't this PR moving?
+
+`status` shows the loop's shape; `explain` answers the question you actually have at 2am, for one
+PR: what GitHub says about the head, how much of the budget is spent *at that head*, who holds the
+seat, what is queued or marked in flight, whether the loop is paused, and — last line, always — the
+one event that has to happen next.
+
+```bash
+hermes review-loop explain --loop widgets --pr 7    # --loop may be omitted when it is the only loop
+```
+
+```
+[widgets] acme/widgets#7 — why this PR is not moving
+  pr:         https://github.com/acme/widgets/pull/7
+  read:       2026-09-24T01:58:53Z (GitHub pulls/reviews/hooks + local state; read once, nothing written)
+  state:      open · base main · author dev-fixer · head aaaaaaa
+  budget:     1/3 verdicts spent · 1 at head aaaaaaa — changes requested 2026-01-01T00:00:00Z by rev-coach
+  seat:       nobody holds it
+  queue:      not queued
+  in-flight:  none
+  escalation: none
+  hooks:      armed — both seat routes are active repo hooks
+  sweep:      no watchdog sweep recorded — nothing has read this loop's PRs yet
+  blocked:    the changes-requested verdict at head aaaaaaa has no fix run out — the fixer gate did not start one for that delivery
+  next:       the fixer pushes a fix and re-requests review of head aaaaaaa: gh api -X POST repos/acme/widgets/pulls/7/requested_reviewers -f 'reviewers[]=rev-seat' — the verdict landed and no fix run is out
+```
+
+A PR that is waiting rather than broken says so, instead of looking like a failure:
+
+```
+[widgets] acme/widgets#9 — why this PR is not moving
+  pr:         https://github.com/acme/widgets/pull/9
+  read:       2026-09-24T01:58:53Z (GitHub pulls/reviews/hooks + local state; read once, nothing written)
+  state:      open · base main · author dev-fixer · head bbbbbbb
+  budget:     0/3 verdicts spent · nothing at head bbbbbbb
+  seat:       nobody holds it
+  queue:      reviewer 1 of 1 (waiting 9m) — reviewer at capacity 1/1: acme/widgets#7 (720s)
+  in-flight:  none
+  escalation: none
+  hooks:      armed — both seat routes are active repo hooks
+  sweep:      no watchdog sweep recorded — nothing has read this loop's PRs yet
+  blocked:    no capacity: queued with the reviewer seat — reviewer at capacity 1/1: acme/widgets#7 (720s)
+  next:       a reviewer slot frees — the queued run starts then (a verdict or a handoff ends the run holding it; the lock expiry at 45m is the backstop)
+```
+
+Three rules keep it honest:
+
+* **No second engine.** The conclusions come from the same predicates the live gates run
+  (`verdicts`, `reviewed_at_head`, `changes_at_head`, `approved_at_head`, the seat ledgers, the
+  queue, the breach marker, the armed check), in the gates' own guard order. A gate stops at the
+  first guard that silences it; `explain` reports every guard and names the one that is holding the
+  PR. What it says cannot drift from what the loop would do, because it is the same code.
+* **Unknown is not a guess.** A failed GitHub read, an unreadable review list, an unreadable hook
+  list, a missing PR: each is printed as unknown, with the reason and the retry, instead of being
+  rendered as "0 verdicts" or "closed". Every timestamp is labelled with where it came from — the
+  read itself, the verdict's `submitted_at`, or the state file's own mark.
+* **Read-only, byte for byte.** No claim, no queue entry, no inflight mark, no drain, no webhook
+  POST, no token printed, and it does not even prune an expired lock while looking at it. Run it
+  twice and GitHub, the loop's state directory and your routes file are untouched. The suite asserts
+  exactly that.
+
+It needs to read the repo's hooks to tell "paused" from "armed", so the read token wants enough
+scope to see them (`repo` is normally enough); if it cannot, the line says the hook state is unknown
+rather than claiming the loop is parked. `explain` exits 2 only when the question cannot be asked at
+all — an unknown loop, or several loops and no `--loop`.
 
 ### How it handles a burst
 
@@ -203,6 +270,10 @@ never copied into `~/.hermes/skills/`.
 - **The watchdog is read-only until it has a reason.** Four stall shapes, read from GitHub state;
   each armed sweep drains eligible queued runs when a seat is free, without waiting for a stall alert.
   A queued head that no longer matches the PR is dropped, never silently retargeted.
+- **Asking why changes nothing.** `explain` reads GitHub and the loop's own files, reaches its
+  conclusion through the *same* predicates the gates run, and writes nothing at all — no queue
+  entry, no claim, no drain, no webhook POST, no token. Run it twice and the loop is byte-for-byte
+  as it was.
 - **Paused means silent.** With the repo hooks off, the watchdog says nothing and drains nothing: a
   parked loop must never spend a run.
 
@@ -210,13 +281,16 @@ never copied into `~/.hermes/skills/`.
 
 Exercised and passing:
 
-- `python3 tests/run_tests.py` — 466 checks, no network: every gate branch, the cap, the one-PR-one-
+- `python3 tests/run_tests.py` — no network: every gate branch, the cap, the one-PR-one-
   seat rule (including the handoff that must *not* deadlock the gates), per-seat capacity and
   queueing, an approval freeing its slot and starting the next queued PR, **real isolation** (real
   clones — one per PR *and* per seat — checked out at the head, with no token in them), the `set` /
   `apply` / `settings` verbs (including the round trip a stranger's install depends on, and that
   `plugin.yaml`'s `config_schema` still matches the keys the code reads), all four watchdog stall
-  shapes, and the cleanup rails against a real git clone.
+  shapes, `explain`'s golden cases (a review in flight, a review with no verdict, a verdict with no
+  fix, a head nobody asked about, a PR queued behind a full seat, a spent budget, a paused loop, a
+  closed PR, a missing PR, a failed GitHub read) plus the proof that two runs of it change nothing,
+  and the cleanup rails against a real git clone.
 - Live use on a private repository: two seats, dozens of PRs, review → verdict → fix → cleanup.
 
 Not proven, and worth knowing before you trust it:
@@ -226,6 +300,9 @@ Not proven, and worth knowing before you trust it:
   `hermes review-loop status`.
 - Cleanup reports **file bytes removed** (`du`), which is not the same as disk recovered on a
   compressed or reflink-sharing volume — quote the `df` delta too.
+- `explain` has been exercised by the suite and by hand against stubbed GitHub, not yet against a
+  live 2am stall. Its armed/paused line depends on the read token being able to see the repo's
+  hooks; where it cannot, the line says unknown instead of claiming the loop is parked.
 - One gateway host is assumed for the routes (`host` in each loop config). A fleet of gateways is
   untested.
 
