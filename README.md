@@ -74,9 +74,15 @@ hermes review-loop init \
   --root ~/reviews --root ~/.hermes/cache/scratch \
   --token rev-bot=~/.hermes/keys/rev-bot-pat \
   --read-token rev-bot \
+  --host https://your-gateway.example \
   --hooks --admin-token owner-account \
   --schedule 15m --watchdog-deliver telegram
 ```
+
+Replace `--host` with the public origin of **your own** Hermes gateway (no path), or explicitly
+set `host` in this plugin's settings. There is no shared webhook host. `init` refuses a missing or
+invalid host before writing the loop config or routes; `--hooks` never creates GitHub hooks in that
+case. Use HTTPS for a public GitHub webhook (HTTP is useful for local testing).
 
 That writes exactly four things, all of them visible and reversible:
 
@@ -145,7 +151,7 @@ The plugin declares a `config_schema`, so it has a settings form at
 | `grace_min` | 25 | quiet minutes before the watchdog speaks |
 | `ttl_min` | 45 | how long a seat slot survives a run that died without a verdict |
 | `inflight_ttl_min` | 10 | how long a mark blocks a second run at the same head |
-| `host` | hooks.coemedia.us | webhook host the routes are reached on |
+| `host` | unset | your gateway's webhook origin; required for `init`, or supply `--host` |
 
 The form shows friendly labels (`Reviews at once`, `Watchdog grace (minutes)`, `Clone path (required
 above 1)`); the keys in the table are what `hermes review-loop settings` prints and what the loop

@@ -41,6 +41,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+from urllib.parse import urlsplit
 
 # Plugin-level settings. The desktop's Capabilities → Plugins form renders `config_schema` from
 # plugin.yaml; this table mirrors it so the CLI can use the same defaults without a YAML parser
@@ -69,8 +70,8 @@ SETTINGS_SCHEMA: dict = {
     "inflight_ttl_min": {"label": "In-flight mark TTL (minutes)", "type": "int", "default": 10,
                          "description": "Minutes an in-flight mark blocks a second run at the "
                                         "same head"},
-    "host": {"label": "Webhook host", "type": "str", "default": "https://hooks.coemedia.us",
-             "description": "Webhook host the loop's routes are reached on"},
+    "host": {"label": "Webhook host", "type": "str", "default": "",
+             "description": "Your gateway's public webhook origin (required to create GitHub hooks)"},
 }
 
 
@@ -109,8 +110,10 @@ def apply_settings(loop_raw: dict, settings: dict | None) -> dict:
     clone = d["clone"] or str(loop_raw.get("clone") or "")
     # The per-seat numbers are written explicitly, so the loop-level default never has to be
     # guessed at: whatever `concurrency` says, the seats carry their own answered value.
+    # An unset form value cannot erase an existing loop's explicitly configured gateway.
+    host = d["host"] or loop_raw.get("host") or ""
     return {**loop_raw, "cap": d["cap"], "clone": clone, "base": d["base"],
-            "host": d["host"], "grace_min": d["grace_min"], "ttl_min": d["ttl_min"],
+            "host": host, "grace_min": d["grace_min"], "ttl_min": d["ttl_min"],
             "inflight_ttl_min": d["inflight_ttl_min"], "seats": seats}
 
 
@@ -133,7 +136,7 @@ DEFAULTS: dict = {
     "cooldown_h": 6,
     "ttl_min": 45,            # seat lock lifetime: past this a crashed run has lost its seat
     "inflight_ttl_min": 10,
-    "host": "https://hooks.coemedia.us",
+    "host": "",
 }
 
 SEAT_KEYS = ("reviewer", "fixer")
@@ -158,6 +161,28 @@ def seat_concurrency(loop: dict, seat: str) -> int:
 
 class ConfigError(Exception):
     """A loop file that cannot be trusted to drive a run."""
+
+def webhook_host(value: str | None, *, required: bool = False) -> str:
+    """Accept only a gateway origin, never a relative URL or another route prefix."""
+    host = str(value or "").strip().rstrip("/")
+    if not host:
+        if required:
+            raise ConfigError("webhook host required to install routes/hooks: pass --host https://your-gateway.example "
+                              "or set your own webhook host in the plugin settings")
+        return ""
+    try:
+        parsed = urlsplit(host)
+        valid = (parsed.scheme in ("http", "https") and bool(parsed.hostname)
+                 and (parsed.port is None or 1 <= parsed.port <= 65535)
+                 and not parsed.username and not parsed.password
+                 and not parsed.path and "?" not in host and "#" not in host
+                 and not any(char.isspace() for char in host))
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ConfigError(f"invalid webhook host {value!r}: --host must be an http(s) gateway "
+                          "origin without a path, query, or credentials")
+    return host
 
 
 def home() -> pathlib.Path:
@@ -258,7 +283,7 @@ def normalize(raw: dict, source: pathlib.Path | None = None) -> dict:
                     f"{where}: seats.{seat}.concurrency > 1 requires 'clone' "
                     f"(runs must be isolated)")
 
-    loop["host"] = str(loop.get("host") or DEFAULTS["host"]).rstrip("/")
+    loop["host"] = webhook_host(loop.get("host"))
     if not loop.get("state_dir"):
         loop["state_dir"] = str(home() / "state" / "review-loops" / loop["id"])
     return loop

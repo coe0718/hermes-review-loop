@@ -940,6 +940,86 @@ def group_plugin_settings() -> None:
     check("settings lists every knob", "reviewer_concurrency" in buf.getvalue(), True)
     check("  and where it came from", "[set]" in buf.getvalue(), True)
 
+def group_webhook_host() -> None:
+    section("webhook host — never borrow another operator's gateway")
+    from review_loop import cli, config, gh
+
+    reset(prs={})
+    init_args = ["init", "--repo", "acme/host-probe", "--fixer", FIXER,
+                 "--reviewer", REVIEWER, "--reviewer-profile", "reviewer-profile",
+                 "--fixer-profile", "fixer-profile", "--hooks"]
+    calls = []
+    original_api = gh.api
+    def fake_api(loop, path, **kwargs):
+        calls.append((path, kwargs))
+        return {"id": len(calls)}
+    gh.api = fake_api
+    try:
+        def parser_for(settings=None):
+            fake = FakeCtx()
+            cli.register_cli(fake, settings=settings)
+            parser = argparse.ArgumentParser(prog="hermes review-loop")
+            fake.setup(parser)
+            return parser
+
+        parser = parser_for()
+        check("unset schema host has no operator URL", config.settings_defaults(None)["host"], "")
+        kept = config.apply_settings(config.load_id("widgets"), {"host": ""})
+        check("empty plugin setting preserves existing loop host", kept["host"], HOST)
+        for label, args in (("missing", []), ("blank", ["--host", "   "]),
+                            ("relative", ["--host", "gateway.local"]),
+                            ("invalid URL", ["--host", "https://"]),
+                            ("path", ["--host", "https://own.example/someone-else"]),
+                            ("credentials", ["--host", "https://user:pass@own.example"]),
+                            ("bad port", ["--host", "https://own.example:wrong"]),
+                            ("out-of-range port", ["--host", "https://own.example:65536"]),
+                            ("empty query", ["--host", "https://own.example?"])):
+            before = (LOOPS_DIR / "widgets.json").read_bytes(), SUBS.read_bytes()
+            calls.clear()
+            buf = io.StringIO()
+            parsed = parser.parse_args([*init_args, *args])
+            with contextlib.redirect_stdout(buf):
+                rc = parsed.func(parsed)
+            check(f"{label} host refused before init writes", rc, 2)
+            check(f"  {label}: actionable error", "--host" in buf.getvalue(), True)
+            check(f"  {label}: no config/route writes",
+                  ((LOOPS_DIR / "widgets.json").read_bytes(), SUBS.read_bytes()) == before, True)
+            check(f"  {label}: no new loop config", (LOOPS_DIR / "host-probe.json").exists(), False)
+            check(f"  {label}: no API calls", calls, [])
+
+        parsed = parser.parse_args(init_args[:-1])
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = parsed.func(parsed)
+        check("without --hooks still refuses missing host before writes", rc, 2)
+        check("  no config/route files added", (LOOPS_DIR / "host-probe.json").exists(), False)
+
+        for label, settings, extra, host in (
+                ("explicit --host", {}, ["--host", "https://own.example:8443/"], "https://own.example:8443"),
+                ("own plugin setting", {"host": "https://settings.example"}, [], "https://settings.example")):
+            reset(prs={})
+            calls.clear()
+            parser = parser_for(settings)
+            args = parser.parse_args([*init_args, *extra])
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = args.func(args)
+            check(f"{label}: init succeeds", rc, 0)
+            check(f"  {label}: saved host", config.load_id("host-probe")["host"], host)
+            check(f"  {label}: hook URLs", [body["config"]["url"] for _, kw in calls
+                  for body in [kw["body"]]],
+                  [f"{host}/p/reviewer-profile/webhooks/host-probe-review",
+                   f"{host}/p/fixer-profile/webhooks/host-probe-fix"])
+            check(f"  {label}: route hosts",
+                  [json.loads(SUBS.read_text())[name]["host"]
+                   for name in ("host-probe-review", "host-probe-fix")], [host, host])
+
+        legacy = json.loads((LOOPS_DIR / "widgets.json").read_text())
+        legacy["host"] = "https://existing.example/"
+        (LOOPS_DIR / "widgets.json").write_text(json.dumps(legacy))
+        check("existing explicit host loads unchanged except trailing slash",
+              config.load_id("widgets")["host"], "https://existing.example")
+    finally:
+        gh.api = original_api
+
 
 def group_watchdog() -> None:
     section("watchdog — quiet is not the same as nothing to do")
@@ -1083,6 +1163,7 @@ def group_cleanup() -> None:
 GROUPS = {"config": group_config, "reviewer": group_reviewer_gate, "budget": group_budget,
           "fixer": group_fixer_gate, "seats": group_seats, "parallel": group_parallel,
           "exclusive": group_exclusive, "settings": group_settings,
+          "webhook_host": group_webhook_host,
           "plugin_settings": group_plugin_settings, "watchdog": group_watchdog,
           "cleanup": group_cleanup}
 

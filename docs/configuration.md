@@ -40,7 +40,7 @@ configuration error, not a run that guesses.
 | `concurrency` | `1` | default runs at once *per seat*. `1` = serialized; above 1 requires `clone`, because every run then gets its own isolated clone. |
 | `seats.<seat>.concurrency` | loop default | this seat's own limit, overriding the default. Set with `hermes review-loop set --reviewer-concurrency N` / `--fixer-concurrency N`. |
 | `state_dir` | `~/.hermes/state/review-loops/<id>` | locks, queue, in-flight marks, breach markers, artifacts, watchdog memory |
-| `host` | `https://hooks.coemedia.us` | gateway webhook host |
+| `host` | unset | your gateway's HTTP(S) webhook origin; `init` requires `--host` or an explicit plugin setting before it writes config/routes/hooks |
 | `grace_min` | `25` | how long a quiet head is allowed to sit before the watchdog speaks |
 | `marker_grace_min` | `60` | how long a breach marker may sit unpicked-up |
 | `cooldown_h` | `6` | repeat suppression per stall |
@@ -63,7 +63,7 @@ hermes review-loop apply --loop <id>             # write it
 |---|---|---|
 | `cap` | 3 | `cap` |
 | `reviewer_concurrency` / `fixer_concurrency` | 1 | `seats.<seat>.concurrency` |
-| `clone`, `base`, `host` | —, `main`, `https://hooks.coemedia.us` | the same loop keys |
+| `clone`, `base`, `host` | —, `main`, unset | the same loop keys; a blank host in the form preserves an existing loop's explicit host |
 | `grace_min`, `ttl_min`, `inflight_ttl_min` | 25, 45, 10 | the same loop keys |
 
 Settings are per profile (`plugins.entries.hermes-review-loop.settings`, written through Hermes'
@@ -73,6 +73,12 @@ fails if the two drift, because a form that writes keys nothing reads is worse t
 Blank `clone` means *not set here*: it never erases the clone a loop already uses, since the cleanup
 prunes worktrees through that path. The rails still apply — `reviewer_concurrency: 2` with no clone
 is refused at `init`, at `set` and at `apply` alike.
+
+There is no built-in webhook host. Set `host` to your own gateway origin (for example,
+`https://your-gateway.example`) in the plugin settings, or pass `--host` to `init`; the CLI rejects
+missing, relative, and malformed hosts before writing any config or routes, even without `--hooks`.
+Existing loop files with an explicit `host` continue to load, and an unset form setting does not
+erase one when you run `apply`. A public GitHub webhook should use HTTPS.
 
 ## State files (per loop, under `state_dir`)
 

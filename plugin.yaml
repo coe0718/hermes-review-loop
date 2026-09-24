@@ -63,5 +63,5 @@ config_schema:
   host:
     label: "Webhook host"
     type: str
-    default: "https://hooks.coemedia.us"
-    description: "Webhook host the loop's routes are reached on"
+    default: ""
+    description: "Your gateway's public webhook origin (required to create GitHub hooks)"
