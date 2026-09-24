@@ -457,23 +457,15 @@ Exercised and passing:
   queueing, an approval freeing its slot and starting the next queued PR, **real isolation** (real
   clones — one per PR *and* per seat — checked out at the head, with no token in them), the `set` /
   `apply` / `settings` verbs (including the round trip a stranger's install depends on, and that
-  `plugin.yaml`'s `config_schema` still matches the keys the code reads), the `doctor` preflight
-  (a correct install passes; a missing profile, token, route, hook, script, cron job, clone or
-  gateway fails with a remediation; an API-denied hooks read is `unknown`, never "absent"), all
-  four watchdog stall shapes, `explain`'s golden cases (a review in flight, a review with no verdict,
-  a verdict with no fix, a head nobody asked about, a PR queued behind a full seat, a spent budget,
-  a paused loop, a closed PR, a missing PR, a failed GitHub read) plus the proof that two runs of it
-  change nothing, and the cleanup rails against a real git clone.
-
   `plugin.yaml`'s `config_schema` still matches the keys the code reads), **seat identity** (the form
   choosing reviewer/fixer/adjudicator profiles and logins, a preview that writes nothing, several
   loops staying isolated from each other, an identity change refused while a seat is in flight and
-  staged — config *and* route — once it is not, and every invalid mapping — unknown profile, login
-  outside the allowlist, two seats on one profile/login/token file, someone else's route, a missing
-  or empty PAT — refused before anything is written), all four watchdog stall shapes, `explain`'s
+  staged — config *and* route — once it is not, and invalid mappings refused before any write),
+  the `doctor` preflight (missing profiles, tokens, routes, hooks or cron jobs fail with remediation;
+  an API-denied hooks read is `unknown`, never "absent"), all four watchdog stall shapes, `explain`'s
   golden cases (in-flight/no-verdict/no-fix reviews, unrequested head, queued/full seat, spent
-  budget, paused loop, closed/missing PR, failed GitHub read) and its read-only proof, and the
-  cleanup rails against a real git clone.
+  budget, paused loop, closed/missing PR, failed GitHub read) and its read-only proof, the route/hook
+  reconciliation rollback cases, and the cleanup rails against a real git clone.
 - Live use on a private repository: two seats, dozens of PRs, review → verdict → fix → cleanup.
 
 Not proven, and worth knowing before you trust it:
@@ -481,9 +473,8 @@ Not proven, and worth knowing before you trust it:
 - The plugin's own `init` path has been exercised against a test gateway, not against every gateway
   layout in the wild. The intended checks after `init` are `hermes plugins validate` and
   `hermes review-loop doctor --loop <id>` — and `doctor` has itself only been run against the
-  suite's stubbed GitHub and isolated homes, not against a live repo's hook list.
-
-  `hermes review-loop status`.
+  suite's stubbed GitHub and isolated homes, not against a live repo's hook list. Check
+  `hermes review-loop status` after installation too.
 - **The seat-identity surfaces are exercised against local files, not the desktop form.** The suite
   calls `register_cli` with a settings dict (the shape the form writes), so the plugin-side
   behaviour — defaults, validation, preview, staged apply — is covered; whether the desktop renders

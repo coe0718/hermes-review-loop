@@ -3827,12 +3827,10 @@ GROUPS = {"routes": group_routes, "config": group_config, "reviewer": group_revi
           "fixer": group_fixer_gate, "seats": group_seats, "parallel": group_parallel,
           "exclusive": group_exclusive, "settings": group_settings,
           "webhook_host": group_webhook_host,
-          "plugin_settings": group_plugin_settings, "watchdog": group_watchdog,
-          "explain": group_explain, "cleanup": group_cleanup, "doctor": group_doctor}
-
           "plugin_settings": group_plugin_settings, "seat_identity": group_seat_identity,
           "watchdog": group_watchdog, "explain": group_explain,
-          "cleanup": group_cleanup, "reconciliation": group_reconciliation}
+          "cleanup": group_cleanup, "doctor": group_doctor,
+          "reconciliation": group_reconciliation}
 
 
 def main() -> int:
