@@ -1,5 +1,7 @@
 # Test scratch: real git clones and worktrees are created here and thrown away
 tests/.tmp/
+# the cleanup tests write throwaway binaries next to the suite; never ship them
+junk.bin
 __pycache__/
 *.pyc
 .venv/
