@@ -84,10 +84,12 @@ class RouteRegistryTest(unittest.TestCase):
         self.create()
         original = self.path.read_bytes()
         with mock.patch.object(routes.os, "replace", side_effect=OSError("injected replace")):
-            with self.assertRaises(OSError):
+            with self.assertRaises(OSError) as create_error:
                 self.create("two")
-            with self.assertRaises(OSError):
+            with self.assertRaises(OSError) as remove_error:
                 routes.remove_route("one")
+        self.assertNotIsInstance(create_error.exception, routes.RegistryDurabilityError)
+        self.assertNotIsInstance(remove_error.exception, routes.RegistryDurabilityError)
         self.assertEqual(self.path.read_bytes(), original)
         self.assertEqual(set(self.path.parent.iterdir()) - {self.path, self.path.with_name(self.path.name + ".lock")}, set())
 
@@ -99,11 +101,38 @@ class RouteRegistryTest(unittest.TestCase):
             real_write(fd, data[:min(5, len(data))])
             raise OSError("injected write failure")
         with mock.patch.object(routes.os, "write", side_effect=broken_write):
-            with self.assertRaises(OSError):
+            with self.assertRaises(OSError) as create_error:
                 self.create("two")
-            with self.assertRaises(OSError):
+            with self.assertRaises(OSError) as remove_error:
                 routes.remove_route("one")
+        self.assertNotIsInstance(create_error.exception, routes.RegistryDurabilityError)
+        self.assertNotIsInstance(remove_error.exception, routes.RegistryDurabilityError)
         self.assertEqual(self.path.read_bytes(), original)
+        self.assertEqual(set(self.path.parent.iterdir()) - {self.path, self.path.with_name(self.path.name + ".lock")}, set())
+
+    def test_failed_directory_sync_reports_published_but_unconfirmed(self):
+        self.create()
+        original = self.path.read_bytes()
+        original_inode = self.path.stat().st_ino
+        real_fsync = os.fsync
+        calls = []
+
+        def fail_directory_sync(fd):
+            calls.append(stat.S_ISDIR(os.fstat(fd).st_mode))
+            if calls[-1]:
+                raise OSError("injected directory fsync failure")
+            return real_fsync(fd)
+
+        with mock.patch.object(routes.os, "fsync", side_effect=fail_directory_sync):
+            with self.assertRaises(routes.RegistryDurabilityError) as raised:
+                self.create("two")
+        self.assertEqual(calls, [False, True])
+        self.assertTrue(raised.exception.published)
+        self.assertIsInstance(raised.exception.__cause__, OSError)
+        self.assertIn("injected directory fsync failure", str(raised.exception.__cause__))
+        self.assertNotEqual(self.path.read_bytes(), original)
+        self.assertNotEqual(self.path.stat().st_ino, original_inode)
+        self.assertEqual(set(json.loads(self.path.read_text())), {"one", "two"})
         self.assertEqual(set(self.path.parent.iterdir()) - {self.path, self.path.with_name(self.path.name + ".lock")}, set())
 
     def test_malformed_existing_json_fails_closed_for_both_writers(self):

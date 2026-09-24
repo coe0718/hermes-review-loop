@@ -50,7 +50,10 @@ def _read_for_write(path: pathlib.Path) -> dict:
 
 @contextmanager
 def _registry_lock(path: pathlib.Path):
-    """Lock a persistent sibling inode; locking the replaced registry inode is unsafe."""
+    """Serialize cooperating plugin writers on a persistent sibling inode.
+
+    Hermes CLI/dashboard subscription writers do not take this lock.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     lock = path.with_name(path.name + ".lock")
     flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
@@ -64,8 +67,19 @@ def _registry_lock(path: pathlib.Path):
         os.close(fd)
 
 
+class RegistryDurabilityError(OSError):
+    """Replacement is visible, but directory sync failed; durability is unconfirmed."""
+
+    published = True
+
+
 def _write_registry(path: pathlib.Path, data: dict) -> None:
-    """Publish complete owner-only bytes; failed writes leave the old inode intact."""
+    """Publish owner-only bytes atomically, then sync the containing directory.
+
+    Before replacement, failures leave the old inode intact. After replacement,
+    a directory sync failure raises RegistryDurabilityError: the new bytes are
+    visible but their survival across a crash has not been confirmed.
+    """
     body = json.dumps(data, indent=2).encode()
     fd, temp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
@@ -81,11 +95,16 @@ def _write_registry(path: pathlib.Path, data: dict) -> None:
         finally:
             os.close(fd)
         os.replace(temp, path)
-        directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+            directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        except OSError as exc:
+            raise RegistryDurabilityError(
+                f"route registry {path} was published but directory sync failed; durability unconfirmed"
+            ) from exc
     finally:
         if os.path.exists(temp):
             os.unlink(temp)
