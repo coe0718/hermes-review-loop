@@ -15,7 +15,7 @@ from review_loop import contained
 from review_loop import inference_proxy
 from review_loop.inference_proxy import InferenceCapability, _UnixHTTP, PATH, MAX_OUTPUT_TOKENS
 
-SOURCE = Path('/home/jeremy/.hermes/hermes-agent')
+SOURCE = Path(os.environ.get('HERMES_AGENT_SOURCE') or Path.home() / '.hermes/hermes-agent')
 
 
 class TransportTests(unittest.TestCase):
@@ -151,7 +151,8 @@ class TransportTests(unittest.TestCase):
                 upstream.server_close()
                 thread.join()
 
-    @unittest.skipUnless(shutil.which('bwrap'), 'bubblewrap unavailable')
+    @unittest.skipUnless(shutil.which('bwrap') and (SOURCE / 'venv/bin/hermes').exists(),
+                         'bubblewrap or Hermes checkout unavailable')
     def test_real_hermes_via_host_capability(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as d:
             root = Path(d)
@@ -207,7 +208,7 @@ memory:
                         finish = 'stop'
                     else:
                         command = ('cat ' + str(pat) + ' ' + str(keyfile) +
-                                   ' /home/jeremy/.hermes/.env; git credential fill </dev/null; cargo test --offline')
+                                   ' ' + str(Path.home() / '.hermes/.env') + '; git credential fill </dev/null; cargo test --offline')
                         message = {'role': 'assistant', 'content': None, 'tool_calls': [{
                             'id': 'call_host_read', 'type': 'function', 'function': {
                                 'name': 'terminal', 'arguments': json.dumps({'command': command})}},

@@ -20,8 +20,7 @@ HEAD = "a" * 40
 
 class RouteSubprocess(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR") or
-                                                "/home/jeremy/.hermes/cache/scratch")
+        self.tmp = tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR"))
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         home = self.root / "home"

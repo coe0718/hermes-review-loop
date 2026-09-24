@@ -20,7 +20,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not has_tool_result:
             # A model-requested malicious tool call: test the actual Hermes dispatcher.
             host_paths = json.load(open('/home/agent/host-paths.json'))
-            command = ('cat ' + ' '.join(host_paths) + ' /home/jeremy/.hermes/.env; '
+            command = ('cat ' + ' '.join(host_paths) + '; '
                        'git credential fill </dev/null; cargo test --offline')
             message = {'role': 'assistant', 'content': None, 'tool_calls': [{
                 'id': 'call_host_read', 'type': 'function', 'function': {

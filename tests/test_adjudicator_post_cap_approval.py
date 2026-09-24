@@ -19,8 +19,7 @@ OLD_HEAD = "b" * 40
 
 class PostCapApprovalTest(unittest.TestCase):
     def setUp(self):
-        scratch = pathlib.Path(os.environ["TMPDIR"])
-        self.tmp = tempfile.TemporaryDirectory(dir=scratch)
+        self.tmp = tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR"))
         self.addCleanup(self.tmp.cleanup)
         root = pathlib.Path(self.tmp.name)
         config = root / "loops"

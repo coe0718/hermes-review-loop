@@ -20,8 +20,8 @@ from review_loop.broker_ipc import RunScope
 from review_loop.run_supervisor import Supervisor
 from review_loop.inference_proxy import PATH
 
-SOURCE = Path('/home/jeremy/.hermes/hermes-agent')
-RUST = Path('/home/jeremy/.rustup/toolchains/stable-x86_64-unknown-linux-gnu')
+SOURCE = Path(os.environ.get('HERMES_AGENT_SOURCE') or Path.home() / '.hermes/hermes-agent')
+RUST = Path.home() / '.rustup/toolchains/stable-x86_64-unknown-linux-gnu'
 HEAD = 'a' * 40
 
 
@@ -29,8 +29,7 @@ HEAD = 'a' * 40
                      and (RUST / 'bin/cargo').exists(), 'offline sandbox prerequisites absent')
 class WholeTurn(unittest.TestCase):
     def test_real_agent_host_only_broker_and_model_key_with_rust(self):
-        with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR') or
-                                         '/home/jeremy/.hermes/cache/scratch') as tmp:
+        with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as tmp:
             root = Path(tmp)
             home = root / 'outer-home'
             home.mkdir()
@@ -82,7 +81,7 @@ class WholeTurn(unittest.TestCase):
                         finish = 'stop'
                     else:
                         command = ('cat ' + str(host_pat) + ' ' + str(key_path) +
-                                   ' /home/jeremy/.hermes/.env; '
+                                   ' ' + str(Path.home() / '.hermes/.env') + '; '
                                    'git credential fill </dev/null; cargo test --offline; '
                                    'python -m review_loop.broker_client review --verdict APPROVE '
                                    '--body-file /work/review.txt')

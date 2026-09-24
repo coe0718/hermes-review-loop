@@ -11,7 +11,7 @@ from unittest import mock
 
 from review_loop import contained
 
-SOURCE = Path('/home/jeremy/.hermes/hermes-agent')
+SOURCE = Path(os.environ.get('HERMES_AGENT_SOURCE') or Path.home() / '.hermes/hermes-agent')
 
 
 class WholeAgentFixture(unittest.TestCase):
@@ -31,7 +31,8 @@ class WholeAgentFixture(unittest.TestCase):
             self.assertEqual((result.returncode, result.stdout, result.stderr),
                              (0, 'ok\n', 'warning\n'))
 
-    @unittest.skipUnless(shutil.which('bwrap'), 'bubblewrap unavailable')
+    @unittest.skipUnless(shutil.which('bwrap') and (SOURCE / 'venv/bin/hermes').exists(),
+                         'bubblewrap or Hermes checkout unavailable')
     def test_real_agent_cannot_read_host_dummy_credentials(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as directory:
             root = Path(directory)
@@ -69,7 +70,7 @@ memory:
             pat.write_text('HOST_DUMMY_PAT_SENTINEL')
             key = root / 'host-dummy.model-key'
             key.write_text('HOST_DUMMY_MODEL_KEY_SENTINEL')
-            (home / 'host-paths.json').write_text(json.dumps([str(pat), str(key)]))
+            (home / 'host-paths.json').write_text(json.dumps([str(pat), str(key), str(Path.home() / '.hermes/.env')]))
             venv = SOURCE / 'venv'
             # Derive the generation directory from the absolute venv Python symlink.
             runtime = Path(os.readlink(venv / 'bin/python')).parents[2]

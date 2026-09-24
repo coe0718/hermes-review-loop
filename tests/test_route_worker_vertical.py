@@ -76,7 +76,7 @@ class Fixture(http.server.BaseHTTPRequestHandler):
                 delta, finish = {'role': 'assistant', 'content': 'Finished the scoped review.'}, 'stop'
             else:
                 cmd = world.get('model_command') or (
-                    'cat /home/jeremy/.hermes/.env; cat ' + str(world['key_path']) +
+                    'cat ' + str(Path.home() / '.hermes/.env') + '; cat ' + str(world['key_path']) +
                     ' ' + str(world['pat_path']) +
                     '; cargo test --offline; python -m review_loop.broker_client review '
                     '--verdict APPROVE --body-file /work/review.txt')
@@ -107,8 +107,7 @@ class Fixture(http.server.BaseHTTPRequestHandler):
                      and (RUST / 'bin/cargo').exists(), 'offline sandbox prerequisites absent')
 class RouteWorkerVertical(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR') or
-                                                '/home/jeremy/.hermes/cache/scratch')
+        self.tmp = tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR'))
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.home = self.root / 'home'
@@ -184,8 +183,7 @@ class RouteWorkerVertical(unittest.TestCase):
                     'PATH': '/usr/bin:/bin', 'PYTHONPATH': str(package),
                     'OFFLINE_GITHUB_PORT': str(self.server.server_port),
                     'REVIEW_LOOP_GH_STUB': str(stub), 'GATE_WORLD': str(self.root / 'gate-world.json'),
-                    'TMPDIR': os.environ.get('TMPDIR',
-                        '/home/jeremy/.hermes/cache/scratch'), 'PYTHONDONTWRITEBYTECODE': '1'}
+                    'TMPDIR': tempfile.gettempdir(), 'PYTHONDONTWRITEBYTECODE': '1'}
         self.payload = {'repository': {'full_name': 'acme/widgets'}, 'action': 'opened',
                         'number': 7, 'pull_request': self.world['pr'], 'sender': {'login': 'dev'}}
 
