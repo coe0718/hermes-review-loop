@@ -31,7 +31,9 @@ class SituationAuthorization(unittest.TestCase):
                          "user": {"login": "reviewer"}, "submitted_at": "2026-01-02T00:00:00Z"}]
 
     def resolution(self):
-        with mock.patch.object(situation.gh, "pr", side_effect=lambda loop, n: {1: self.parent, 2: self.child}[n]):
+        with (mock.patch.object(situation.gh, "pr", side_effect=lambda loop, n: {1: self.parent, 2: self.child}[n]),
+              mock.patch.object(situation.gh, "fetch", return_value=(
+                  {"ref": "refs/heads/main", "object": {"type": "commit", "sha": C}}, ""))):
             return situation.resolve(self.loop, 2, listing=self.listing)
 
     def readiness(self, resolved):

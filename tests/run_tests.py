@@ -2751,6 +2751,13 @@ def group_explain() -> None:
     check("paused → re-arm", decide(armed=False)["next"]["kind"], "rearm")
     check("a draft → ready_for_review", decide(pr=pr(7, draft=True))["next"]["kind"], "ready")
     check("unverified stacked base → retry, not a run", decide(pr=pr(7, base="release"))["next"]["kind"], "retry")
+    from review_loop import situation
+    verified_stack = situation.Resolution("waiting", "waiting on #6",
+        situation.Identity(HEAD_A, "release", HEAD_B, ((6, "release", HEAD_B, HEAD_A),)), (6,))
+    stacked_kind = decide(pr=pr(7, base="release"), chain=verified_stack,
+                          parent_readiness=(False, "approval unassociated"))["next"]["kind"]
+    check("verified stacked branch waits", stacked_kind, "wait")
+    check("stacked wait is a declared explain kind", stacked_kind in gate.EXPLAIN_KINDS, True)
     check("someone else's PR → nothing", decide(pr=pr(7, author="outsider"))["next"]["kind"], "none")
     check("approved at the head → nothing",
           decide(reviews=[review(REVIEWER, state="approved")])["next"]["kind"], "none")

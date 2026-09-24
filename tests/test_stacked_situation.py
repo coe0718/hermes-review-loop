@@ -47,6 +47,28 @@ class SituationTest(unittest.TestCase):
                 gh, "fetch", return_value=({"ref": "refs/heads/main", "object": {"type": "commit", "sha": A.upper()}}, "")):
             self.assertEqual(situation.resolve(LOOP, 184).status, "eligible")
 
+    def test_stacked_root_requires_independent_live_trunk_generation(self):
+        child = pr(184, "child", D, "middle", C)
+        middle = pr(183, "middle", C, "parent", B)
+        root = pr(182, "parent", B, "main", A)
+        path = "/repos/acme/widgets/git/ref/heads/main"
+        valid = {"ref": "refs/heads/main", "object": {"type": "commit", "sha": A.upper()}}
+        cases = ((valid, "", "waiting"),
+                 ({"ref": "refs/heads/main", "object": {"type": "commit", "sha": D}}, "", "blocked"),
+                 ({"ref": "refs/heads/other", "object": {"type": "commit", "sha": A}}, "", "blocked"),
+                 ({"ref": "refs/heads/main", "object": {"type": "tag", "sha": A}}, "", "blocked"),
+                 ({"ref": "refs/heads/main", "object": {"type": "commit", "sha": "invalid"}}, "", "blocked"),
+                 ([], "", "blocked"), (None, "HTTP 503", "blocked"))
+        for ref, error, status in cases:
+            with self.subTest(ref=ref, error=error), mock.patch.object(
+                    gh, "pr", side_effect=lambda _loop, n: {184: child, 183: middle, 182: root}.get(n)), \
+                    mock.patch.object(gh, "open_prs_read", return_value=([root, middle, child], "")), \
+                    mock.patch.object(gh, "fetch", return_value=(ref, error)) as fetch:
+                result = situation.resolve(LOOP, 184)
+                self.assertEqual(result.status, status)
+                self.assertEqual(result.identity is not None, status == "waiting")
+                fetch.assert_called_once_with(LOOP, path)
+
     def test_direct_and_stacked_identity(self):
         direct = pr(182, "parent", B, "main", A)
         child = pr(184, "child", C, "parent", B)

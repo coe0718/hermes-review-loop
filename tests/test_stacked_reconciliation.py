@@ -37,6 +37,10 @@ class ReconciliationTest(unittest.TestCase):
         with mock.patch.object(watchdog, "TEST", True), mock.patch.object(watchdog.gh, "open_prs", return_value=listing), \
              mock.patch.object(watchdog.gh, "pr", side_effect=lambda _loop, n: by_number.get(n)), \
              mock.patch.object(watchdog.gh, "reviews", return_value=[]), \
+             mock.patch.object(watchdog.gh, "fetch", return_value=(
+                 {"ref": "refs/heads/main", "object": {"type": "commit",
+                  "sha": next((p["base"]["sha"] for p in listing
+                               if p["head"]["ref"] == "grand"), A) if isinstance(listing, list) else A}}, "")), \
              mock.patch.object(watchdog.observer, "notify", side_effect=lambda *a, **kw: self.notices.append((a, kw))), \
              mock.patch.object(watchdog.observer, "retry", return_value=0), \
              mock.patch.object(watchdog.observer, "flush"), \

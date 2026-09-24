@@ -57,6 +57,23 @@ def _fields(pr: dict, repo: str) -> tuple[str, str, str, str] | None:
     return branch, head_sha.lower(), base_ref, base_sha.lower()
 
 
+def _verify_trunk(loop: dict, base_ref: str, base_sha: str) -> Resolution | None:
+    """Require the live exact commit ref, not a PR's potentially stale base snapshot."""
+    path = f"/repos/{loop['repo']}/git/ref/heads/{quote(base_ref, safe='/')}"
+    live_ref, error = gh.fetch(loop, path)
+    if error or not isinstance(live_ref, dict):
+        return Resolution("blocked", f"trunk ref unreadable: {error or 'invalid response'}")
+    obj = live_ref.get("object")
+    live_sha = obj.get("sha") if isinstance(obj, dict) else None
+    if (live_ref.get("ref") != f"refs/heads/{base_ref}" or
+            not isinstance(obj, dict) or obj.get("type") != "commit" or
+            not isinstance(live_sha, str) or not SHA.fullmatch(live_sha)):
+        return Resolution("blocked", "trunk ref response unverified")
+    if live_sha.lower() != base_sha:
+        return Resolution("blocked", "trunk advanced beyond PR base SHA")
+    return None
+
+
 def resolve(loop: dict, number: int, *, listing: list[dict] | None = None) -> Resolution:
     """Read child and bounded open-parent listing; ambiguity or inconsistent SHA blocks."""
     repo = loop["repo"]
@@ -69,19 +86,9 @@ def resolve(loop: dict, number: int, *, listing: list[dict] | None = None) -> Re
         return Resolution("blocked", "child base/head SHA or repository unverified")
     _, child_sha, base_ref, base_sha = child_fields
     if base_ref == loop["base"]:
-        # The PR's base.sha is a snapshot, not proof of the current trunk tip.
-        path = f"/repos/{repo}/git/ref/heads/{quote(base_ref, safe='/')}"
-        live_ref, error = gh.fetch(loop, path)
-        if error or not isinstance(live_ref, dict):
-            return Resolution("blocked", f"trunk ref unreadable: {error or 'invalid response'}")
-        obj = live_ref.get("object")
-        live_sha = obj.get("sha") if isinstance(obj, dict) else None
-        if (live_ref.get("ref") != f"refs/heads/{base_ref}" or
-                not isinstance(obj, dict) or obj.get("type") != "commit" or
-                not isinstance(live_sha, str) or not SHA.fullmatch(live_sha)):
-            return Resolution("blocked", "trunk ref response unverified")
-        if live_sha.lower() != base_sha:
-            return Resolution("blocked", "trunk advanced beyond PR base SHA")
+        invalid = _verify_trunk(loop, base_ref, base_sha)
+        if invalid is not None:
+            return invalid
         return Resolution("eligible", "direct trunk base",
                           Identity(child_sha, base_ref, base_sha, ()))
 
@@ -122,6 +129,9 @@ def resolve(loop: dict, number: int, *, listing: list[dict] | None = None) -> Re
         seen.add(parent_number)
         chain.append((parent_number, branch, head_sha, next_sha))
         if next_ref == loop["base"]:
+            invalid = _verify_trunk(loop, next_ref, next_sha)
+            if invalid is not None:
+                return invalid
             return Resolution("waiting", f"waiting on #{chain[0][0]}",
                               Identity(child_sha, base_ref, base_sha, tuple(chain)),
                               tuple(item[0] for item in chain))
