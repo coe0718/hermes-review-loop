@@ -543,6 +543,13 @@ def cmd_init(args) -> int:
     if not reviewer_seat:
         print("with several reviewer logins, --reviewer-seat names which one this loop's route serves")
         return 2
+    configured_fixer = d["fixer_login"]
+    if configured_fixer and configured_fixer.lower() not in {login.lower() for login in fixers}:
+        print(f"configured fixer login {configured_fixer!r} is not in the --fixer allowlist — "
+              "name an eligible fixer in the plugin settings before installing this loop")
+        return 2
+    fixer_seat = next((login for login in fixers
+                       if login.lower() == configured_fixer.lower()), fixers[0]) if configured_fixer else fixers[0]
     adjudicator_profile = args.adjudicator_profile or d["adjudicator_profile"] or "default"
 
     raw = {
@@ -556,7 +563,7 @@ def cmd_init(args) -> int:
                          "login": reviewer_seat,
                          "agent": args.reviewer_agent},
             "fixer": {"profile": fixer_profile, "route": "",
-                      "login": fixers[0], "agent": args.fixer_agent},
+                      "login": fixer_seat, "agent": args.fixer_agent},
         },
         "adjudicator": ({"route": args.adjudicator_route, "profile": adjudicator_profile}
                         if args.adjudicator_route else {}),
@@ -752,12 +759,16 @@ def cmd_apply(args) -> int:
         return 2
 
     identity, touched = _seat_diffs(loop, updated)
+    # The installed registry can drift independently of the loop and the form. Repair those
+    # routes through the same ownership, seat and in-flight preflight as an identity push.
+    binds = _route_binds(updated, set(_routes_of(updated)))
+    rebinding = touched | set(binds)
     try:
         # Validate what this apply would *write*: a loop that predates the seat checks keeps
         # loading, but a seat this push moves must be one that can actually run.
-        config.verify_seats(updated, touched)
-        if touched:
-            _verify_routes(updated, touched)
+        config.verify_seats(updated, rebinding)
+        if rebinding:
+            _verify_routes(updated, rebinding)
     except config.ConfigError as exc:
         print(f"settings refused: {exc}")
         return 2
@@ -773,11 +784,10 @@ def cmd_apply(args) -> int:
         if was != now:
             changes.append((f"{seat} concurrency", was, now))
 
-    binds = _route_binds(updated, touched) if touched else {}
     missing_routes = sorted(name for role, name in _routes_of(updated).items()
                             if role in touched and not routes.route(name))
 
-    if not changes and not identity:
+    if not changes and not identity and not binds:
         print(f"[{loop['id']}] already matches the plugin settings")
         return 0
     for name, was, now in list(changes) + list(identity):
@@ -796,7 +806,7 @@ def cmd_apply(args) -> int:
         print("(dry run — nothing written: no loop config, no routes touched)")
         return 0
 
-    busy = _busy_seats(loop, touched) if touched else []
+    busy = _busy_seats(loop, rebinding) if rebinding else []
     if busy and not getattr(args, "while_busy", False):
         for line in busy:
             print(f"  {line}")
@@ -827,7 +837,7 @@ def cmd_apply(args) -> int:
         for hook_id, old, new in hook_moves:
             attempted_hooks.append((hook_id, old))
             _patch_hook_url(loop, hook_id, new)
-        path = _write_config(updated)
+        path = _write_config(updated) if changes or identity else config_path
     except Exception as exc:
         failed = []
         for hook_id, old in reversed(attempted_hooks):

@@ -165,7 +165,61 @@ def main():
     assert rc == 0, out
     assert config.load_id('multi')['reviewer_seat'] == t.REVIEWER
     print('PASS configured eligible reviewer selected from multi-login allowlist')
-    print('12/12 reconciliation cases pass')
+
+    # A stale route must be repaired even when the form and loop config already agree.
+    stable_form = {'reviewer_profile': 'reviewer-profile', 'fixer_profile': 'fixer-profile',
+                   'reviewer_login': t.REVIEWER, 'fixer_login': t.FIXER}
+    unchanged_apply = t.parser_for(stable_form).parse_args(['apply', '--loop', 'reconcile'])
+    routes.new_route('reconcile-review', profile='vex', prompt=cli.prompts.REVIEWER,
+                     events=['pull_request'], script='gate_reviewer.py', host=t.HOST,
+                     deliver='discord')
+    old_config = config_path.read_bytes()
+    old_fixer = routes.route('reconcile-fix')
+    with mock.patch.object(gh, 'api', side_effect=api):
+        rc, out = t.run_cli(t.parser_for(stable_form).parse_args(
+            ['apply', '--loop', 'reconcile', '--dry-run']))
+    assert rc == 0 and 'profile vex → reviewer-profile' in out, (rc, out)
+    assert routes.route('reconcile-review')['profile'] == 'vex'
+    with mock.patch.object(gh, 'api', side_effect=api):
+        rc, out = t.run_cli(unchanged_apply)
+    assert rc == 0 and routes.route('reconcile-review')['profile'] == 'reviewer-profile', (rc, out)
+    assert routes.route('reconcile-fix') == old_fixer
+    assert config_path.read_bytes() == old_config
+    print('PASS unchanged settings reconcile only the stale owned route')
+
+    # A stale profile is not permission to overwrite a route with another gate's script.
+    foreign = routes.route('reconcile-review')
+    routes.new_route('reconcile-review', profile='vex', prompt=cli.prompts.FIXER,
+                     events=['pull_request_review'], script='gate_fixer.py', host=t.HOST,
+                     deliver='discord')
+    foreign_snapshot = routes.route('reconcile-review')
+    with mock.patch.object(gh, 'api', side_effect=api):
+        rc, out = t.run_cli(unchanged_apply)
+    assert rc == 2 and 'belongs to something else' in out, (rc, out)
+    assert routes.route('reconcile-review') == foreign_snapshot
+    assert config_path.read_bytes() == old_config and hooks == old_hooks
+    routes.restore_entries({'reconcile-review': foreign})
+    print('PASS unchanged-settings route repair refuses foreign gate ownership')
+
+    # The configured fixer is the selected login, not merely one of the allowed fixers.
+    fixer_form = {'reviewer_profile': 'vex', 'fixer_profile': 'drey',
+                  'reviewer_login': t.REVIEWER, 'fixer_login': t.FIXER}
+    fixer_args = ['init', '--repo', 'acme/multifix', '--host', t.HOST,
+                  '--reviewer', t.REVIEWER, '--fixer', 'backup-fixer', '--fixer', t.FIXER,
+                  '--token', f'{t.REVIEWER}={t.SEAT_PATS[0]}',
+                  '--token', f'{t.FIXER}={t.SEAT_PATS[1]}']
+    rc, out = t.run_cli(t.parser_for(fixer_form).parse_args(fixer_args))
+    assert rc == 0 and config.load_id('multifix')['seats']['fixer']['login'] == t.FIXER, (rc, out)
+    print('PASS configured eligible fixer selected from multi-login allowlist')
+
+    ineligible = {**fixer_form, 'fixer_login': 'not-allowed'}
+    rc, out = t.run_cli(t.parser_for(ineligible).parse_args(
+        [*fixer_args, '--id', 'badfix']))
+    assert rc == 2 and 'fixer' in out.lower(), (rc, out)
+    assert not (t.LOOPS_DIR / 'badfix.json').exists()
+    assert not routes.route('badfix-review') and not routes.route('badfix-fix')
+    print('PASS ineligible configured fixer fails before config and route writes')
+    print('16/16 reconciliation cases pass')
 
 
 if __name__ == '__main__':
