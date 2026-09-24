@@ -42,6 +42,78 @@ import json
 import os
 import pathlib
 
+# Plugin-level settings. The desktop's Capabilities → Plugins form renders `config_schema` from
+# plugin.yaml; this table mirrors it so the CLI can use the same defaults without a YAML parser
+# (the package is stdlib-only on purpose). `tests/run_tests.py` asserts the two agree, because a
+# form that writes keys nothing reads is worse than no form at all.
+SETTINGS_SCHEMA: dict = {
+    "cap": {"label": "Review cap (verdicts)", "type": "int", "default": 3,
+            "description": "Verdicts before the loop stops and hands the PR to an adjudicator "
+                           "(cap - 1 fixes)"},
+    "reviewer_concurrency": {"label": "Reviews at once", "type": "int", "default": 1,
+                             "description": "Reviews that may run at once; everything above this "
+                                            "queues. Above 1 needs a clone path, so each run gets "
+                                            "its own sandbox."},
+    "fixer_concurrency": {"label": "Fixes at once", "type": "int", "default": 1,
+                          "description": "Fixes that may run at once; everything above this queues"},
+    "clone": {"label": "Clone path (required above 1)", "type": "str", "default": "",
+              "description": "Local clone the runs isolate from — required above 1, because a "
+                             "parallel run in a shared checkout produces wrong verdicts"},
+    "base": {"label": "Base branch", "type": "str", "default": "main",
+             "description": "Base branch the loop watches"},
+    "grace_min": {"label": "Watchdog grace (minutes)", "type": "int", "default": 25,
+                  "description": "Minutes a quiet PR may sit before the watchdog speaks"},
+    "ttl_min": {"label": "Seat slot TTL (minutes)", "type": "int", "default": 45,
+                "description": "Minutes a seat slot survives — the backstop for a run that died "
+                               "without a verdict"},
+    "inflight_ttl_min": {"label": "In-flight mark TTL (minutes)", "type": "int", "default": 10,
+                         "description": "Minutes an in-flight mark blocks a second run at the "
+                                        "same head"},
+    "host": {"label": "Webhook host", "type": "str", "default": "https://hooks.coemedia.us",
+             "description": "Webhook host the loop's routes are reached on"},
+}
+
+
+def settings_defaults(settings: dict | None) -> dict:
+    """Effective plugin-level defaults: what the settings form set, else the schema default.
+
+    A value of the wrong type falls back to the default rather than propagating a string into a
+    field the loop does arithmetic on. Nothing here raises: a bad setting must not break the CLI.
+    """
+    out: dict = {}
+    for key, spec in SETTINGS_SCHEMA.items():
+        value = (settings or {}).get(key)
+        if value is None or value == "":
+            value = spec["default"]
+        try:
+            value = int(value) if spec["type"] == "int" else str(value)
+        except (TypeError, ValueError):
+            value = spec["default"]
+        out[key] = value
+    return out
+
+
+def apply_settings(loop_raw: dict, settings: dict | None) -> dict:
+    """The loop knobs the plugin settings own, overlaid on a raw (pre-``normalize``) loop dict.
+
+    `apply` is deliberately a push, not a subscription: the form sets defaults, and a loop takes
+    them when the operator says so. A running loop whose numbers changed under it would be a very
+    confusing thing to debug at 2am.
+    """
+    d = settings_defaults(settings)
+    seats = {k: dict(v or {}) for k, v in (loop_raw.get("seats") or {}).items()}
+    seats.setdefault("reviewer", {})["concurrency"] = d["reviewer_concurrency"]
+    seats.setdefault("fixer", {})["concurrency"] = d["fixer_concurrency"]
+    # A blank clone in the form means "not set here", never "forget the clone this loop uses":
+    # silently dropping it would quietly downgrade the cleanup, which prunes worktrees through it.
+    clone = d["clone"] or str(loop_raw.get("clone") or "")
+    # The per-seat numbers are written explicitly, so the loop-level default never has to be
+    # guessed at: whatever `concurrency` says, the seats carry their own answered value.
+    return {**loop_raw, "cap": d["cap"], "clone": clone, "base": d["base"],
+            "host": d["host"], "grace_min": d["grace_min"], "ttl_min": d["ttl_min"],
+            "inflight_ttl_min": d["inflight_ttl_min"], "seats": seats}
+
+
 DEFAULTS: dict = {
     "base": "main",
     "cap": 3,

@@ -178,6 +178,7 @@ def cmd_init(args) -> int:
         "clone": args.clone, "roots": args.root or [],
         "state_dir": args.state_dir or str(config.home() / "state" / "review-loops" / (args.id or args.repo.split("/")[-1])),
         "host": args.host, "grace_min": args.grace_min,
+        "ttl_min": args.ttl_min, "inflight_ttl_min": args.inflight_ttl_min,
     }
     if not args.reviewer_seat and len(args.reviewer) > 1:
         print("with several reviewer logins, --reviewer-seat names which one this loop's route serves")
@@ -269,6 +270,64 @@ def cmd_set(args) -> int:
     print("  parallel now: " + " · ".join(
         f"{seat} {config.seat_concurrency(updated, seat)}" for seat in ("reviewer", "fixer"))
         + "   (1 = serialized; everything above the limit queues)")
+    return 0
+
+
+def cmd_apply(args) -> int:
+    """Make a loop match the plugin settings — one push, with the diff printed.
+
+    Push, not subscription: a running loop whose numbers changed under it is exactly the kind of
+    thing nobody can debug at 2am. The same validation as ``init``/``set`` still applies, so a
+    settings form asking for two reviews at once without a clone path is refused here too.
+    """
+    try:
+        loop = config.load_id(args.loop)
+    except config.ConfigError as exc:
+        print(f"no such loop: {exc}")
+        return 2
+
+    try:
+        updated = config.normalize(config.apply_settings(loop, _SETTINGS))
+    except config.ConfigError as exc:
+        print(f"settings refused: {exc}")
+        return 2
+
+    changes = []
+    for key in ("cap", "base", "host", "grace_min", "ttl_min", "inflight_ttl_min"):
+        if updated.get(key) != loop.get(key):
+            changes.append((key, loop.get(key), updated.get(key)))
+    if (updated.get("clone") or "") != (loop.get("clone") or ""):
+        changes.append(("clone", loop.get("clone") or "(none)", updated.get("clone") or "(none)"))
+    for seat in ("reviewer", "fixer"):
+        was, now = config.seat_concurrency(loop, seat), config.seat_concurrency(updated, seat)
+        if was != now:
+            changes.append((f"{seat} concurrency", was, now))
+
+    if not changes:
+        print(f"[{loop['id']}] already matches the plugin settings")
+        return 0
+    for name, was, now in changes:
+        print(f"  {name}: {was} → {now}")
+    if args.dry_run:
+        print("(dry run — nothing written)")
+        return 0
+    print(f"loop config updated: {_write_config(updated)}")
+    return 0
+
+
+def cmd_settings(args) -> int:
+    """Show the plugin-level defaults — what a new loop starts from, and what ``apply`` pushes."""
+    d = config.settings_defaults(_SETTINGS)
+    print("plugin settings (desktop: Capabilities → Plugins → review loop)")
+    for key, spec in config.SETTINGS_SCHEMA.items():
+        value = d[key]
+        source = "set" if str((_SETTINGS or {}).get(key, "")) not in ("", "None") else "default"
+        print(f"  {key:<19} {str(value):<26} [{source}]  {spec['description']}")
+    if not _SETTINGS:
+        print("\nnothing set — every value above is the schema default")
+    print("\napply them to a loop with: hermes review-loop apply --loop <id>"
+          "\n(settings are defaults, not a subscription: an existing loop keeps its own numbers"
+          " until you apply)")
     return 0
 
 
@@ -366,7 +425,27 @@ def cmd_uninstall(args) -> int:
     return 0
 
 
-def register_cli(ctx) -> None:
+# What the plugin's settings form held when this process started (Capabilities → Plugins in the
+# desktop). Set by `register_cli`; read by `apply` and `settings`. A form that silently renumbered
+# a running loop would be a nasty thing to debug, so these are *defaults* and a push — never a
+# subscription.
+_SETTINGS: dict = {}
+
+
+def register_cli(ctx, settings: dict | None = None) -> None:
+    """Wire ``hermes review-loop`` into the CLI.
+
+    ``settings`` is the plugin-level settings form. It supplies the defaults a new loop starts
+    from, and what ``apply`` pushes onto an existing loop; it never rewrites a loop behind the
+    operator's back.
+    """
+    global _SETTINGS
+    _SETTINGS = dict(settings or {})
+    d = config.settings_defaults(settings)
+    # Both seats agreeing is the only case where a loop-level default says anything useful: when
+    # they disagree the two seat values below carry the answer explicitly.
+    both = d["reviewer_concurrency"] if d["reviewer_concurrency"] == d["fixer_concurrency"] else 1
+
     def setup(sub) -> None:  # noqa: ANN001
         sub.add_parser("list", help="List configured loops").set_defaults(func=cmd_list)
 
@@ -380,17 +459,18 @@ def register_cli(ctx) -> None:
         init.add_argument("--fixer-profile", required=True, help="Hermes profile for the fixer seat")
         init.add_argument("--reviewer-agent", default="", help="display name for the reviewer (default: profile)")
         init.add_argument("--fixer-agent", default="", help="display name for the fixer")
-        init.add_argument("--cap", type=int, default=3, help="verdicts allowed before adjudication")
-        init.add_argument("--concurrency", type=int, default=1,
+        init.add_argument("--cap", type=int, default=d["cap"],
+                          help="verdicts allowed before adjudication")
+        init.add_argument("--concurrency", type=int, default=both,
                           help="default PRs per seat at once: 1 = serialized (default). "
                                "Above 1 needs --clone, because each run then gets its own clone. "
                                "Override per seat with --reviewer-concurrency / --fixer-concurrency.")
-        init.add_argument("--reviewer-concurrency", type=int, default=None,
+        init.add_argument("--reviewer-concurrency", type=int, default=d["reviewer_concurrency"],
                           help="PRs the reviewer may work at once (overrides --concurrency)")
-        init.add_argument("--fixer-concurrency", type=int, default=None,
+        init.add_argument("--fixer-concurrency", type=int, default=d["fixer_concurrency"],
                           help="PRs the fixer may work at once (overrides --concurrency)")
-        init.add_argument("--base", default="main")
-        init.add_argument("--clone", default="", help="local clone the runs may use")
+        init.add_argument("--base", default=d["base"])
+        init.add_argument("--clone", default=d["clone"], help="local clone the runs may use")
         init.add_argument("--root", action="append", default=[], help="a directory reviews may clean (repeatable)")
         init.add_argument("--state-dir", default="")
         init.add_argument("--token", action="append", default=[], help="login=/path/to/pat (repeatable)")
@@ -398,8 +478,12 @@ def register_cli(ctx) -> None:
         init.add_argument("--skill", default="", help="skill the seats should load")
         init.add_argument("--adjudicator-route", default="")
         init.add_argument("--adjudicator-profile", default="default")
-        init.add_argument("--host", default=config.DEFAULTS["host"], help="gateway webhook host")
-        init.add_argument("--grace-min", type=int, default=25)
+        init.add_argument("--host", default=d["host"], help="gateway webhook host")
+        init.add_argument("--grace-min", type=int, default=d["grace_min"])
+        init.add_argument("--ttl-min", type=int, default=d["ttl_min"],
+                          help="how long a run may hold its seat slot")
+        init.add_argument("--inflight-ttl-min", type=int, default=d["inflight_ttl_min"],
+                          help="how long an in-flight mark blocks a second run at the same head")
         init.add_argument("--hooks", action="store_true", help="create the GitHub hooks too")
         init.add_argument("--admin-token", default="", help="login whose token can create hooks")
         init.add_argument("--schedule", default="", help="e.g. 15m — install the watchdog cron job")
@@ -428,6 +512,16 @@ def register_cli(ctx) -> None:
         change.add_argument("--inflight-ttl-min", type=int)
         change.add_argument("--host", help="gateway webhook host")
         change.set_defaults(func=cmd_set)
+
+        apply_cmd = sub.add_parser("apply", help="Push the plugin settings onto a loop")
+        apply_cmd.add_argument("--loop", required=True)
+        apply_cmd.add_argument("--dry-run", action="store_true",
+                               help="show the diff without writing it")
+        apply_cmd.set_defaults(func=cmd_apply)
+
+        settings_cmd = sub.add_parser("settings",
+                                      help="Show the plugin-level defaults a loop starts from")
+        settings_cmd.set_defaults(func=cmd_settings)
 
         arm = sub.add_parser("arm", help="Activate the loop's GitHub hooks")
         arm.add_argument("--loop")

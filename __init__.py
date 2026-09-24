@@ -21,11 +21,29 @@ _HERE = pathlib.Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:          # the gates import this package from scripts/
     sys.path.insert(0, str(_HERE))
 
-from review_loop import cli  # noqa: E402
+from review_loop import cli, config  # noqa: E402
+
+
+def _settings(ctx) -> dict:
+    """What the operator set in the plugin's settings form (Capabilities → Plugins).
+
+    Read through the documented context accessor, never the config file directly, and never
+    fatally: a plugin that fails to register because one setting was misspelled is a plugin the
+    operator cannot reach to fix it.
+    """
+    out: dict = {}
+    for key in config.SETTINGS_SCHEMA:
+        try:
+            value = ctx.get_config(key, None)
+        except Exception:
+            continue
+        if value is not None and value != "":
+            out[key] = value
+    return out
 
 
 def register(ctx) -> None:  # noqa: ANN001 - PluginContext, untyped by design here
-    cli.register_cli(ctx)
+    cli.register_cli(ctx, settings=_settings(ctx))
     skill_md = _HERE / "skill" / "SKILL.md"
     if skill_md.exists():
         ctx.register_skill(

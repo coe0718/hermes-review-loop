@@ -16,17 +16,22 @@ Runs with a plain interpreter and no network — no ``gh``, no pytest, no GitHub
 
 from __future__ import annotations
 
+import argparse
+import contextlib
 import hashlib
 import hmac
+import io
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from types import SimpleNamespace
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -174,7 +179,10 @@ def make_clone() -> None:
     git("worktree", "add", "--detach", str(REVIEWS / "pr9-wt"), "HEAD")
     (REVIEWS / "pr9-wt" / "notes.txt").write_text("keep me\n")
     (SCRATCH / "pr8-target").mkdir(parents=True)
-    (SCRATCH / "pr8-target" / "junk.bin").write_bytes(b"y" * 2048)
+    # A build-output file the cleanup should reclaim. Text, and named like the real artifacts
+    # (.log), because a stray .bin here trips the plugin security scan's binary-file caution every
+    # time anyone runs `hermes plugins validate` on this repo.
+    (SCRATCH / "pr8-target" / "build.log").write_text("y" * 2048 + "\n")
     branch_wt = SCRATCH / "pr8-work-branch"
     git("worktree", "add", "-b", "fix/thing-8", str(branch_wt), "HEAD")
     (branch_wt / "work.txt").write_text("someone's work\n")
@@ -304,6 +312,16 @@ def load_state(name: str):
     return json.loads(path.read_text()) if path.exists() else {}
 
 
+def ns(**kw):
+    """A stand-in for an argparse Namespace, with every flag the commands read."""
+    base = dict(loop="widgets", concurrency=None, cap=None, clone=None, base=None,
+                grace_min=None, marker_grace_min=None, ttl_min=None,
+                inflight_ttl_min=None, host=None, reviewer_concurrency=None,
+                fixer_concurrency=None, dry_run=False, seat=None, pr=None)
+    base.update(kw)
+    return SimpleNamespace(**base)
+
+
 # == groups ======================================================================
 
 def group_config() -> None:
@@ -398,14 +416,6 @@ def group_settings() -> None:
     from review_loop import cli, config
 
     section("settings — how many PRs a seat may work at once")
-
-    def ns(**kw):
-        base = dict(loop="widgets", concurrency=None, cap=None, clone=None, base=None,
-                    grace_min=None, marker_grace_min=None, ttl_min=None,
-                    inflight_ttl_min=None, host=None, reviewer_concurrency=None,
-                    fixer_concurrency=None)
-        base.update(kw)
-        return SimpleNamespace(**base)
 
     def call(**kw) -> tuple[int, str]:
         buf = io.StringIO()
@@ -788,6 +798,132 @@ def group_exclusive() -> None:
     check("  the queue is empty again", load_state("pending.json").get("reviewer", {}), {})
 
 
+def manifest_schema() -> dict:
+    """The ``config_schema`` block out of plugin.yaml, without a YAML dependency.
+
+    The package is stdlib-only on purpose (it ships to other people's machines), so the suite reads
+    the manifest by hand instead of adding PyYAML for one assertion. A shape this cannot follow
+    raises rather than returning an empty dict — a drift test that silently passes is worse than no
+    drift test.
+    """
+    text = (ROOT / "plugin.yaml").read_text()
+    parts = text.split("\nconfig_schema:", 1)
+    if len(parts) != 2:
+        raise AssertionError("plugin.yaml has no config_schema: block")
+    entries: dict = {}
+    current = None
+    for line in parts[1].splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if re.match(r"^  \S", line):
+            current = line.strip().rstrip(":")
+            entries[current] = {}
+        elif re.match(r"^    \S", line) and current:
+            key, _, value = line.strip().partition(":")
+            entries[current][key.strip()] = value.strip().strip('"')
+    return entries
+
+
+class FakeCtx:
+    """Just enough PluginContext to capture the CLI parser a plugin registers."""
+
+    def __init__(self) -> None:
+        self.registered: str | None = None
+        self.setup = None
+        self.skill = None
+
+    def register_cli_command(self, name, help_text, setup, description="", **kw):  # noqa: ANN001
+        self.registered = name
+        self.setup = setup
+
+    def register_skill(self, name, path, description="", **kw):  # noqa: ANN001
+        self.skill = name
+
+
+def group_plugin_settings() -> None:
+    section("plugin settings — the desktop form and the loop must agree")
+    from review_loop import cli, config
+
+    reset(prs={"7": pr(7)})      # a known starting loop, whatever the earlier groups left behind
+    manifest = manifest_schema()
+    check("plugin.yaml declares a config_schema", bool(manifest), True)
+    check("  the same keys the code reads", sorted(manifest), sorted(config.SETTINGS_SCHEMA))
+    for key, spec in config.SETTINGS_SCHEMA.items():
+        declared = manifest.get(key) or {}
+        check(f"  {key}: type agrees", declared.get("type"), spec["type"])
+        check(f"  {key}: default agrees", declared.get("default"), str(spec["default"]))
+        check(f"  {key}: label agrees (the form shows the label, not the key)",
+              declared.get("label"), spec["label"])
+        check(f"  {key}: has a description", bool(declared.get("description")), True)
+
+    check("unset → schema defaults", config.settings_defaults(None)["cap"],
+          config.SETTINGS_SCHEMA["cap"]["default"])
+    tuned = config.settings_defaults({"cap": 6, "reviewer_concurrency": "4"})
+    check("a set value wins", (tuned["cap"], tuned["reviewer_concurrency"]), (6, 4))
+    check("  and is coerced to the declared type", isinstance(tuned["reviewer_concurrency"], int), True)
+    check("a junk value falls back", config.settings_defaults({"cap": "many"})["cap"], 3)
+
+    settings = {"cap": 5, "reviewer_concurrency": 2, "fixer_concurrency": 1,
+                "clone": str(CLONE), "grace_min": 30}
+    raw = config.apply_settings(config.load_id("widgets"), settings)
+    check("apply writes both seats",
+          (raw["seats"]["reviewer"]["concurrency"], raw["seats"]["fixer"]["concurrency"]), (2, 1))
+    check("  and the plain knobs", (raw["cap"], raw["grace_min"]), (5, 30))
+
+    kept = config.apply_settings({"clone": "/some/where", "seats": {}}, {"clone": ""})
+    check("a blank clone in the form never wipes the loop's own",
+          kept["clone"], "/some/where")
+
+    fake = FakeCtx()
+    cli.register_cli(fake, settings=settings)
+    check("the CLI registers itself under one name", fake.registered, "review-loop")
+
+    parser = argparse.ArgumentParser(prog="hermes review-loop")
+    sub = parser.add_subparsers(dest="cmd")
+    fake.setup(sub)
+    args = parser.parse_args(["init", "--repo", "acme/solo", "--fixer", "f", "--reviewer", "r",
+                              "--reviewer-profile", "p", "--fixer-profile", "q"])
+    check("a new loop starts from the settings",
+          (args.cap, args.reviewer_concurrency, args.fixer_concurrency), (5, 2, 1))
+    check("  clone and grace too", (args.clone, args.grace_min), (str(CLONE), 30))
+    check("  seats differing → no misleading loop-level default", args.concurrency, 1)
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.cmd_apply(ns(loop="widgets", dry_run=True))
+    check("apply --dry-run exits 0", rc, 0)
+    check("  and shows the diff", "reviewer concurrency: 1 → 2" in buf.getvalue(), True)
+    check("  nothing written on a dry run",
+          config.seat_concurrency(config.load_id("widgets"), "reviewer"), 1)
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.cmd_apply(ns(loop="widgets", dry_run=False))
+    check("apply writes it", config.seat_concurrency(config.load_id("widgets"), "reviewer"), 2)
+    check("  and reports the file", "loop config updated" in buf.getvalue(), True)
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.cmd_apply(ns(loop="widgets", dry_run=False))
+    check("a second apply is a no-op", "already matches" in buf.getvalue(), True)
+
+    # the rails still hold: two reviews at once with nowhere to isolate them is refused
+    cfg = json.loads((LOOPS_DIR / "widgets.json").read_text())
+    cfg["clone"] = ""
+    (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = cli.cmd_apply(ns(loop="widgets", dry_run=False))
+    check("parallel settings without a clone → refused", rc, 2)
+    check("  and it says why", "requires 'clone'" in buf.getvalue(), True)
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        cli.cmd_settings(ns())
+    check("settings lists every knob", "reviewer_concurrency" in buf.getvalue(), True)
+    check("  and where it came from", "[set]" in buf.getvalue(), True)
+
+
 def group_watchdog() -> None:
     section("watchdog — quiet is not the same as nothing to do")
 
@@ -929,7 +1065,8 @@ def group_cleanup() -> None:
 
 GROUPS = {"config": group_config, "reviewer": group_reviewer_gate, "budget": group_budget,
           "fixer": group_fixer_gate, "seats": group_seats, "parallel": group_parallel,
-          "exclusive": group_exclusive, "settings": group_settings, "watchdog": group_watchdog,
+          "exclusive": group_exclusive, "settings": group_settings,
+          "plugin_settings": group_plugin_settings, "watchdog": group_watchdog,
           "cleanup": group_cleanup}
 
 

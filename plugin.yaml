@@ -14,3 +14,54 @@ platforms:
   - linux
   - darwin
 python_dependencies: []
+# Settings the operator can edit in the desktop (Capabilities → Plugins → review loop). They are
+# the defaults a NEW loop starts from, and what `hermes review-loop apply --loop <id>` pushes onto
+# an existing one — a form that silently renumbered a running loop would be a nasty thing to debug.
+# Mirrored by review_loop/config.py SETTINGS_SCHEMA; the test suite asserts the two agree, because a
+# form that writes keys nothing reads is worse than no form at all.
+config_schema:
+  cap:
+    label: "Review cap (verdicts)"
+    type: int
+    default: 3
+    description: "Verdicts before the loop stops and hands the PR to an adjudicator (cap - 1 fixes)"
+  reviewer_concurrency:
+    label: "Reviews at once"
+    type: int
+    default: 1
+    description: "Reviews that may run at once; everything above this queues. Above 1 needs a clone path, so each run gets its own sandbox."
+  fixer_concurrency:
+    label: "Fixes at once"
+    type: int
+    default: 1
+    description: "Fixes that may run at once; everything above this queues"
+  clone:
+    label: "Clone path (required above 1)"
+    type: str
+    default: ""
+    description: "Local clone the runs isolate from — required above 1, because a parallel run in a shared checkout produces wrong verdicts"
+  base:
+    label: "Base branch"
+    type: str
+    default: "main"
+    description: "Base branch the loop watches"
+  grace_min:
+    label: "Watchdog grace (minutes)"
+    type: int
+    default: 25
+    description: "Minutes a quiet PR may sit before the watchdog speaks"
+  ttl_min:
+    label: "Seat slot TTL (minutes)"
+    type: int
+    default: 45
+    description: "Minutes a seat slot survives — the backstop for a run that died without a verdict"
+  inflight_ttl_min:
+    label: "In-flight mark TTL (minutes)"
+    type: int
+    default: 10
+    description: "Minutes an in-flight mark blocks a second run at the same head"
+  host:
+    label: "Webhook host"
+    type: str
+    default: "https://hooks.coemedia.us"
+    description: "Webhook host the loop's routes are reached on"

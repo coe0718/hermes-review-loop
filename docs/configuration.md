@@ -47,6 +47,33 @@ configuration error, not a run that guesses.
 | `ttl_min` | `45` | seat-lock lifetime; past this a crashed run has lost its seat |
 | `inflight_ttl_min` | `10` | how long a same-head burst is considered already handled |
 
+## Plugin settings (the desktop form)
+
+`plugin.yaml` declares a `config_schema`, so the desktop renders a form at **Capabilities → Plugins →
+review loop**. Those values are **defaults for a new loop**; pushing them onto an existing loop is
+explicit, because a form that quietly renumbers a running loop is a miserable thing to debug:
+
+```bash
+hermes review-loop settings                      # what the form holds, [set] vs [default], per key
+hermes review-loop apply --loop <id> --dry-run   # the diff
+hermes review-loop apply --loop <id>             # write it
+```
+
+| setting | default | lands on |
+|---|---|---|
+| `cap` | 3 | `cap` |
+| `reviewer_concurrency` / `fixer_concurrency` | 1 | `seats.<seat>.concurrency` |
+| `clone`, `base`, `host` | —, `main`, `https://hooks.coemedia.us` | the same loop keys |
+| `grace_min`, `ttl_min`, `inflight_ttl_min` | 25, 45, 10 | the same loop keys |
+
+Settings are per profile (`plugins.entries.hermes-review-loop.settings`, written through Hermes'
+single config writer), and `review_loop/config.py::SETTINGS_SCHEMA` mirrors the manifest — the suite
+fails if the two drift, because a form that writes keys nothing reads is worse than no form.
+
+Blank `clone` means *not set here*: it never erases the clone a loop already uses, since the cleanup
+prunes worktrees through that path. The rails still apply — `reviewer_concurrency: 2` with no clone
+is refused at `init`, at `set` and at `apply` alike.
+
 ## State files (per loop, under `state_dir`)
 
 | file | what it holds |
@@ -57,7 +84,7 @@ configuration error, not a run that guesses.
 | `breach.json` | `{"repo#PR": {head, rounds, cap, reason, at, status}}` — awaiting adjudication |
 | `watchdog.json` | `armed_since` baseline, alert history, last run |
 | `watchdog.log` | one line per sweep, and per breach |
-| `artifacts/<PR>/` | where a run must keep its worktrees, build dirs and logs |
+| `artifacts/<PR>/<seat>/` | where a run must keep its worktrees, build dirs and logs — per PR *and* per seat, so the two never share a checkout |
 
 ## Environment overrides
 
@@ -71,9 +98,10 @@ configuration error, not a run that guesses.
 
 ## Deliberate non-features
 
-- **No config_schema / settings form.** The interesting configuration is per repository, and a
-  per-profile settings form would be the wrong shape for it. Loop files are plain JSON you can read
-  and diff.
+- **No config_schema for *loop* config.** The interesting configuration is per repository, so a
+  per-profile form cannot own it — the form carries the plugin-level defaults (below), and the loop
+  file stays plain JSON you can read and diff. Pushing those defaults onto a loop is explicit
+  (`apply`), never a subscription.
 - **No auto-update, no telemetry, no network beyond GitHub, Discord and your own gateway.**
 - **No deploy/hosting integration and no model provider assumptions.** The seats are Hermes profiles;
   what model each profile runs is the operator's business.

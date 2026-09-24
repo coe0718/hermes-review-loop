@@ -89,6 +89,8 @@ That writes exactly four things, all of them visible and reversible:
 ```bash
 hermes review-loop list                 # what is configured
 hermes review-loop status --loop name   # parallel setting, live runs, queue, breaches
+hermes review-loop settings             # the plugin-level defaults, and where each came from
+hermes review-loop apply --loop name    # push those defaults onto an existing loop (--dry-run)
 hermes review-loop set --loop name --reviewer-concurrency 2   # two reviews at once, one fix at a time
 hermes review-loop arm --loop name      # arm/pause by flipping the repo hooks
 hermes review-loop pause --loop name
@@ -128,6 +130,39 @@ Do the arithmetic before setting it high: each in-flight run is a whole agent pl
 its own cold build. On a big Rust repo, ten at once is ten parallel builds — the machine, not GitHub,
 is what decides how high this number can go.
 
+### Settings, in the desktop
+
+The plugin declares a `config_schema`, so it has a settings form at
+**Capabilities → Plugins → review loop** — no hand-edited JSON required:
+
+| setting | default | what it does |
+|---|---|---|
+| `cap` | 3 | verdicts before the loop stops and hands the PR to an adjudicator |
+| `reviewer_concurrency` | 1 | reviews at once; the rest queue |
+| `fixer_concurrency` | 1 | fixes at once; the rest queue |
+| `clone` | — | the local clone runs isolate from (required above 1) |
+| `base` | main | base branch the loop watches |
+| `grace_min` | 25 | quiet minutes before the watchdog speaks |
+| `ttl_min` | 45 | how long a seat slot survives a run that died without a verdict |
+| `inflight_ttl_min` | 10 | how long a mark blocks a second run at the same head |
+| `host` | hooks.coemedia.us | webhook host the routes are reached on |
+
+The form shows friendly labels (`Reviews at once`, `Watchdog grace (minutes)`, `Clone path (required
+above 1)`); the keys in the table are what `hermes review-loop settings` prints and what the loop
+file holds.
+
+Two rules, because a settings form that quietly renumbers a running loop is a miserable thing to
+debug at 2am:
+
+* settings are **defaults for a new loop**, and
+* they reach an existing loop only when you push them: `hermes review-loop apply --loop <id>`,
+  which prints the diff first (`--dry-run` to stop there).
+
+`hermes review-loop settings` prints the same table from the CLI with `[set]` / `[default]` beside
+each value, so you can tell what the form actually holds without opening it. Settings follow the
+**profile** they were saved in, and the rails still apply: a concurrency above 1 with no clone is
+refused at `init`, at `set` and at `apply` alike.
+
 ## What the loop guarantees
 
 - **One PR, one seat.** A PR is held by the reviewer *or* the fixer, never both: a review never
@@ -156,11 +191,12 @@ is what decides how high this number can go.
 
 Exercised and passing:
 
-- `python3 tests/run_tests.py` — 168 checks, no network: every gate branch, the cap, the one-PR-one-
+- `python3 tests/run_tests.py` — 218 checks, no network: every gate branch, the cap, the one-PR-one-
   seat rule (including the handoff that must *not* deadlock the gates), per-seat capacity and
   queueing, an approval freeing its slot and starting the next queued PR, **real isolation** (real
-  clones — one per PR *and* per seat — checked out at the head, with no token in them), the `set`
-  verb's rails (including the round trip a stranger's install depends on), all four watchdog stall
+  clones — one per PR *and* per seat — checked out at the head, with no token in them), the `set` /
+  `apply` / `settings` verbs (including the round trip a stranger's install depends on, and that
+  `plugin.yaml`'s `config_schema` still matches the keys the code reads), all four watchdog stall
   shapes, and the cleanup rails against a real git clone.
 - Live use on a private repository: two seats, dozens of PRs, review → verdict → fix → cleanup.
 
