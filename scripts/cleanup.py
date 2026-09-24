@@ -274,6 +274,15 @@ def clear_state(loop: dict, number: int, quiet: bool) -> list[str]:
             continue
         before = json.dumps(data, sort_keys=True)
         data.pop(key, None)
+        if path == st.inflight_file:
+            # Marks are role:PR:SHA; require exact fields, not a string prefix.
+            for mark in list(data):
+                if not isinstance(mark, str):
+                    continue
+                parts = mark.split(":")
+                if (len(parts) == 3 and parts[0] in ("review", "fix")
+                        and parts[1] == str(number) and parts[2]):
+                    data.pop(mark)
         for seat, entry in list(data.items()):
             if not isinstance(entry, dict):
                 continue

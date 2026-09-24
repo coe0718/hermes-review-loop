@@ -182,6 +182,37 @@ def drain_queued(loop: dict, st: state_mod.LoopState, lines: list[str]) -> None:
             lines.append(f"started the queued {seat} run whose wait was over")
 
 
+def retry_pending_breaches(loop: dict, st: state_mod.LoopState, prs: list) -> None:
+    """Retry listed eligible heads only after reviews verify the cap.
+
+    The first armed sweep baselines stall clocks, not pending delivery. The
+    breach gate rechecks the live head under its delivery lock before POST.
+    """
+    markers = st.breach_all()
+    for pr in prs:
+        if not isinstance(pr, dict) or pr.get("state") != "open" or pr.get("draft"):
+            continue
+        if (pr.get("base") or {}).get("ref") != loop["base"]:
+            continue
+        if ((pr.get("user") or {}).get("login") or "").lower() not in loop["fixers"]:
+            continue
+        number = pr.get("number")
+        head = (pr.get("head") or {}).get("sha")
+        if type(number) is not int or not head:
+            continue
+        marker = markers.get(f"{loop['repo']}#{number}")
+        if (not isinstance(marker, dict) or marker.get("status") != "delivery-pending"
+                or marker.get("head") != head):
+            continue
+        reviews = gh.reviews(loop, number)
+        if not isinstance(reviews, list) or gate.approved_at_head(reviews, loop, head):
+            continue
+        changes = gate.verdicts(reviews, loop)
+        if len(changes) >= loop["cap"]:
+            gate.breach(loop, st, number, head, marker.get("rounds", len(changes)),
+                        marker.get("reason", "review cap reached"))
+
+
 def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
     lines: list[str] = []
     watch = st.watch()
@@ -245,6 +276,7 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
                                   "last_seen_at": now}
     watch["heads"] = current_heads
     st.watch_save(watch)                 # persist observations even if review reads fail
+    retry_pending_breaches(loop, st, prs)
     if first_sweep:
         st.note("loop observed armed — head snapshot set; existing heads excluded")
         drain_queued(loop, st, lines)
@@ -279,13 +311,8 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
         at_head = gate.changes_at_head(reviews, loop, head)
         changes = gate.verdicts(reviews, loop)
         marker = breach.get(f"{loop['repo']}#{number}") or {}
-        if (marker.get("head") == head and marker.get("status") == "delivery-pending"
-                and len(changes) >= loop["cap"]):
-            # The original POST failed (or the sender crashed). A sweep can
-            # recover without relying on GitHub redelivering the cap event.
-            gate.breach(loop, st, number, head, marker.get("rounds", len(changes)),
-                        marker.get("reason", "review cap reached"))
-            marker = st.breach_get(number)
+        if marker.get("head") == head and marker.get("status") == "delivery-pending":
+            continue  # failed delivery is not a silent stall
         observed_at = current_heads[str(number)]["observed_at"]
         head_postdates_arming = TEST or observed_at is not None
         kind = ""

@@ -772,11 +772,53 @@ def group_adjudicator() -> None:
     run("gate_reviewer.py", pr_payload(head=HEAD_B))
     cfg["host"] = HOST
     (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
-    state_file("watchdog.json").write_text(json.dumps({"armed_since": time.time() - 86400}))
-    run("watchdog.py", None, "--loop", "widgets")
-    check("sweep delivers pending breach without another webhook", len(RECEIVED), 1)
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets")
+    check("first armed sweep delivers pending breach without another webhook", len(RECEIVED), 1)
+    check("first armed sweep does not report a stall", "silent stall" in out, False)
     check("sweep marks successful delivery",
           load_state("breach.json")[f"{REPO}#7"]["status"], "awaiting-adjudication")
+    run("watchdog.py", None, "--loop", "widgets")
+    check("subsequent sweep does not redeliver", len(RECEIVED), 1)
+
+    # Unknown reviews/listing cannot authorize delivery; neither can an
+    # approval, a cap that is no longer spent, or a moved head.
+    for label, candidate in (("unreadable reviews", {**pr(7, head=HEAD_B), "reviews": None}),
+                             ("below cap", {**pr(7, head=HEAD_B), "reviews": reviews[:2]}),
+                             ("approved", {**pr(7, head=HEAD_B), "reviews": reviews +
+                                           [review(REVIEWER, head=HEAD_B, rid=8, state="APPROVED")]}),
+                             ("moved head", {**pr(7, head=HEAD_A), "reviews": reviews})):
+        reset(prs={"7": {**pr(7, head=HEAD_B), "reviews": reviews}})
+        cfg = json.loads((LOOPS_DIR / "widgets.json").read_text())
+        cfg["host"] = "http://127.0.0.1:9"
+        (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
+        run("gate_reviewer.py", pr_payload(head=HEAD_B))
+        cfg["host"] = HOST
+        (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
+        set_prs({"7": candidate})
+        out, _, _ = run("watchdog.py", None, "--loop", "widgets")
+        check(f"{label} does not deliver pending", len(RECEIVED), 0)
+        check(f"{label} retains pending marker", load_state("breach.json")[f"{REPO}#7"]["status"],
+              "delivery-pending")
+        check(f"{label} first sweep has no false stall", "silent stall" in out, False)
+        if label == "unreadable reviews":
+            set_prs({"7": {**pr(7, head=HEAD_B), "reviews": reviews}})
+            run("watchdog.py", None, "--loop", "widgets")
+            check("review recovery retries pending POST", len(RECEIVED), 1)
+
+    reset(prs={"7": {**pr(7, head=HEAD_B), "reviews": reviews}})
+    cfg = json.loads((LOOPS_DIR / "widgets.json").read_text())
+    cfg["host"] = "http://127.0.0.1:9"
+    (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
+    run("gate_reviewer.py", pr_payload(head=HEAD_B))
+    cfg["host"] = HOST
+    (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets",
+                    extra_env={"REVIEW_LOOP_GH_STUB": "/bin/false"})
+    check("failed listing leaves pending marker", load_state("breach.json")[f"{REPO}#7"]["status"],
+          "delivery-pending")
+    check("failed listing does not POST", len(RECEIVED), 0)
+    run("watchdog.py", None, "--loop", "widgets")
+    check("listing recovery retries pending POST", len(RECEIVED), 1)
 
 
 def group_fixer_gate() -> None:
@@ -1954,9 +1996,27 @@ def group_cleanup() -> None:
     reset(prs={"7": pr(7, state="closed", merged="2026-02-02T00:00:00Z")})
     state_file("locks.json").write_text(json.dumps({"reviewer": {"at": time.time(), "key": f"{REPO}#7"}}))
     state_file("breach.json").write_text(json.dumps({f"{REPO}#7": {"status": "awaiting-adjudication"}}))
+    state_file("inflight.json").write_text(json.dumps({
+        f"review:7:{HEAD_A}": time.time(), f"fix:7:{HEAD_A}": time.time(),
+        f"review:70:{HEAD_A}": 123, f"fix:70:{HEAD_A}": 456,
+        f"review:7x:{HEAD_A}": 789, f"other:7:{HEAD_A}": 321,
+        f"review:7:{HEAD_A}:extra": 654}))
+    state_file("pending.json").write_text(json.dumps({"reviewer": {
+        f"{REPO}#7": {"head": HEAD_A}, f"{REPO}#70": {"head": HEAD_A}}}))
+    state_file("breach.json").write_text(json.dumps({f"{REPO}#7": {"status": "awaiting-adjudication"},
+                                                      f"{REPO}#70": {"status": "delivery-pending"}}))
     run("cleanup.py", None, "--loop", "widgets", "--pr", "7")
     check("locks cleared for the PR", load_state("locks.json"), {})
-    check("breach marker cleared", load_state("breach.json"), {})
+    check("breach marker cleared without adjacent PR", load_state("breach.json"),
+          {f"{REPO}#70": {"status": "delivery-pending"}})
+    check("queue keeps adjacent PR", load_state("pending.json"),
+          {"reviewer": {f"{REPO}#70": {"head": HEAD_A}}})
+    check("only exact PR in-flight marks cleared", load_state("inflight.json"), {
+        f"review:70:{HEAD_A}": 123, f"fix:70:{HEAD_A}": 456,
+        f"review:7x:{HEAD_A}": 789, f"other:7:{HEAD_A}": 321,
+        f"review:7:{HEAD_A}:extra": 654})
+    set_prs({"7": pr(7, head=HEAD_A)})
+    check("reopened same head can enter reviewer gate", run("gate_reviewer.py", pr_payload())[0], "FIRE")
 
     # an open PR is refused without --force
     reset(prs={"7": pr(7, state="open")})
