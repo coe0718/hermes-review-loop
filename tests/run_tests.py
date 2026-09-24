@@ -32,6 +32,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from types import SimpleNamespace
+from typing import Any
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -829,7 +830,7 @@ class FakeCtx:
 
     def __init__(self) -> None:
         self.registered: str | None = None
-        self.setup = None
+        self.setup: Any = None
         self.skill = None
 
     def register_cli_command(self, name, help_text, setup, description="", **kw):  # noqa: ANN001
@@ -879,14 +880,30 @@ def group_plugin_settings() -> None:
     check("the CLI registers itself under one name", fake.registered, "review-loop")
 
     parser = argparse.ArgumentParser(prog="hermes review-loop")
-    sub = parser.add_subparsers(dest="cmd")
-    fake.setup(sub)
+    fake.setup(parser)          # the framework hands setup the COMMAND's parser, not a subparsers action
     args = parser.parse_args(["init", "--repo", "acme/solo", "--fixer", "f", "--reviewer", "r",
                               "--reviewer-profile", "p", "--fixer-profile", "q"])
     check("a new loop starts from the settings",
           (args.cap, args.reviewer_concurrency, args.fixer_concurrency), (5, 2, 1))
     check("  clone and grace too", (args.clone, args.grace_min), (str(CLONE), 30))
     check("  seats differing → no misleading loop-level default", args.concurrency, 1)
+
+    # The bug this test used to *encode*: setup was handed a subparsers action here and the
+    # command's own parser in the framework, so the real CLI silently offered zero subcommands.
+    for argv in (["list"], ["settings"], ["status", "--loop", "widgets"],
+                 ["apply", "--loop", "widgets", "--dry-run"],
+                 ["set", "--loop", "widgets", "--cap", "4"],
+                 ["arm", "--loop", "widgets"], ["cleanup", "--loop", "widgets"],
+                 ["uninstall", "--loop", "widgets"]):
+        parsed = parser.parse_args(argv)
+        check(f"  `{' '.join(argv)}` parses", callable(parsed.func), True)
+        check(f"    …as the {argv[0]} command", parsed.command, argv[0])
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = parser.parse_args([]).func(ns())
+    check("bare invocation prints usage instead of erroring", rc, 0)
+    check("  and it lists the commands", "apply" in buf.getvalue(), True)
 
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):

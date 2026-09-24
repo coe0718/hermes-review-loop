@@ -446,7 +446,20 @@ def register_cli(ctx, settings: dict | None = None) -> None:
     # they disagree the two seat values below carry the answer explicitly.
     both = d["reviewer_concurrency"] if d["reviewer_concurrency"] == d["fixer_concurrency"] else 1
 
-    def setup(sub) -> None:  # noqa: ANN001
+    def setup(parser) -> None:  # noqa: ANN001
+        """Build the command's argparse tree.
+
+        The framework hands this the parser for ``hermes review-loop`` itself — the subcommands are
+        ours to create. (Claiming a subparsers action here compiles, loads, validates, and then
+        quietly offers zero subcommands: ``hermes review-loop list`` is "unrecognized arguments".)
+        """
+        sub = parser.add_subparsers(dest="command", metavar="<command>")
+
+        def _usage(_args) -> int:      # bare `hermes review-loop` prints the commands, not an error
+            parser.print_help()
+            return 0
+
+        parser.set_defaults(func=_usage)
         sub.add_parser("list", help="List configured loops").set_defaults(func=cmd_list)
 
         init = sub.add_parser("init", help="Configure a loop and install its routes")
