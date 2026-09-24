@@ -115,19 +115,32 @@ def route(name: str) -> dict | None:
     return entry if isinstance(entry, dict) else None
 
 
+def url_for_profile(name: str, profile: str | None, host: str | None = None) -> str | None:
+    """The URL a route *has* under a profile — the same shape the gateway serves.
+
+    Split out from ``url_for`` so a preview can show the URL a route is about to get before the
+    registry holds it: the profile is part of the URL, which is exactly why changing a seat's
+    profile is a route change and not only a config edit.
+    """
+    base = config.webhook_host(host)
+    if not base:
+        return None
+    if not profile or profile == "default":
+        return f"{base}/webhooks/{name}"
+    return f"{base}/p/{profile}/webhooks/{name}"
+
+
 def url_for(name: str, host: str | None = None) -> str | None:
     entry = route(name)
     if not entry:
         return None
     # Never invent a relative webhook URL when neither the caller nor the route
     # names an operator-owned gateway. Reject malformed origins at this boundary.
-    base = config.webhook_host(host or entry.get("host"))
+    # A malformed *stored* origin raises here, which is the caller's to refuse loudly.
+    base = config.webhook_host(host or entry.get("host")) or ""
     if not base:
         return None
-    profile = entry.get("profile", "default")
-    if profile == "default":
-        return f"{base}/webhooks/{name}"
-    return f"{base}/p/{profile}/webhooks/{name}"
+    return url_for_profile(name, entry.get("profile", "default"), base)
 
 
 def target(name: str, host: str | None = None):
@@ -213,3 +226,16 @@ def remove_route(name: str) -> bool:
         data.pop(name)
         _write_registry(path, data)
         return True
+
+
+def restore_entries(entries: dict[str, dict | None]) -> None:
+    """Restore only owned route entries after an incomplete multi-route update."""
+    path = subs_path()
+    with _registry_lock(path):
+        data = _read_for_write(path)
+        for name, entry in entries.items():
+            if entry is None:
+                data.pop(name, None)
+            else:
+                data[name] = entry
+        _write_registry(path, data)

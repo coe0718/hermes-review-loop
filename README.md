@@ -84,6 +84,12 @@ set `host` in this plugin's settings. There is no shared webhook host. `init` re
 invalid host before writing the loop config or routes; `--hooks` never creates GitHub hooks in that
 case. Use HTTPS for a public GitHub webhook (HTTP is useful for local testing).
 
+When the plugin settings name the seats (`fixer_profile`, `reviewer_profile`, `reviewer_login`,
+`fixer_login`, `adjudicator_profile`), the seat flags above become optional — the form supplies them
+and an explicit flag still wins. `--dry-run` prints the whole plan (who serves each seat, the route
+URLs, what would be written) and stops there, which is the way to check a form before it reaches a
+running loop.
+
 That writes exactly four things, all of them visible and reversible:
 
 1. one loop config — `~/.hermes/review-loops.d/<id>.json`
@@ -101,11 +107,13 @@ registry is visible, but crash durability is unconfirmed; do not assume the oper
 
 ```bash
 hermes review-loop list                 # what is configured
-hermes review-loop status --loop name   # parallel setting, live runs, queue, breaches
+hermes review-loop status --loop name   # seats, profiles, routes, live runs, queue, breaches
 hermes review-loop explain --loop name --pr 123   # why that PR is not moving, and what is next
 hermes review-loop doctor --loop name   # preflight the install: profiles, tokens, routes, hooks, cron
 hermes review-loop settings             # the plugin-level defaults, and where each came from
+hermes review-loop init --repo owner/name --dry-run   # preview a loop: seats, routes, nothing written
 hermes review-loop apply --loop name    # push those defaults onto an existing loop (--dry-run)
+hermes review-loop apply --loop name --while-busy     # rebind even while a seat has a run out
 hermes review-loop set --loop name --reviewer-concurrency 2   # two reviews at once, one fix at a time
 hermes review-loop arm --loop name      # arm/pause by flipping the repo hooks
 hermes review-loop pause --loop name
@@ -224,9 +232,17 @@ widgets: 12 verified, 6 failed, 1 unknown (of 19 checks)
 sink for the probe, a stubbed GitHub, short relative paths. A run against a live install
 prints the same lines with absolute paths and the real hook list.)
 
+*Who* serves each seat is the settings form's business (below), not `set`'s: a per-profile form holds
+the defaults, and `apply --loop` pushes them onto exactly one loop — with the seat diff, the route
+profiles it rebinds and the credentials it checked. For one repository that needs a shape no form
+should own (a different allowlist, its own route names), the loop file is still plain JSON you can
+read and diff; `init` is the only verb that writes routes from scratch.
+
 Each seat needs its own GitHub token, and that is deliberate: the token that reviews, the token
 that pushes and the token that reads are separate and revocable one at a time. A classic PAT with
-`repo` is enough for the seats; creating hooks additionally needs `admin:repo_hook`.
+`repo` is enough for the seats; creating hooks additionally needs `admin:repo_hook`. A loop that
+names tokens must name one per seat, and the file has to be there — checked before `init` or `apply`
+writes anything, because a missing PAT otherwise surfaces hours later as an unauthenticated read.
 
 ### Why isn't this PR moving?
 
@@ -326,6 +342,11 @@ The plugin declares a `config_schema`, so it has a settings form at
 | `cap` | 3 | verdicts before the loop stops and hands the PR to an adjudicator |
 | `reviewer_concurrency` | 1 | reviews at once; the rest queue |
 | `fixer_concurrency` | 1 | fixes at once; the rest queue |
+| `reviewer_profile` | — | Hermes profile the reviewer seat runs as |
+| `fixer_profile` | — | Hermes profile the fixer seat runs as |
+| `reviewer_login` | — | GitHub login the reviewer acts as (and the login the review route serves) |
+| `fixer_login` | — | GitHub login the fixer acts as |
+| `adjudicator_profile` | — | Hermes profile that rules when the budget is spent (optional) |
 | `clone` | — | the local clone runs isolate from (required above 1) |
 | `base` | main | base branch the loop watches |
 | `grace_min` | 25 | quiet minutes before the watchdog speaks |
@@ -333,9 +354,17 @@ The plugin declares a `config_schema`, so it has a settings form at
 | `inflight_ttl_min` | 10 | how long a mark blocks a second run at the same head |
 | `host` | unset | your gateway's webhook origin; required for `init`, or supply `--host` |
 
-The form shows friendly labels (`Reviews at once`, `Watchdog grace (minutes)`, `Clone path (required
-above 1)`); the keys in the table are what `hermes review-loop settings` prints and what the loop
-file holds.
+The form shows friendly labels (`Reviews at once`, `Reviewer's Hermes profile`, `Clone path
+(required above 1)`); the keys in the table are what `hermes review-loop settings` prints and what
+the loop file holds.
+
+**Blank means *not set here*, never "unset what the loop has".** A blank profile or login leaves
+that seat exactly as the loop file has it, which is what lets one profile-level form hold defaults
+without silently rewriting the seats a repository already answered for itself. Profiles and logins
+are validated before anything is written — the profile must exist on this machine, the login must be
+in that loop's allowlist, the two seats must not share a profile, a login or a token file, and every
+token the loop names must be a file that is there. A form that names a seat is a promise that the
+seat can run, so `init` and `apply` refuse rather than write a loop that fails at its first event.
 
 Two rules, because a settings form that quietly renumbers a running loop is a miserable thing to
 debug at 2am:
@@ -344,8 +373,40 @@ debug at 2am:
 * they reach an existing loop only when you push them: `hermes review-loop apply --loop <id>`,
   which prints the diff first (`--dry-run` to stop there).
 
+Changing *who* serves a seat is staged rather than half-applied: the routes whose URLs carry the old
+profile are rebound first, the loop config is committed second, and every rebind is verified by
+reading the route registry back. A registry that refuses the rebind leaves the loop exactly as it
+was — there is no config to put back. A seat with a run in flight is refused rather than rewritten
+underneath itself — the live run holds its old profile, login and credential until it ends — and
+`--while-busy` is the explicit override that says "rebind now, I know that run finishes under the
+identity it started with". `apply --dry-run` shows all of it without writing: the seat diff, the
+route profiles it would rebind, and nothing else.
+
+Preview a loop before installing it with `hermes review-loop init ... --dry-run`: it prints the
+effective seat mapping (profile, login, route, and the URL the profile is part of) and stops
+without writing config, routes, hooks or cron.
+
+```bash
+hermes review-loop settings                      # the form's seat mapping, and what each loop runs as today
+hermes review-loop init --repo owner/name --dry-run   # preview: seats, routes, nothing written
+hermes review-loop apply --loop name --dry-run   # what a push would change, including routes
+hermes review-loop status --loop name            # each seat, its profile, and whether its route agrees
+```
+
+`status` is the honest surface: it prints what the *installed* route serves next to what the config
+claims, and says `MISMATCH` with the command to fix it when a seat moved but its route did not.
+Token *references* are shown (which login reads which file); token values never are — they live in
+the per-profile 0600 file the seats read at use time.
+
+The form stays a per-profile default on purpose. Fixer/reviewer **allowlists**, route names, the
+adjudicator route and everything else that is per repository stay in the loop config, because one
+form cannot honestly claim to own every repository. Pushing the form onto one loop with
+`apply --loop` is the loop-specific editor: it goes through the same validation and the same staged
+apply, and it never touches a loop you did not name.
+
 `hermes review-loop settings` prints the same table from the CLI with `[set]` / `[default]` beside
-each value, so you can tell what the form actually holds without opening it. Settings follow the
+each value — and the seat mapping underneath it — so you can tell what the form actually holds,
+and what each configured loop runs as today, without opening either. Settings follow the
 **profile** they were saved in, and the rails still apply: a concurrency above 1 with no clone is
 refused at `init`, at `set` and at `apply` alike.
 
@@ -382,6 +443,10 @@ never copied into `~/.hermes/skills/`.
   as it was.
 - **Paused means silent.** With the repo hooks off, the watchdog says nothing and drains nothing: a
   parked loop must never spend a run.
+- **A seat is who the config says it is — or the loop refuses to run.** The profile it runs as, the
+  login it acts as and the route that wakes it are validated together before a config, a route or a
+  hook is written, and `status` prints the installed route next to the configured seat so a
+  half-applied identity change is visible instead of silent.
 
 ## Status and honesty
 
@@ -392,13 +457,15 @@ Exercised and passing:
   queueing, an approval freeing its slot and starting the next queued PR, **real isolation** (real
   clones — one per PR *and* per seat — checked out at the head, with no token in them), the `set` /
   `apply` / `settings` verbs (including the round trip a stranger's install depends on, and that
-  `plugin.yaml`'s `config_schema` still matches the keys the code reads), the `doctor` preflight
-  (a correct install passes; a missing profile, token, route, hook, script, cron job, clone or
-  gateway fails with a remediation; an API-denied hooks read is `unknown`, never "absent"), all
-  four watchdog stall shapes, `explain`'s golden cases (a review in flight, a review with no verdict,
-  a verdict with no fix, a head nobody asked about, a PR queued behind a full seat, a spent budget,
-  a paused loop, a closed PR, a missing PR, a failed GitHub read) plus the proof that two runs of it
-  change nothing, and the cleanup rails against a real git clone.
+  `plugin.yaml`'s `config_schema` still matches the keys the code reads), **seat identity** (the form
+  choosing reviewer/fixer/adjudicator profiles and logins, a preview that writes nothing, several
+  loops staying isolated from each other, an identity change refused while a seat is in flight and
+  staged — config *and* route — once it is not, and invalid mappings refused before any write),
+  the `doctor` preflight (missing profiles, tokens, routes, hooks or cron jobs fail with remediation;
+  an API-denied hooks read is `unknown`, never "absent"), all four watchdog stall shapes, `explain`'s
+  golden cases (in-flight/no-verdict/no-fix reviews, unrequested head, queued/full seat, spent
+  budget, paused loop, closed/missing PR, failed GitHub read) and its read-only proof, the route/hook
+  reconciliation rollback cases, and the cleanup rails against a real git clone.
 - Live use on a private repository: two seats, dozens of PRs, review → verdict → fix → cleanup.
 
 Not proven, and worth knowing before you trust it:
@@ -406,7 +473,14 @@ Not proven, and worth knowing before you trust it:
 - The plugin's own `init` path has been exercised against a test gateway, not against every gateway
   layout in the wild. The intended checks after `init` are `hermes plugins validate` and
   `hermes review-loop doctor --loop <id>` — and `doctor` has itself only been run against the
-  suite's stubbed GitHub and isolated homes, not against a live repo's hook list.
+  suite's stubbed GitHub and isolated homes, not against a live repo's hook list. Check
+  `hermes review-loop status` after installation too.
+- **The seat-identity surfaces are exercised against local files, not the desktop form.** The suite
+  calls `register_cli` with a settings dict (the shape the form writes), so the plugin-side
+  behaviour — defaults, validation, preview, staged apply — is covered; whether the desktop renders
+  the new fields the way the manifest asks is not something these tests can see.
+- A live run that spans an identity change keeps the profile and login it started with. `--while-busy`
+  is honest about that but cannot retro-fit a run already in flight.
 - Cleanup reports **file bytes removed** (`du`), which is not the same as disk recovered on a
   compressed or reflink-sharing volume — quote the `df` delta too.
 - `explain` has been exercised by the suite and by hand against stubbed GitHub, not yet against a

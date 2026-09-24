@@ -10,11 +10,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import shutil
 import subprocess
 import sys
 import time
+import tempfile
+from urllib.parse import urlsplit
 
 from . import config, doctor, gate, gh, prompts, routes
 
@@ -53,71 +56,342 @@ if proc.returncode != 0 and proc.stderr.strip():
 
 
 def routes_for(loop: dict) -> dict:
+    """The conventional route names for a loop, and the names ``init`` writes."""
     return {"reviewer": f"{loop['id']}-review", "fixer": f"{loop['id']}-fix",
             "adjudicator": f"{loop['id']}-breach"}
 
 
-def _install_routes(loop: dict) -> dict:
-    names = routes_for(loop)
+def _routes_of(loop: dict) -> dict:
+    """role → route name, from the loop's own config: the seats own the names, not this module.
+
+    A hand-edited loop may route its reviewer anywhere; every path that fires, verifies or
+    rebinds a route must read that answer rather than re-derive the convention.
+    """
+    names: dict = {}
+    for role in ("reviewer", "fixer"):
+        name = str(((loop.get("seats") or {}).get(role) or {}).get("route") or "")
+        if name:
+            names[role] = name
+    adjudicator = str((loop.get("adjudicator") or {}).get("route") or "")
+    if adjudicator:
+        names["adjudicator"] = adjudicator
+    return names
+
+
+# Which gate script each role's route must run. Ownership is checked against this before a route
+# is written: the registry is shared with every other plugin on the host, and rebinding someone
+# else's route to our profile would be a silent takeover of their webhook.
+GATE_SCRIPT = {"reviewer": "gate_reviewer.py", "fixer": "gate_fixer.py",
+               "adjudicator": "gate_adjudicator.py"}
+
+
+def _verify_routes(loop: dict, roles) -> None:
+    """Refuse to write a route that is not this loop's to write.
+
+    Three rails: no other loop may already claim the name, no two roles of this loop may share one
+    route (one route wakes one seat), and an installed route must have this role's exact gate and
+    prompt. All three fail *before* anything is written, because a route is the one
+    artifact here that another plugin could own.
+    """
+    mine = _routes_of(loop)
+    wanted = [role for role in config.ROUTE_ROLES if role in set(roles) and role in mine]
+    names = [mine[role] for role in config.ROUTE_ROLES if role in mine]
+    shared = sorted({name for name in names if names.count(name) > 1})
+    if shared:
+        raise config.ConfigError(
+            f"{loop['id']}: {', '.join(shared)} is routed to more than one seat — one route wakes "
+            "one seat, or two profiles fight over the same webhook")
+    try:
+        other_loops = config.all_loops()
+    except config.ConfigError as exc:
+        raise config.ConfigError(f"cannot check route ownership: {exc}") from exc
+    registry = routes.all_routes()
+    for role in wanted:
+        name = mine[role]
+        # "Itself" is the loop file being rewritten — same id *and* same repo. A loop that merely
+        # shares the id is a different loop, and `init` writing its own file would take the routes
+        # (and the repo) out from under it.
+        owners = [other["id"] for other in other_loops
+                  if not (other["id"] == loop["id"] and other.get("repo") == loop.get("repo"))
+                  and name in set(_routes_of(other).values())]
+        if owners:
+            raise config.ConfigError(
+                f"route {name!r} already belongs to loop {', '.join(sorted(owners))} — give this "
+                "loop its own route name (the registry is shared by every plugin)")
+        if name not in registry:
+            continue                  # not installed yet: nothing of someone else's to collide with
+        entry = registry[name]
+        if not isinstance(entry, dict):
+            raise config.ConfigError(f"route {name!r} exists but its ownership cannot be verified "
+                                     "— pick another route name")
+        script = entry.get("script")
+        if script != GATE_SCRIPT[role]:
+            raise config.ConfigError(
+                f"route {name!r} runs {script!r}, not {GATE_SCRIPT[role]!r} — it belongs to "
+                "something else; pick another route name")
+        expected_prompt = {"reviewer": prompts.REVIEWER, "fixer": prompts.FIXER,
+                           "adjudicator": prompts.ADJUDICATOR}[role]
+        if entry.get("prompt") != expected_prompt:
+            raise config.ConfigError(
+                f"route {name!r} does not have this {role} gate's prompt — ownership cannot be "
+                "verified; pick another route name")
+
+
+def _install_routes(loop: dict, roles=None) -> dict:
+    """Write (or rewrite) the loop's routes; return only the roles actually written.
+
+    Rewriting is idempotent and keeps the existing secret, and it is how a stale route gets fixed:
+    the URL itself carries the seat's profile, so a seat that changed profile has a route that no
+    longer points at the right one until this runs. Nothing else in the registry is touched —
+    another loop's routes and their secrets survive this untouched.
+    """
+    names = _routes_of(loop)
     host = config.webhook_host(loop.get("host"), required=True)
     skill = loop.get("skill") or ""
-    routes.new_route(
-        names["reviewer"], profile=loop["seats"]["reviewer"]["profile"],
-        prompt=prompts.REVIEWER, events=["pull_request"],
-        script="gate_reviewer.py", deliver="discord", host=host,
-        skills=[skill] if skill else [],
-        description=f"{loop['repo']} — wake the reviewer for a new or requested review")
-    routes.new_route(
-        names["fixer"], profile=loop["seats"]["fixer"]["profile"],
-        prompt=prompts.FIXER, events=["pull_request_review"],
-        script="gate_fixer.py", deliver="discord", host=host,
-        skills=[skill] if skill else [],
-        description=f"{loop['repo']} — wake the fixer on a changes-requested verdict")
-    if loop.get("adjudicator", {}).get("route"):
-        routes.new_route(
-            loop["adjudicator"]["route"], profile=loop["adjudicator"].get("profile", "default"),
-            prompt=prompts.ADJUDICATOR, events=["pull_request"],
-            script="gate_adjudicator.py", deliver=loop["adjudicator"].get("deliver", "telegram"),
-            host=host,
-            description=f"{loop['repo']} — adjudicate a loop that spent its budget")
-    return names
+    wanted = config.ROUTE_ROLES if roles is None else tuple(roles)
+    written: dict = {}
+    for role in config.ROUTE_ROLES:
+        if role not in wanted or role not in names:
+            continue
+        name = names[role]
+        common = {"script": GATE_SCRIPT[role], "host": host,
+                  "skills": [skill] if skill else []}
+        if role == "reviewer":
+            routes.new_route(name, profile=config.seat_profile(loop, "reviewer"),
+                             prompt=prompts.REVIEWER, events=["pull_request"],
+                             deliver="discord",
+                             description=f"{loop['repo']} — wake the reviewer for a new or "
+                                          "requested review", **common)
+        elif role == "fixer":
+            routes.new_route(name, profile=config.seat_profile(loop, "fixer"),
+                             prompt=prompts.FIXER, events=["pull_request_review"],
+                             deliver="discord",
+                             description=f"{loop['repo']} — wake the fixer on a changes-requested "
+                                          "verdict", **common)
+        else:
+            adjudicator = loop.get("adjudicator") or {}
+            routes.new_route(name, profile=adjudicator.get("profile", "default"),
+                             prompt=prompts.ADJUDICATOR, events=["pull_request"],
+                             deliver=adjudicator.get("deliver", "telegram"),
+                             description=f"{loop['repo']} — adjudicate a loop that spent its "
+                                          "budget", **common)
+        written[role] = name
+    return written
+
+
+def _seat_lines(loop: dict, title: str = "seat mapping") -> list[str]:
+    """The effective mapping: who serves each role, as what login, woken by which route.
+
+    This is the line an operator reads to answer "is Drey actually the fixer here?" without
+    opening two JSON files — so it shows the resolved values, including the route URL the profile
+    is part of.
+    """
+    lines = [f"{title}:"]
+    names = _routes_of(loop)
+    host = loop.get("host") or ""
+    for role in config.ROUTE_ROLES:
+        profile = config.seat_profile(loop, role) or "(none)"
+        name = names.get(role) or ""
+        if not name:
+            lines.append(f"  {role:<12} profile {profile:<16} route (none — nothing wakes it)")
+            continue
+        url = ""
+        if host:
+            try:
+                url = routes.url_for_profile(name, profile, host) or ""
+            except config.ConfigError:
+                url = ""
+        login = config.seat_login(loop, role) or "(unset)"
+        # The adjudicator has no login, so it keeps the column empty rather than shifting the route
+        # and URL columns out of line in the one place an operator compares seats side by side.
+        login_cell = f"login {login:<16} " if role != "adjudicator" else " " * 23
+        lines.append(f"  {role:<12} profile {profile:<16} {login_cell}"
+                     f"route {name:<22} {url}".rstrip())
+    return lines
+
+
+def _credential_lines(loop: dict) -> list[str]:
+    """Where each seat's PAT is *referenced*. Never its value: the value lives in a 0600 file the
+    seats read at use time, and this CLI has no business copying it into a terminal."""
+    tokens = loop.get("tokens") or {}
+    lines: list[str] = []
+    seen: set[str] = set()
+    for role in ("reviewer", "fixer"):
+        login = config.seat_login(loop, role)
+        if not login or login.lower() in seen:
+            continue
+        seen.add(login.lower())
+        ref = tokens.get(login) or tokens.get(login.lower()) or ""
+        lines.append(f"{role} {login} → "
+                     f"{ref or '(no file mapped — falls back to read_token)'}")
+    read_token = loop.get("read_token") or ""
+    if read_token and read_token.lower() not in seen:
+        ref = tokens.get(read_token) or tokens.get(read_token.lower()) or ""
+        lines.append(f"read {read_token} → {ref or '(no file mapped)'}")
+    return lines
+
+
+def _role_summary(loop: dict, role: str) -> str:
+    profile = config.seat_profile(loop, role) or "(no profile)"
+    if role == "adjudicator":
+        if not (loop.get("adjudicator") or {}).get("route"):
+            return "adjudicator (none)"
+        return f"adjudicator {profile}"
+    return f"{role} {config.seat_login(loop, role) or '(no login)'} ({profile})"
+
+
+def _route_state(loop: dict, role: str) -> str:
+    """What the *installed* route serves, next to what the loop says it should serve.
+
+    The mismatch is the interesting case: a seat whose profile moved but whose route did not is a
+    loop that runs as the old agent while every config file claims otherwise.
+    """
+    name = _routes_of(loop).get(role) or ""
+    if not name:
+        return f"{role}: (no route)"
+    want = config.seat_profile(loop, role)
+    entry = routes.route(name)
+    if not entry:
+        return f"{role} {name}: not installed — run init"
+    got = str(entry.get("profile") or "default")
+    if got == want:
+        return f"{role} {name} → {got} (ok)"
+    return (f"{role} {name} → {got}, not {want}: MISMATCH — "
+            f"hermes review-loop apply --loop {loop['id']}")
+
+
+def _seat_diffs(was: dict, now: dict) -> tuple[list[tuple[str, object, object]], set[str]]:
+    """The seat identities the settings move, and which roles that touches.
+
+    A role is *touched* when its profile, its login, or the login its review route serves moves:
+    all three are "who does what", and each one owes the same validation, the same in-flight check
+    and the same route rebind.
+    """
+    diffs: list[tuple[str, object, object]] = []
+    touched: set[str] = set()
+    for role in ("reviewer", "fixer"):
+        for key in ("profile", "login"):
+            before = str((was["seats"].get(role) or {}).get(key) or "")
+            after = str((now["seats"].get(role) or {}).get(key) or "")
+            if before != after:
+                diffs.append((f"{role} {key}", before or "(none)", after or "(none)"))
+                touched.add(role)
+    review_seat_before = str(was.get("reviewer_seat") or "")
+    review_seat_after = str(now.get("reviewer_seat") or "")
+    if review_seat_before != review_seat_after and "reviewer" not in touched:
+        # Only worth its own line when nothing else already explains it: the two move together
+        # through the settings, and a duplicate line reads like two changes.
+        diffs.append(("reviewer_seat", review_seat_before or "(none)", review_seat_after or "(none)"))
+        touched.add("reviewer")
+    adj_before = str((was.get("adjudicator") or {}).get("profile") or "")
+    adj_after = str((now.get("adjudicator") or {}).get("profile") or "")
+    if adj_before != adj_after:
+        diffs.append(("adjudicator profile", adj_before or "(none)", adj_after or "(none)"))
+        touched.add("adjudicator")
+    return diffs, touched
+
+
+def _route_binds(loop: dict, touched: set[str]) -> dict:
+    """role → (route name, installed profile, target profile) for routes a seat change rebinds."""
+    binds: dict = {}
+    for role, name in _routes_of(loop).items():
+        if role not in touched:
+            continue
+        entry = routes.route(name)
+        if not entry:
+            continue
+        current = str(entry.get("profile") or "default")
+        target = config.seat_profile(loop, role)
+        if current != target:
+            binds[role] = (name, current, target)
+    return binds
+
+
+def _busy_seats(loop: dict, roles: set[str]) -> list[str]:
+    """Seats with a run in flight right now — the ones an identity change must not surprise."""
+    from . import state as state_mod
+
+    st = state_mod.state_for(loop)
+    lines = []
+    for seat in ("reviewer", "fixer"):
+        if seat not in roles:
+            continue
+        live = st.active(seat)
+        if live:
+            held = ", ".join(f"{key} ({int((time.time() - entry.get('at', time.time())) / 60)}m)"
+                             for key, entry in sorted(live.items()))
+            lines.append(f"{seat} is in flight on {held}")
+    return lines
 
 
 def _install_hooks(loop: dict, token_login: str | None) -> list[str]:
     """Create the two repo hooks via the API. Needs a token with admin:repo_hook on the repo."""
-    names = routes_for(loop)
+    names = _routes_of(loop)
     host = config.webhook_host(loop.get("host"), required=True)
     # Validate both destinations and secrets before creating either external hook.
     hooks = []
     for seat, event in (("reviewer", "pull_request"), ("fixer", "pull_request_review")):
-        route_name = names[seat]
+        route_name = names.get(seat, "")
         url = routes.url_for(route_name, host)
         secret = (routes.route(route_name) or {}).get("secret", "")
         if not url or not secret:
             raise config.ConfigError(f"route {route_name!r} needs a valid webhook URL and secret before installing hooks")
         hooks.append((event, url, secret))
-    made = []
-    for event, url, secret in hooks:
-        body = {"name": "web", "active": True, "events": [event],
-                "config": {"url": url, "content_type": "json", "secret": secret,
-                           "insecure_ssl": "0"}}
-        result = gh.api(loop, f"/repos/{loop['repo']}/hooks", method="POST", body=body,
-                        login=token_login or loop.get("read_token"))
-        if isinstance(result, dict) and result.get("id"):
-            made.append(f"hook {result['id']} → {url}")
-        else:
-            made.append(f"FAILED to create a hook for {url} "
-                        f"(needs a token with admin:repo_hook on {loop['repo']})")
-    return made
+    baseline = _hook_listing(loop, token_login)
+    created = []
+    try:
+        for event, url, secret in hooks:
+            body = {"name": "web", "active": True, "events": [event],
+                    "config": {"url": url, "content_type": "json", "secret": secret,
+                               "insecure_ssl": "0"}}
+            result = gh.api(loop, f"/repos/{loop['repo']}/hooks", method="POST", body=body,
+                            login=token_login or loop.get("read_token"))
+            if not isinstance(result, dict) or not isinstance(result.get("id"), int):
+                raise config.ConfigError(f"hook creation not confirmed for {url}")
+            created.append(result["id"])
+        return [f"hook {id} → {url}" for id, (_, url, _) in zip(created, hooks)]
+    except Exception as exc:
+        failures = []
+        # A lost POST response may still have created a hook: compare with the baseline.
+        try:
+            current = _hook_listing(loop, token_login)
+            target_urls = {url for _, url, _ in hooks}
+            created = list(set(created) | {h["id"] for h in current
+                           if h["id"] not in {b["id"] for b in baseline}
+                           and h["config"]["url"] in target_urls})
+        except Exception as read_exc:
+            failures.append(f"cannot identify newly created hooks: {read_exc}")
+        for hook_id in created:
+            try:
+                gh.api(loop, f"/repos/{loop['repo']}/hooks/{hook_id}", method="DELETE",
+                       login=token_login or loop.get("read_token"))
+                if any(h["id"] == hook_id for h in _hook_listing(loop, token_login)):
+                    raise config.ConfigError("still present after DELETE")
+            except Exception as rollback_exc:
+                failures.append(f"hook {hook_id}: {rollback_exc}")
+        raise config.ConfigError(f"hook install failed: {exc}; " +
+                                 ("ROLLBACK FAILED: " + "; ".join(failures) if failures
+                                  else "created hooks removed")) from exc
+
+def _hook_listing(loop: dict, token_login: str | None = None) -> list[dict]:
+    hooks = gh.api(loop, f"/repos/{loop['repo']}/hooks?per_page=100",
+                   login=token_login or loop.get("read_token"))
+    if not isinstance(hooks, list) or len(hooks) >= 100 or any(
+        not isinstance(h, dict) or not isinstance(h.get("id"), int) or
+        not isinstance(h.get("config"), dict) or
+        not isinstance(h["config"].get("url"), str) for h in hooks
+    ):
+        raise config.ConfigError("cannot read a complete, valid repo hook listing; no changes made")
+    return hooks
 
 
 def _set_hooks(loop: dict, active: bool, token_login: str | None) -> list[str]:
-    names = routes_for(loop)
-    wanted = (names["reviewer"], names["fixer"])
-    hooks = gh.api(loop, f"/repos/{loop['repo']}/hooks?per_page=100",
-                   login=token_login or loop.get("read_token"))
-    if not isinstance(hooks, list):
-        return ["could not read the repo's hooks (token needs admin:repo_hook to change them)"]
+    names = _routes_of(loop)
+    wanted = tuple(name for role, name in names.items() if role in ("reviewer", "fixer"))
+    try:
+        hooks = _hook_listing(loop, token_login)
+    except config.ConfigError as exc:
+        return [f"could not read the repo's hooks: {exc}"]
     out = []
     for hook in hooks:
         url = (hook.get("config") or {}).get("url", "")
@@ -130,6 +404,70 @@ def _set_hooks(loop: dict, active: bool, token_login: str | None) -> list[str]:
                body={"active": active}, login=token_login or loop.get("read_token"))
         out.append(f"hook {hook['id']} → {'active' if active else 'paused'}")
     return out or ["no loop hooks found — run init --hooks first"]
+
+
+def _hook_moves(before: dict, after: dict, binds: dict) -> list[tuple[int, str, str]]:
+    """Preflight exact hook URLs against configured and installed owned route profiles."""
+    names = _routes_of(after)
+    expected: dict[str, tuple[str, str]] = {}
+    targets: dict[str, str] = {}
+    unchanged: dict[str, str] = {}
+    for role in ("reviewer", "fixer"):
+        name = names.get(role)
+        if not name or name != _routes_of(before).get(role):
+            continue
+        new = routes.url_for_profile(name, config.seat_profile(after, role), after.get("host"))
+        old = routes.url_for_profile(name, config.seat_profile(before, role), before.get("host"))
+        if not old or not new:
+            raise config.ConfigError(f"cannot resolve {role} hook URL; no changes made")
+        if old != new:
+            expected[old] = (role, new)
+        if role in binds:
+            # The registry can drift while loop config and form still agree. Its owned route's
+            # installed profile is another known old URL, not an arbitrary hook destination.
+            installed = routes.url_for_profile(name, binds[role][1], before.get("host"))
+            if not installed:
+                raise config.ConfigError(f"cannot resolve installed {role} hook URL; no changes made")
+            if installed != new:
+                expected[installed] = (role, new)
+            targets[role] = new
+        elif old != new:
+            targets[role] = new
+        else:
+            unchanged[role] = new
+    if not targets:
+        return []
+    hooks = _hook_listing(before)  # Never repair a route if this listing cannot be trusted.
+    moves = []
+    route_names = {name: role for role, name in names.items() if role in ("reviewer", "fixer")}
+    for hook in hooks:
+        old = hook["config"]["url"]
+        parts = urlsplit(old)
+        # Match a complete webhook route segment, not a substring of another route.
+        installed_name = parts.path.rsplit("/webhooks/", 1)[-1] if "/webhooks/" in parts.path else ""
+        role = route_names.get(installed_name)
+        if role is None:
+            continue
+        if role in unchanged and old == unchanged[role]:
+            continue
+        if role in targets and old == targets[role]:
+            continue  # Already corrected independently; do not rewrite it.
+        if role not in targets or old not in expected or expected[old][0] != role:
+            raise config.ConfigError(f"installed {role} hook {hook['id']} "
+                                     f"points at unexpected URL {old!r}; no changes made")
+        moves.append((hook["id"], old, targets[role]))
+    return moves
+
+
+def _patch_hook_url(loop: dict, hook_id: int, url: str) -> None:
+    path = f"/repos/{loop['repo']}/hooks/{hook_id}"
+    result = gh.api(loop, path, method="PATCH", body={"config": {"url": url}},
+                    login=loop.get("read_token"))
+    # A lost response is ambiguous. Always read back and roll back if it does not agree.
+    actual = gh.api(loop, path, login=loop.get("read_token"))
+    if not isinstance(result, dict) or not isinstance(actual, dict) or \
+            (actual.get("config") or {}).get("url") != url:
+        raise config.ConfigError(f"hook {hook_id} URL update not confirmed as {url!r}")
 
 
 def _install_schedule(loop: dict, schedule: str, deliver: str) -> list[str]:
@@ -160,12 +498,42 @@ def _write_config(loop: dict) -> pathlib.Path:
     directory = config.config_dir()
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{loop['id']}.json"
-    path.write_text(json.dumps({k: v for k, v in loop.items() if v not in ({}, [], "")},
-                               indent=2, sort_keys=True))
+    payload = json.dumps({k: v for k, v in loop.items() if v not in ({}, [], "")},
+                         indent=2, sort_keys=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{loop['id']}.", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        pathlib.Path(temporary).unlink(missing_ok=True)
     return path
+
+def _restore_config(path: pathlib.Path, data: bytes) -> None:
+    """Publish a previous snapshot without exposing partially restored JSON."""
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.stem}.", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        pathlib.Path(temporary).unlink(missing_ok=True)
 
 
 def cmd_init(args) -> int:
+    """Install a loop: write its config, its routes, and (on request) its hooks and cron job.
+
+    The settings form supplies *who serves each seat* the same way it supplies the numeric knobs —
+    as a default a new loop starts from — while explicit flags still win, because an operator
+    installing a loop from the CLI on this machine should not have to depend on what a per-profile
+    form happens to hold. Everything is validated (profiles, allowlists, credentials, route
+    ownership) before the first file is written.
+    """
+    d = config.settings_defaults(_SETTINGS)
     tokens = {}
     for pair in args.token or []:
         if "=" not in pair:
@@ -173,52 +541,148 @@ def cmd_init(args) -> int:
             return 2
         login, path = pair.split("=", 1)
         tokens[login] = path
+
+    reviewer_profile = args.reviewer_profile or d["reviewer_profile"]
+    fixer_profile = args.fixer_profile or d["fixer_profile"]
+    fixers = [login for login in (args.fixer or []) if login] or (
+        [d["fixer_login"]] if d["fixer_login"] else [])
+    reviewers = [login for login in (args.reviewer or []) if login] or (
+        [d["reviewer_login"]] if d["reviewer_login"] else [])
+    if not fixers or not reviewers:
+        print("--fixer and --reviewer name the GitHub logins this loop trusts (repeatable); with "
+              "neither the flag nor the plugin settings naming them, there is no loop to install")
+        return 2
+    if not reviewer_profile or not fixer_profile:
+        print("both seats need a Hermes profile: pass --reviewer-profile/--fixer-profile, or set "
+              "them in the plugin settings (Capabilities → Plugins → review loop)")
+        return 2
+    configured_reviewer = d["reviewer_login"]
+    reviewer_seat = args.reviewer_seat or (
+        configured_reviewer if configured_reviewer in reviewers else "") or (
+        reviewers[0] if len(reviewers) == 1 else "")
+    if not reviewer_seat:
+        print("with several reviewer logins, --reviewer-seat names which one this loop's route serves")
+        return 2
+    configured_fixer = d["fixer_login"]
+    if configured_fixer and configured_fixer.lower() not in {login.lower() for login in fixers}:
+        print(f"configured fixer login {configured_fixer!r} is not in the --fixer allowlist — "
+              "name an eligible fixer in the plugin settings before installing this loop")
+        return 2
+    fixer_seat = next((login for login in fixers
+                       if login.lower() == configured_fixer.lower()), fixers[0]) if configured_fixer else fixers[0]
+    adjudicator_profile = args.adjudicator_profile or d["adjudicator_profile"] or "default"
+
     raw = {
         "id": args.id or args.repo.split("/")[-1],
         "repo": args.repo, "base": args.base, "cap": args.cap,
         "concurrency": args.concurrency,
-        "fixers": args.fixer, "reviewers": args.reviewer,
-        "reviewer_seat": args.reviewer_seat or (args.reviewer[0] if len(args.reviewer) == 1 else ""),
+        "fixers": fixers, "reviewers": reviewers,
+        "reviewer_seat": reviewer_seat,
         "seats": {
-            "reviewer": {"profile": args.reviewer_profile, "route": "",
-                         "login": args.reviewer_seat or args.reviewer[0],
+            "reviewer": {"profile": reviewer_profile, "route": "",
+                         "login": reviewer_seat,
                          "agent": args.reviewer_agent},
-            "fixer": {"profile": args.fixer_profile, "route": "",
-                      "login": args.fixer[0], "agent": args.fixer_agent},
+            "fixer": {"profile": fixer_profile, "route": "",
+                      "login": fixer_seat, "agent": args.fixer_agent},
         },
-        "adjudicator": ({"route": args.adjudicator_route, "profile": args.adjudicator_profile}
+        "adjudicator": ({"route": args.adjudicator_route, "profile": adjudicator_profile}
                         if args.adjudicator_route else {}),
         "skill": args.skill,
-        "tokens": tokens, "read_token": args.read_token or (args.reviewer_seat or args.reviewer[0]),
+        "tokens": tokens, "read_token": args.read_token or reviewer_seat,
         "clone": args.clone, "roots": args.root or [],
-        "state_dir": args.state_dir or str(config.home() / "state" / "review-loops" / (args.id or args.repo.split("/")[-1])),
+        "state_dir": args.state_dir or str(config.home() / "state" / "review-loops"
+                                           / (args.id or args.repo.split("/")[-1])),
         "host": args.host, "grace_min": args.grace_min,
         "ttl_min": args.ttl_min, "inflight_ttl_min": args.inflight_ttl_min,
     }
-    if not args.reviewer_seat and len(args.reviewer) > 1:
-        print("with several reviewer logins, --reviewer-seat names which one this loop's route serves")
-        return 2
     # A seat-level capacity wins over the loop default, so only write it when it was asked for.
     for seat, value in (("reviewer", args.reviewer_concurrency), ("fixer", args.fixer_concurrency)):
         if value is not None:
             raw["seats"][seat]["concurrency"] = value
-    names = {"reviewer": f"{raw['id']}-review", "fixer": f"{raw['id']}-fix"}
+    names = routes_for(raw)
     raw["seats"]["reviewer"]["route"] = names["reviewer"]
     raw["seats"]["fixer"]["route"] = names["fixer"]
+    roles = {"reviewer", "fixer"} | ({"adjudicator"} if raw["adjudicator"] else set())
     try:
         loop = config.normalize(raw)
         # Routes are installed even without --hooks; never write a partial loop with
         # route URLs that cannot resolve to this operator's own gateway.
         config.webhook_host(loop["host"], required=True)
+        # Who does what, and may they: profiles, allowlists, distinct credentials and route
+        # ownership are all checked before a single file is written.
+        config.verify_seats(loop, roles)
+        _verify_routes(loop, roles)
     except config.ConfigError as exc:
         print(f"config refused: {exc}")
         return 2
 
-    path = _write_config(loop)
+    if args.dry_run:
+        print("dry run — nothing written: no loop config, no routes, no hooks, no cron job")
+        print(f"  would write: {config.config_dir() / (loop['id'] + '.json')}")
+        for line in _seat_lines(loop, "effective seat mapping"):
+            print(f"  {line}")
+        for name in _routes_of(loop).values():
+            print(f"  would write route: {name}")
+        if args.hooks:
+            print("  would create the two repo hooks (pull_request, pull_request_review)")
+        if args.schedule:
+            print(f"  would install the watchdog cron job ({args.schedule})")
+        return 0
+
+    path = config.config_dir() / f"{loop['id']}.json"
+    previous_config = path.read_bytes() if path.exists() else None
+    previous_routes = {name: routes.route(name) for name in _routes_of(loop).values()}
+    try:
+        path = _write_config(loop)
+    except Exception as exc:
+        print(f"config install FAILED: {exc}; previous config unchanged")
+        return 2
     print(f"loop config written: {path}")
-    for name in _install_routes(loop).values():
+    for line in _seat_lines(loop):
+        print(line)
+    print("  credentials: " + " · ".join(_credential_lines(loop)))
+    # A route that fails to land must not leave a loop installed with half its seats woken: the
+    # config `init` just wrote and any route it just added are taken back out again, so a second
+    # `init` starts from clean rather than from a loop nobody can see.
+    try:
+        written_routes = list(_install_routes(loop).values())
+    except Exception as exc:
+        try:
+            routes.restore_entries(previous_routes)
+            if previous_config is None:
+                path.unlink(missing_ok=True)
+            else:
+                _restore_config(path, previous_config)
+        except Exception as rollback_exc:
+            print(f"ROLLBACK FAILED: {rollback_exc} — inspect config and routes manually")
+            return 2
+        print(f"route install FAILED: {exc}")
+        print("  previous config and routes restored; fix the registry and re-run init")
+        return 2
+    for name in written_routes:
         print(f"route written: {name}")
-    for line in _install_hooks(loop, args.admin_token) if args.hooks else []:
+    try:
+        hook_lines = _install_hooks(loop, args.admin_token) if args.hooks else []
+    except Exception as exc:
+        failed = []
+        try:
+            routes.restore_entries(previous_routes)
+        except Exception as rollback_exc:
+            failed.append(f"routes: {rollback_exc}")
+        try:
+            if previous_config is None:
+                path.unlink(missing_ok=True)
+            else:
+                _restore_config(path, previous_config)
+        except Exception as rollback_exc:
+            failed.append(f"config: {rollback_exc}")
+        print(f"hook install FAILED: {exc}")
+        if failed or "ROLLBACK FAILED" in str(exc):
+            print("ROLLBACK FAILED — inspect before retrying: " + "; ".join(failed))
+        else:
+            print("  prior config and routes restored")
+        return 2
+    for line in hook_lines:
         print(f"  {line}")
     if not args.hooks:
         print("  (repo hooks not created — pass --hooks, or add them by hand with the route URLs)")
@@ -297,6 +761,10 @@ def cmd_apply(args) -> int:
     Push, not subscription: a running loop whose numbers changed under it is exactly the kind of
     thing nobody can debug at 2am. The same validation as ``init``/``set`` still applies, so a
     settings form asking for two reviews at once without a clone path is refused here too.
+
+    An identity change is *staged* rather than half-applied: the loop config and the routes whose
+    URL carries the old profile move together, and a change that would land while a seat has a run
+    in flight is refused unless the operator says otherwise out loud.
     """
     try:
         loop = config.load_id(args.loop)
@@ -306,6 +774,21 @@ def cmd_apply(args) -> int:
 
     try:
         updated = config.normalize(config.apply_settings(loop, _SETTINGS))
+    except config.ConfigError as exc:
+        print(f"settings refused: {exc}")
+        return 2
+
+    identity, touched = _seat_diffs(loop, updated)
+    # The installed registry can drift independently of the loop and the form. Repair those
+    # routes through the same ownership, seat and in-flight preflight as an identity push.
+    binds = _route_binds(updated, set(_routes_of(updated)))
+    rebinding = touched | set(binds)
+    try:
+        # Validate what this apply would *write*: a loop that predates the seat checks keeps
+        # loading, but a seat this push moves must be one that can actually run.
+        config.verify_seats(updated, rebinding)
+        if rebinding:
+            _verify_routes(updated, rebinding)
     except config.ConfigError as exc:
         print(f"settings refused: {exc}")
         return 2
@@ -321,15 +804,93 @@ def cmd_apply(args) -> int:
         if was != now:
             changes.append((f"{seat} concurrency", was, now))
 
-    if not changes:
+    missing_routes = sorted(name for role, name in _routes_of(updated).items()
+                            if role in touched and not routes.route(name))
+
+    if not changes and not identity and not binds:
         print(f"[{loop['id']}] already matches the plugin settings")
         return 0
-    for name, was, now in changes:
+    for name, was, now in list(changes) + list(identity):
         print(f"  {name}: {was} → {now}")
+    for role, (name, current, target) in sorted(binds.items()):
+        print(f"  route {name}: profile {current} → {target}   (the URL carries the profile)")
+    for name in missing_routes:
+        print(f"  route {name}: not installed — `hermes review-loop init` creates routes; "
+              "apply will not invent one behind your back")
+    if missed := [role for role, name in _routes_of(updated).items()
+                  if role in touched and name in missing_routes]:
+        print(f"refused: {', '.join(missed)} would move to a route that does not exist yet")
+        return 2
+
     if args.dry_run:
-        print("(dry run — nothing written)")
+        print("(dry run — nothing written: no loop config, no routes touched)")
         return 0
-    print(f"loop config updated: {_write_config(updated)}")
+
+    busy = _busy_seats(loop, rebinding) if rebinding else []
+    if busy and not getattr(args, "while_busy", False):
+        for line in busy:
+            print(f"  {line}")
+        print("refused: a seat is in flight, and its live run holds the old profile and login "
+              "until it ends. Let it finish, then apply again — or pass --while-busy to rebind "
+              "now, knowing that run still finishes under the identity it started with.")
+        return 2
+    for line in busy:
+        print(f"  {line}  (--while-busy: that run keeps the identity it started with)")
+
+    # Preflight remote hooks before any local mutation. Snapshot each owned route and roll back
+    # both surfaces on any failure; config is published only after route/hook readback agrees.
+    try:
+        hook_moves = _hook_moves(loop, updated, binds)
+    except config.ConfigError as exc:
+        print(f"refused: {exc}")
+        return 2
+    previous = {name: routes.route(name) for name, _, _ in binds.values()}
+    config_path = config.config_dir() / f"{loop['id']}.json"
+    previous_config = config_path.read_bytes()
+    attempted_hooks = []
+    try:
+        rebound = list(_install_routes(updated, roles=tuple(binds)).items()) if binds else []
+        for role, name in rebound:
+            entry = routes.route(name)
+            if not entry or str(entry.get("profile") or "") != config.seat_profile(updated, role):
+                raise config.ConfigError(f"route {name} readback does not match requested profile")
+        for hook_id, old, new in hook_moves:
+            attempted_hooks.append((hook_id, old))
+            _patch_hook_url(loop, hook_id, new)
+        path = _write_config(updated) if changes or identity else config_path
+    except Exception as exc:
+        failed = []
+        for hook_id, old in reversed(attempted_hooks):
+            try:
+                _patch_hook_url(loop, hook_id, old)
+            except Exception as rollback_exc:
+                failed.append(f"hook {hook_id}: {rollback_exc}")
+        if previous:
+            try:
+                routes.restore_entries(previous)
+            except Exception as rollback_exc:
+                failed.append(f"routes: {rollback_exc}")
+        try:
+            if config_path.read_bytes() != previous_config:
+                _restore_config(config_path, previous_config)
+        except Exception as rollback_exc:
+            failed.append(f"config: {rollback_exc}")
+        try:
+            config_unchanged = config_path.read_bytes() == previous_config
+        except OSError:
+            config_unchanged = False
+        print(f"reconciliation FAILED: {exc}; " +
+              ("config unchanged" if config_unchanged else "config may have changed"))
+        if failed:
+            print("ROLLBACK FAILED — inspect before retrying: " + "; ".join(failed))
+        else:
+            print("  prior routes and hook URLs restored")
+        return 2
+    print(f"loop config updated: {path}")
+    for role, name in rebound:
+        print(f"  route {name} rebound → profile {config.seat_profile(updated, role)}")
+    for hook_id, _, new in hook_moves:
+        print(f"  hook {hook_id} → {new}")
     return 0
 
 
@@ -341,11 +902,40 @@ def cmd_settings(args) -> int:
         value = d[key]
         source = "set" if str((_SETTINGS or {}).get(key, "")) not in ("", "None") else "default"
         print(f"  {key:<21} {str(value):<26} [{source}]  {spec['description']}")
+
+    print("\nseat mapping (blank = not set here: a loop keeps its own answer)")
+    mapping = config.seat_mapping(_SETTINGS)
+    for role in config.ROUTE_ROLES:
+        entry = mapping.get(role) or {}
+        profile = entry.get("profile") or "(blank)"
+        if role in config.LOGIN_SETTINGS:
+            cell = f"login {(entry.get('login') or '(blank)'):<30} "
+        else:
+            # The adjudicator reads and rules and never pushes, so there is no login to name — the
+            # cell says so in the same width, which keeps the [set]/[blank] markers in one column.
+            cell = f"{'no login (rules, never pushes)':<36} "
+        print(f"  {role:<12} profile {profile:<20} {cell}[{'set' if entry else 'blank'}]")
+    adjudicator_note = ("the adjudicator lands only on a loop that already has an adjudicator "
+                        "route, and it has no login to misattribute a ruling to; route names stay "
+                        "per repository")
+    print(f"  ({adjudicator_note})")
+
+    try:
+        loops = config.all_loops()
+    except config.ConfigError as exc:
+        loops = []
+        print(f"\ncould not read every loop config: {exc}")
+    if loops:
+        print("\neffective mapping per loop (what each one runs as today; "
+              "`apply --loop <id>` pushes the mapping above onto exactly one of them):")
+        for loop in loops:
+            print(f"  {loop['id']:<18} "
+                  + " · ".join(_role_summary(loop, role) for role in config.ROUTE_ROLES))
     if not _SETTINGS:
         print("\nnothing set — every value above is the schema default")
     print("\napply them to a loop with: hermes review-loop apply --loop <id>"
-          "\n(settings are defaults, not a subscription: an existing loop keeps its own numbers"
-          " until you apply)")
+          "\n(settings are defaults, not a subscription: an existing loop keeps its own seats, "
+          "profiles and numbers until you apply — and blank fields above never erase them)")
     return 0
 
 
@@ -379,6 +969,20 @@ def cmd_status(args) -> int:
         print(f"  seats:      reviewer={loop['seats']['reviewer']['login']} "
               f"({loop['seats']['reviewer']['profile']}) · "
               f"fixer={loop['seats']['fixer']['login']} ({loop['seats']['fixer']['profile']})")
+        adjudicator = loop.get("adjudicator") or {}
+        if adjudicator.get("route"):
+            print(f"  {'adjudicator:':<12} {adjudicator.get('profile', 'default')} "
+                  f"(route {adjudicator['route']})")
+        else:
+            print(f"  {'adjudicator:':<12} (no route — the cap only writes a marker)")
+        # What the registry actually serves, next to what the config claims: those two facts can
+        # disagree after a profile change, and this is the one place the operator would see it.
+        print("  routes:     " + " · ".join(_route_state(loop, role)
+                                            for role in config.ROUTE_ROLES
+                                            if role in _routes_of(loop)))
+        refs = _credential_lines(loop)
+        if refs:
+            print("  token refs: " + " · ".join(refs))
         locks = st._load(st.locks, {}) or {}
         for seat, entries in locks.items():
             for key, entry in (entries or {}).items():
@@ -505,8 +1109,7 @@ def cmd_cleanup(args) -> int:
 
 def cmd_uninstall(args) -> int:
     loop = config.load_id(args.loop)
-    names = routes_for(loop)
-    for name in (names["reviewer"], names["fixer"], loop.get("adjudicator", {}).get("route")):
+    for name in _routes_of(loop).values():
         if name and routes.remove_route(name):
             print(f"route removed: {name}")
     if not args.keep_config:
@@ -560,11 +1163,15 @@ def register_cli(ctx, settings: dict | None = None) -> None:
         init = sub.add_parser("init", help="Configure a loop and install its routes")
         init.add_argument("--repo", required=True, help="owner/name")
         init.add_argument("--id", help="loop id (default: the repository name)")
-        init.add_argument("--fixer", action="append", required=True, help="GitHub login that pushes (repeatable)")
-        init.add_argument("--reviewer", action="append", required=True, help="GitHub login that may review (repeatable)")
+        init.add_argument("--fixer", action="append", default=[],
+                          help="GitHub login that pushes (repeatable; default: the plugin setting)")
+        init.add_argument("--reviewer", action="append", default=[],
+                          help="GitHub login that may review (repeatable; default: the plugin setting)")
         init.add_argument("--reviewer-seat", help="the login the reviewer route serves")
-        init.add_argument("--reviewer-profile", required=True, help="Hermes profile for the reviewer seat")
-        init.add_argument("--fixer-profile", required=True, help="Hermes profile for the fixer seat")
+        init.add_argument("--reviewer-profile", default=d["reviewer_profile"],
+                          help="Hermes profile for the reviewer seat (default: the plugin setting)")
+        init.add_argument("--fixer-profile", default=d["fixer_profile"],
+                          help="Hermes profile for the fixer seat (default: the plugin setting)")
         init.add_argument("--reviewer-agent", default="", help="display name for the reviewer (default: profile)")
         init.add_argument("--fixer-agent", default="", help="display name for the fixer")
         init.add_argument("--cap", type=int, default=d["cap"],
@@ -587,7 +1194,9 @@ def register_cli(ctx, settings: dict | None = None) -> None:
                           help="skill the seats are told to load. A plugin-provided skill is "
                                "qualified, e.g. hermes-review-loop:review-loop")
         init.add_argument("--adjudicator-route", default="")
-        init.add_argument("--adjudicator-profile", default="default")
+        init.add_argument("--adjudicator-profile", default="",
+                          help="Hermes profile for the adjudicator (default: the plugin setting, "
+                               "else the launch profile)")
         init.add_argument("--host", default=d["host"],
                           help="your gateway webhook origin (required unless set in plugin settings)")
         init.add_argument("--grace-min", type=int, default=d["grace_min"])
@@ -599,6 +1208,8 @@ def register_cli(ctx, settings: dict | None = None) -> None:
         init.add_argument("--admin-token", default="", help="login whose token can create hooks")
         init.add_argument("--schedule", default="", help="e.g. 15m — install the watchdog cron job")
         init.add_argument("--watchdog-deliver", default="local", help="cron delivery target for watchdog alerts")
+        init.add_argument("--dry-run", action="store_true",
+                          help="print the seat mapping and what would be written, write nothing")
         init.set_defaults(func=cmd_init)
 
         status = sub.add_parser("status", help="Show a loop's config and live state")
@@ -643,6 +1254,9 @@ def register_cli(ctx, settings: dict | None = None) -> None:
         apply_cmd.add_argument("--loop", required=True)
         apply_cmd.add_argument("--dry-run", action="store_true",
                                help="show the diff without writing it")
+        apply_cmd.add_argument("--while-busy", action="store_true",
+                               help="rebind a seat's profile/login even while a run is in flight "
+                                    "(that run keeps the identity it started with)")
         apply_cmd.set_defaults(func=cmd_apply)
 
         settings_cmd = sub.add_parser("settings",

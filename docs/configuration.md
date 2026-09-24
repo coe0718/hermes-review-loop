@@ -21,8 +21,8 @@ See [Preflight](architecture.md#preflight-can-this-installation-run).
 | `fixers` | GitHub logins allowed to open/push the PRs this loop works on. |
 | `reviewers` | GitHub logins whose verdicts count toward the budget. |
 | `seats.reviewer.route` / `seats.fixer.route` | the webhook routes that wake each seat. |
-| `seats.reviewer.profile` / `seats.fixer.profile` | the Hermes profile each run happens as. |
-| `reviewer_seat` | which reviewer login the reviewer route serves (a request aimed at anyone else is not this loop's business). |
+| `seats.reviewer.profile` / `seats.fixer.profile` | the Hermes profile each run happens as; it must exist on this machine, and the two must differ. |
+| `reviewer_seat` | which reviewer login the reviewer route serves (a request aimed at anyone else is not this loop's business). Validated against `reviewers`: a route that serves a login this loop does not count is a loop that never wakes. |
 
 ## Everything else
 
@@ -31,7 +31,7 @@ See [Preflight](architecture.md#preflight-can-this-installation-run).
 | `id` | repo name | loop id; also the prefix of the generated routes |
 | `base` | `main` | only PRs targeting this branch are in the loop |
 | `cap` | `3` | verdicts allowed before escalation (`cap - 1` fix turns) |
-| `seats.<seat>.login` | first fixer/reviewer | the GitHub login that seat acts as |
+| `seats.<seat>.login` | first fixer/reviewer | the GitHub login that seat acts as; `init`/`apply` refuse one outside that seat's allowlist, and two seats may not share one |
 | `seats.<seat>.agent` | profile name | display name used in start-pings and prompts |
 | `seats.<seat>.channel` | profile's `DISCORD_HOME_CHANNEL` | where the start-ping goes |
 | `seats.<seat>.emoji` | 🔍 / 🔧 | cosmetic, for the ping |
@@ -68,6 +68,10 @@ hermes review-loop apply --loop <id>             # write it
 |---|---|---|
 | `cap` | 3 | `cap` |
 | `reviewer_concurrency` / `fixer_concurrency` | 1 | `seats.<seat>.concurrency` |
+| `reviewer_profile` / `fixer_profile` | — | `seats.<seat>.profile` (and `seats.<seat>.agent`, when the loop has not named one) |
+| `reviewer_login` | — | `seats.reviewer.login` **and** `reviewer_seat` — the login the review route serves |
+| `fixer_login` | — | `seats.fixer.login` |
+| `adjudicator_profile` | — | `adjudicator.profile`, on a loop that already has an `adjudicator.route` |
 | `clone`, `base`, `host` | —, `main`, unset | the same loop keys; a blank host in the form preserves an existing loop's explicit host |
 | `grace_min`, `ttl_min`, `inflight_ttl_min` | 25, 45, 10 | the same loop keys |
 
@@ -84,6 +88,70 @@ There is no built-in webhook host. Set `host` to your own gateway origin (for ex
 missing, relative, and malformed hosts before writing any config or routes, even without `--hooks`.
 Existing loop files with an explicit `host` continue to load, and an unset form setting does not
 erase one when you run `apply`. A public GitHub webhook should use HTTPS.
+
+## Seat identity (who serves each seat)
+
+A seat is a **Hermes profile** (the model, its budget, its credentials) plus a **GitHub login** (the
+identity it acts as and the attribution its reviews carry). The form carries a per-profile default
+for both, plus an optional adjudicator profile; the allowlists, the route names and the adjudicator
+route stay per repository, because one form cannot honestly own every repository.
+
+A blank profile or login means **not set here**. It never unsets what a loop file says, so a
+repository that needs its own pair keeps it until somebody pushes the form onto that loop:
+
+```bash
+hermes review-loop settings                            # the form's mapping, and what each loop runs as now
+hermes review-loop init --repo owner/name --dry-run    # preview seats + routes for a new loop
+hermes review-loop apply --loop name --dry-run         # what a push would change, including routes
+hermes review-loop apply --loop name                   # stage it: config and routes together
+hermes review-loop apply --loop name --while-busy      # ...even while a seat has a run out
+```
+
+**Validation, before anything is written.** `init` and `apply` refuse a mapping that cannot drive a
+run, and they refuse it *before* the loop config, the routes or the hooks are touched:
+
+| check | why |
+|---|---|
+| the profile exists (`~/.hermes/profiles/<name>`, or `default` for the launch profile) | otherwise the first event wakes nobody |
+| the login is in that loop's `fixers` / `reviewers` allowlist | a seat may only act as a login the repository already trusts |
+| reviewer and fixer differ in profile, in login, and in token file | one seat reviewing its own work is not a review |
+| an adjudicator differs from both seats | it is judging them |
+| every `tokens` mapping points at a real, non-empty file, and `read_token` is one of them | a missing PAT reads as an unauthenticated call, hours later, in a log nobody reads |
+| a loop that maps tokens maps one for each seat it is writing | otherwise that seat pushes as the read identity |
+| a route is not claimed by another loop, and still runs this role's gate script | the registry is shared by every plugin on the host |
+
+Existence and allowlist membership are checked for the roles an operation *writes*: a loop created
+before this validation existed keeps loading when you tune its `cap`. Distinctness, credentials and
+route ownership always apply, because the unsafe shape is the combination.
+
+**Applying is staged, not half-applied.** A route URL carries the seat's profile
+(`/p/<profile>/webhooks/<route>`), so changing who serves a seat must also move its installed
+GitHub hook URL. `apply` first reads the repo hooks; if that listing is unavailable it refuses to
+move the profile. It snapshots the affected routes, rebinds and reads them back, updates matching
+hook URLs and reads each hook back, then writes the loop config. Any failed route write, readback,
+or hook update returns failure and attempts to restore prior routes and hook URLs; an incomplete
+rollback is reported loudly for manual repair. Other loops' routes and their secrets are untouched.
+`init` likewise restores the previous config bytes and owned routes if a retry fails partway
+through route installation. Installing or moving a seat requires token-file mappings for the
+read login and both seat logins before any installation writes.
+
+**A seat with a run in flight is not rewritten underneath itself.** `apply` refuses while the seat
+it would move has a live run, and says who is running and for how long. `--while-busy` is the
+explicit override: the change lands now, and that run finishes under the identity it started with.
+Numeric knobs (`cap`, concurrency, timers) are not gated this way — they take effect on the next
+event and cannot strand a run.
+
+`status` shows the mapping and checks it against the registry:
+
+```
+  seats:      reviewer=vex-coat (vex) · fixer=drey-coe (drey)
+  adjudicator:tuck (route widgets-breach)
+  routes:     reviewer widgets-review → vex (ok) · fixer widgets-fix → drey (ok) · adjudicator widgets-breach → tuck (ok)
+  token refs: reviewer vex-coat → ~/.hermes/keys/vex-coat-pat · fixer drey-coe → ~/.hermes/keys/drey-coe-pat
+```
+
+`MISMATCH — hermes review-loop apply --loop <id>` in that line means the config moved and the route
+did not. Token values are never printed: only which login reads which file.
 
 ## State files (per loop, under `state_dir`)
 
@@ -115,9 +183,14 @@ exactly as it was.
 ## Deliberate non-features
 
 - **No config_schema for *loop* config.** The interesting configuration is per repository, so a
-  per-profile form cannot own it — the form carries the plugin-level defaults (below), and the loop
-  file stays plain JSON you can read and diff. Pushing those defaults onto a loop is explicit
-  (`apply`), never a subscription.
+  per-profile form cannot own it — the form carries the plugin-level defaults (including the seat
+  profiles/logins above), and the loop file stays plain JSON you can read and diff. Pushing those
+  defaults onto a loop is explicit (`apply --loop <id>`), never a subscription; blank fields never
+  erase a loop's own answer.
+- **No loop-specific editor in the plugin.** The form is a per-profile default, not a per-repository
+  editor: it cannot claim to live-edit every loop. The one-loop-at-a-time path is
+  `apply --loop <id>` (same validation, same staged route rebind), and a dashboard editor for a
+  single loop would have to be built on top of that path, not beside it.
 - **No auto-update, no telemetry, no network beyond GitHub, Discord and your own gateway.**
 - **No deploy/hosting integration and no model provider assumptions.** The seats are Hermes profiles;
   what model each profile runs is the operator's business.

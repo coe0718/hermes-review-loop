@@ -65,3 +65,28 @@ config_schema:
     type: str
     default: ""
     description: "Your gateway's public webhook origin (required to create GitHub hooks)"
+  reviewer_profile:
+    label: "Reviewer's Hermes profile"
+    type: str
+    default: ""
+    description: "Profile the reviewer seat runs as. Blank = not set here: a new loop still needs one, and it must differ from the fixer's"
+  fixer_profile:
+    label: "Fixer's Hermes profile"
+    type: str
+    default: ""
+    description: "Profile the fixer seat runs as. Blank = not set here: a new loop still needs one, and it must differ from the reviewer's"
+  reviewer_login:
+    label: "Reviewer's GitHub login"
+    type: str
+    default: ""
+    description: "GitHub login the reviewer seat acts as — the login the review route serves. Must be in the loop's reviewers allowlist. Blank = not set here"
+  fixer_login:
+    label: "Fixer's GitHub login"
+    type: str
+    default: ""
+    description: "GitHub login the fixer seat acts as. Must be in the loop's fixers allowlist. Blank = not set here"
+  adjudicator_profile:
+    label: "Adjudicator's Hermes profile (optional)"
+    type: str
+    default: ""
+    description: "Profile that rules when the verdict budget is spent. Blank = not set here: a loop with no adjudicator route is left exactly as it is"
