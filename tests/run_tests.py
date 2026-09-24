@@ -1285,6 +1285,49 @@ def group_cleanup() -> None:
     check("open PR is refused", "still open" in out, True)
     check("  and its files stay", (REVIEWS / "pr7-wt").exists(), True)
 
+    # A failed or malformed fresh lookup must not turn an unknown PR into a deletion.
+    # Use real scratch worktrees and persisted state so the test catches both effects.
+    for label, response in (("missing", None),
+                            ("malformed state", {"number": 7, "state": "mystery"}),
+                            ("missing identity", {"state": "closed"}),
+                            ("error body", {"message": "API unavailable"}),
+                            ("wrong PR", pr(9, state="closed"))):
+        reset(prs={"7": response} if response is not None else {})
+        marker = state_file("breach.json")
+        marker.write_text(json.dumps({f"{REPO}#7": {"status": "awaiting-adjudication"}}))
+        run("cleanup.py", None, "--loop", "widgets", "--pr", "7")
+        check(f"direct {label}: worktree kept", (REVIEWS / "pr7-wt").exists(), True)
+        check(f"direct {label}: state kept", f"{REPO}#7" in load_state("breach.json"), True)
+        payload = pr_payload(action="closed", merged="2026-02-02T00:00:00Z")
+        kind, _, _ = run("gate_reviewer.py", payload)
+        check(f"webhook {label}: silent", kind, "SILENT")
+        check(f"webhook {label}: worktree kept", (REVIEWS / "pr7-wt").exists(), True)
+        check(f"webhook {label}: state kept", f"{REPO}#7" in load_state("breach.json"), True)
+
+    reset(prs={"7": pr(7, state="closed")})
+    marker = state_file("breach.json")
+    marker.write_text(json.dumps({f"{REPO}#7": {"status": "awaiting-adjudication"}}))
+    failed_lookup = {"REVIEW_LOOP_GH_STUB": "/bin/false"}
+    run("cleanup.py", None, "--loop", "widgets", "--pr", "7", extra_env=failed_lookup)
+    check("failed GitHub command: direct keeps worktree", (REVIEWS / "pr7-wt").exists(), True)
+    check("failed GitHub command: direct keeps state", f"{REPO}#7" in load_state("breach.json"), True)
+    kind, _, _ = run("gate_reviewer.py", pr_payload(action="closed"), extra_env=failed_lookup)
+    check("failed GitHub command: webhook silent", kind, "SILENT")
+    check("failed GitHub command: webhook keeps worktree", (REVIEWS / "pr7-wt").exists(), True)
+    check("failed GitHub command: webhook keeps state", f"{REPO}#7" in load_state("breach.json"), True)
+
+    reset(prs={"7": pr(7, state="open")})
+    payload = pr_payload(action="closed", merged="2026-02-02T00:00:00Z")
+    run("gate_reviewer.py", payload)
+    check("stale close webhook keeps reopened PR", (REVIEWS / "pr7-wt").exists(), True)
+    reset(prs={"7": pr(7, state="closed")})
+    run("gate_reviewer.py", pr_payload(action="closed"))
+    check("confirmed closed webhook reclaims worktree", (REVIEWS / "pr7-wt").exists(), False)
+
+    reset(prs={})
+    run("cleanup.py", None, "--loop", "widgets", "--pr", "7", "--force")
+    check("explicit operator force permits unknown cleanup", (REVIEWS / "pr7-wt").exists(), False)
+
     # the sweep walks what is closed and leaves what is open
     reset(prs={"7": pr(7, state="closed", merged="2026-02-02T00:00:00Z"),
                "8": pr(8), "9": pr(9)})

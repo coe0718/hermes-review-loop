@@ -165,7 +165,9 @@ state (locks, queue, in-flight marks, breach marker). Rails, because this delete
   a review artifact (only detached checkouts are cleaned);
 - evidence patterns (`phase3`, `evidence`, `soak`, `release-verification`) are skipped: regenerable
   build output is not the same thing as a receipt;
-- a PR that is still open is refused; `--force` is required to override that;
+- cleanup requires a fresh GitHub lookup confirming the matching PR is closed; open, failed, and
+  malformed lookups are refused. The standalone cleanup script's explicit `--force` is the
+  operator-only override (the webhook and plugin CLI never pass it);
 - the clone itself is out of scope by construction.
 
 ## What a plugin can and cannot own

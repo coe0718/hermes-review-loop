@@ -19,7 +19,8 @@ Safety rails, because this deletes real directories:
   tree, not a review artifact (only detached review checkouts are cleaned);
 * evidence patterns (``phase3``, ``evidence``, ``soak``, ``release-verification``) are
   skipped outright: regenerable build output is not the same thing as a receipt;
-* a PR that is still open is refused, and ``--force`` is required to override that;
+* only a fresh lookup confirming this PR is closed permits cleanup; ``--force`` is an
+  explicit operator override for open or unavailable/malformed lookup results;
 * the clone itself, and anything outside the roots, is out of scope by construction.
 
 The report prints **file bytes removed** (``du``), which is not the same number as disk
@@ -124,12 +125,13 @@ def remove_path(path: pathlib.Path, quiet: bool) -> int:
 
 
 def pr_state(loop: dict, number: int) -> dict:
-    """Open or closed, from GitHub. Unknown counts as open — refuse to delete on a guess."""
+    """Return a fresh, matching GitHub PR state; invalid responses remain unknown."""
     data = gh.pr(loop, number)
-    if not isinstance(data, dict) or not data:
+    if not isinstance(data, dict) or data.get("number") != number:
         return {}
-    return {"state": data.get("state"), "merged": data.get("merged_at"),
-            "head": (data.get("head") or {}).get("sha")}
+    if data.get("state") not in ("open", "closed"):
+        return {}
+    return {"state": data["state"], "merged": data.get("merged_at")}
 
 
 def clear_state(loop: dict, number: int, quiet: bool) -> list[str]:
@@ -168,8 +170,8 @@ def clear_state(loop: dict, number: int, quiet: bool) -> list[str]:
 def clean_pr(loop: dict, number: int, dry: bool, quiet: bool, force: bool = False) -> int:
     """Remove the local footprint of one finished PR. Returns the bytes removed."""
     state = pr_state(loop, number)
-    if state.get("state") == "open" and not force:
-        log(f"    SKIP: PR #{number} is still open", quiet)
+    if state.get("state") != "closed" and not force:
+        log(f"    SKIP: PR #{number} is still open or its state is unknown", quiet)
         return 0
 
     freed = 0
@@ -271,7 +273,8 @@ def main() -> None:
     ap.add_argument("--sweep", action="store_true", help="every closed PR this clone knows about")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--quiet", action="store_true")
-    ap.add_argument("--force", action="store_true", help="allow cleaning a PR that is still open")
+    ap.add_argument("--force", action="store_true",
+                    help="explicitly clean one PR despite an open or unknown GitHub state")
     args = ap.parse_args()
 
     if not args.pr and not args.sweep:
