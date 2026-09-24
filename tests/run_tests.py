@@ -940,6 +940,176 @@ def group_plugin_settings() -> None:
     check("settings lists every knob", "reviewer_concurrency" in buf.getvalue(), True)
     check("  and where it came from", "[set]" in buf.getvalue(), True)
 
+def group_webhook_host() -> None:
+    section("webhook host — never borrow another operator's gateway")
+    from review_loop import cli, config, gh
+
+    reset(prs={})
+    init_args = ["init", "--repo", "acme/host-probe", "--fixer", FIXER,
+                 "--reviewer", REVIEWER, "--reviewer-profile", "reviewer-profile",
+                 "--fixer-profile", "fixer-profile", "--hooks"]
+    calls = []
+    original_api = gh.api
+    def fake_api(loop, path, **kwargs):
+        calls.append((path, kwargs))
+        return {"id": len(calls)}
+    gh.api = fake_api
+    try:
+        def parser_for(settings=None):
+            fake = FakeCtx()
+            cli.register_cli(fake, settings=settings)
+            parser = argparse.ArgumentParser(prog="hermes review-loop")
+            fake.setup(parser)
+            return parser
+
+        parser = parser_for()
+        check("unset schema host has no operator URL", config.settings_defaults(None)["host"], "")
+        kept = config.apply_settings(config.load_id("widgets"), {"host": ""})
+        check("empty plugin setting preserves existing loop host", kept["host"], HOST)
+        for label, args in (("missing", []), ("blank", ["--host", "   "]),
+                            ("relative", ["--host", "gateway.local"]),
+                            ("invalid URL", ["--host", "https://"]),
+                            ("path", ["--host", "https://own.example/someone-else"]),
+                            ("credentials", ["--host", "https://user:pass@own.example"]),
+                            ("empty userinfo", ["--host", "https://@own.example"]),
+                            ("empty password", ["--host", "https://user:@own.example"]),
+                            ("encoded slash in hostname", ["--host", "https://own.example%2fattacker.example"]),
+                            ("encoded at in hostname", ["--host", "https://own.example%40attacker.example"]),
+                            ("backslash", ["--host", "https://own.example\\attacker.example"]),
+                            ("bad port", ["--host", "https://own.example:wrong"]),
+                            ("empty port", ["--host", "https://own.example:"]),
+                            ("signed port", ["--host", "https://own.example:+80"]),
+                            ("unicode port", ["--host", "https://own.example:８０"]),
+                            ("out-of-range port", ["--host", "https://own.example:65536"]),
+                            ("empty query", ["--host", "https://own.example?"]),
+                            ("query", ["--host", "https://own.example/?foo=bar"]),
+                            ("empty fragment", ["--host", "https://own.example#"]),
+                            ("fragment", ["--host", "https://own.example#x"]),
+                            ("double trailing slash", ["--host", "https://own.example//"]),
+                            ("unbracketed IPv6", ["--host", "http://::1"]),
+                            ("bad bracketed IPv6", ["--host", "http://[2001:db8:::1]"]),
+                            ("invalid DNS label", ["--host", "https://own..example"]),
+                            ("invalid IPv4", ["--host", "http://999.999.999.999"])):
+            (LOOPS_DIR / "host-probe.json").unlink(missing_ok=True)
+            before = (LOOPS_DIR / "widgets.json").read_bytes(), SUBS.read_bytes()
+            calls.clear()
+            buf = io.StringIO()
+            parsed = parser.parse_args([*init_args, *args])
+            with contextlib.redirect_stdout(buf):
+                rc = parsed.func(parsed)
+            check(f"{label} host refused before init writes", rc, 2)
+            check(f"  {label}: actionable error", "--host" in buf.getvalue(), True)
+            check(f"  {label}: no config/route writes",
+                  ((LOOPS_DIR / "widgets.json").read_bytes(), SUBS.read_bytes()) == before, True)
+            check(f"  {label}: no new loop config", (LOOPS_DIR / "host-probe.json").exists(), False)
+            check(f"  {label}: no API calls", calls, [])
+
+        parsed = parser.parse_args(init_args[:-1])
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = parsed.func(parsed)
+        check("without --hooks still refuses missing host before writes", rc, 2)
+        check("  no config/route files added", (LOOPS_DIR / "host-probe.json").exists(), False)
+
+        from urllib.request import Request
+        for origin, expected in (
+                ("https://own.example:8443/", "https://own.example:8443"),
+                ("https://own.example", "https://own.example"),
+                ("HTTPS://OWN.example", "HTTPS://OWN.example"),
+                ("https://own.example.", "https://own.example."),
+                ("http://localhost:8080", "http://localhost:8080"),
+                ("http://127.0.0.1:8080", "http://127.0.0.1:8080"),
+                ("https://[2001:db8::1]:8443/", "https://[2001:db8::1]:8443"),
+                ("http://[::1]", "http://[::1]")):
+            actual = config.webhook_host(origin, required=True)
+            check(f"valid origin {origin}", actual, expected)
+            request = Request(f"{actual}/webhooks/test")
+            check(f"  urllib destination {origin}",
+                  (request.type, request.host, request.selector),
+                  (expected.split("://", 1)[0].lower(), expected.split("://", 1)[1], "/webhooks/test"))
+
+        for label, settings, extra, host in (
+                ("explicit --host", {}, ["--host", "https://own.example:8443/"], "https://own.example:8443"),
+                ("own plugin setting", {"host": "https://settings.example"}, [], "https://settings.example")):
+            reset(prs={})
+            calls.clear()
+            parser = parser_for(settings)
+            args = parser.parse_args([*init_args, *extra])
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = args.func(args)
+            check(f"{label}: init succeeds", rc, 0)
+            check(f"  {label}: saved host", config.load_id("host-probe")["host"], host)
+            check(f"  {label}: hook URLs", [body["config"]["url"] for _, kw in calls
+                  for body in [kw["body"]]],
+                  [f"{host}/p/reviewer-profile/webhooks/host-probe-review",
+                   f"{host}/p/fixer-profile/webhooks/host-probe-fix"])
+            check(f"  {label}: route hosts",
+                  [json.loads(SUBS.read_text())[name]["host"]
+                   for name in ("host-probe-review", "host-probe-fix")], [host, host])
+
+        legacy = json.loads((LOOPS_DIR / "widgets.json").read_text())
+        legacy["host"] = "https://existing.example/"
+        (LOOPS_DIR / "widgets.json").write_text(json.dumps(legacy))
+        check("existing explicit host loads unchanged except trailing slash",
+              config.load_id("widgets")["host"], "https://existing.example")
+        # A legacy route without a host must not produce a relative URL, even when
+        # the gateway subscription still carries a valid secret.
+        from review_loop import routes
+        import urllib.request
+        subs = json.loads(SUBS.read_text())
+        subs["widgets-review"].pop("host", None)
+        SUBS.write_text(json.dumps(subs))
+        check("hostless route has no URL", routes.url_for("widgets-review"), None)
+        check("hostless route has no target", routes.target("widgets-review"), None)
+        original_urlopen = urllib.request.urlopen
+        def forbidden_urlopen(*args, **kwargs):
+            raise AssertionError("hostless route attempted a webhook POST")
+        urllib.request.urlopen = forbidden_urlopen
+        try:
+            check("hostless route cannot fire", routes.fire("widgets-review", "pull_request", {}, "probe"), False)
+        finally:
+            urllib.request.urlopen = original_urlopen
+        check("explicit host resolves legacy route", routes.url_for("widgets-review", HOST),
+              f"{HOST}/p/reviewer-profile/webhooks/widgets-review")
+        check("existing route host still resolves", routes.url_for("widgets-fix"),
+              f"{HOST}/p/fixer-profile/webhooks/widgets-fix")
+        check("existing host yields a target", routes.target("widgets-fix"),
+              (f"{HOST}/p/fixer-profile/webhooks/widgets-fix",
+               subs["widgets-fix"]["secret"].encode()))
+        check("existing host can fire", routes.fire("widgets-fix", "pull_request_review", {}, "probe"), True)
+        check("existing host delivered to the sink", RECEIVED[-1]["path"],
+              "/p/fixer-profile/webhooks/widgets-fix")
+        calls.clear()
+        try:
+            cli._install_hooks({**config.load_id("widgets"), "host": ""}, None)
+        except config.ConfigError:
+            check("install refuses absent loop host", True, True)
+        else:
+            check("install refuses absent loop host", False, True)
+        check("absent loop host made no API calls", calls, [])
+        try:
+            routes.url_for("widgets-review", "https://own.example/foreign")
+        except config.ConfigError:
+            check("invalid route host rejected", True, True)
+        else:
+            check("invalid route host rejected", False, True)
+        subs["widgets-review"]["host"] = "https://own.example/foreign"
+        SUBS.write_text(json.dumps(subs))
+        check("invalid stored origin has no target", routes.target("widgets-review"), None)
+        check("invalid stored origin cannot fire", routes.fire("widgets-review", "pull_request", {}, "probe"), False)
+        # The second missing route must be caught before the first hook is posted.
+        subs.pop("widgets-fix")
+        SUBS.write_text(json.dumps(subs))
+        calls.clear()
+        try:
+            cli._install_hooks(config.load_id("widgets"), None)
+        except config.ConfigError as exc:
+            check("install refuses missing route before API", "route" in str(exc), True)
+        else:
+            check("install refuses missing route before API", False, True)
+        check("missing route made no API calls", calls, [])
+    finally:
+        gh.api = original_api
+
 
 def group_watchdog() -> None:
     section("watchdog — quiet is not the same as nothing to do")
@@ -1092,6 +1262,7 @@ def group_routes() -> None:
 GROUPS = {"routes": group_routes, "config": group_config, "reviewer": group_reviewer_gate, "budget": group_budget,
           "fixer": group_fixer_gate, "seats": group_seats, "parallel": group_parallel,
           "exclusive": group_exclusive, "settings": group_settings,
+          "webhook_host": group_webhook_host,
           "plugin_settings": group_plugin_settings, "watchdog": group_watchdog,
           "cleanup": group_cleanup}
 

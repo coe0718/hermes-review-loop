@@ -50,7 +50,7 @@ def routes_for(loop: dict) -> dict:
 
 def _install_routes(loop: dict) -> dict:
     names = routes_for(loop)
-    host = loop.get("host") or config.DEFAULTS["host"]
+    host = config.webhook_host(loop.get("host"), required=True)
     skill = loop.get("skill") or ""
     routes.new_route(
         names["reviewer"], profile=loop["seats"]["reviewer"]["profile"],
@@ -77,12 +77,18 @@ def _install_routes(loop: dict) -> dict:
 def _install_hooks(loop: dict, token_login: str | None) -> list[str]:
     """Create the two repo hooks via the API. Needs a token with admin:repo_hook on the repo."""
     names = routes_for(loop)
-    host = loop.get("host") or config.DEFAULTS["host"]
-    made = []
+    host = config.webhook_host(loop.get("host"), required=True)
+    # Validate both destinations and secrets before creating either external hook.
+    hooks = []
     for seat, event in (("reviewer", "pull_request"), ("fixer", "pull_request_review")):
         route_name = names[seat]
         url = routes.url_for(route_name, host)
         secret = (routes.route(route_name) or {}).get("secret", "")
+        if not url or not secret:
+            raise config.ConfigError(f"route {route_name!r} needs a valid webhook URL and secret before installing hooks")
+        hooks.append((event, url, secret))
+    made = []
+    for event, url, secret in hooks:
         body = {"name": "web", "active": True, "events": [event],
                 "config": {"url": url, "content_type": "json", "secret": secret,
                            "insecure_ssl": "0"}}
@@ -192,6 +198,9 @@ def cmd_init(args) -> int:
     raw["seats"]["fixer"]["route"] = names["fixer"]
     try:
         loop = config.normalize(raw)
+        # Routes are installed even without --hooks; never write a partial loop with
+        # route URLs that cannot resolve to this operator's own gateway.
+        config.webhook_host(loop["host"], required=True)
     except config.ConfigError as exc:
         print(f"config refused: {exc}")
         return 2
@@ -493,7 +502,8 @@ def register_cli(ctx, settings: dict | None = None) -> None:
                                "qualified, e.g. hermes-review-loop:review-loop")
         init.add_argument("--adjudicator-route", default="")
         init.add_argument("--adjudicator-profile", default="default")
-        init.add_argument("--host", default=d["host"], help="gateway webhook host")
+        init.add_argument("--host", default=d["host"],
+                          help="your gateway webhook origin (required unless set in plugin settings)")
         init.add_argument("--grace-min", type=int, default=d["grace_min"])
         init.add_argument("--ttl-min", type=int, default=d["ttl_min"],
                           help="how long a run may hold its seat slot")
