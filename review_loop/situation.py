@@ -135,7 +135,8 @@ def parent_readiness(loop: dict, st, number: int, expected: Resolution) -> tuple
     A delivered webhook, matching head SHA, or a bare APPROVED REST review never
     establishes which diff was approved. Re-resolve both the child and every parent;
     any changed generation, missing receipt, dismissed verdict, or failed read parks it.
-    There is deliberately no automatic receipt writer in the current gh workflow.
+    The current state reader rejects even a disk record labeled as a trusted receipt:
+    no host-attested reviewer submission writer/verifier exists yet.
     """
     if expected.status != "waiting" or expected.identity is None or not expected.parents:
         return False, "no verified stacked child situation"

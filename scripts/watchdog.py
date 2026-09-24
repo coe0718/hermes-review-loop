@@ -130,14 +130,18 @@ def drain(loop: dict, st: state_mod.LoopState, seat: str, quiet: bool = False) -
                  "title": pr.get("title", ""), "html_url": pr.get("html_url", "")}
 
         if seat == "fixer":
-            changes = gate.changes_at_head(reviews, loop, head)
-            if not changes:
+            latest = gate.latest_effective_review_at_head(reviews, loop, head)
+            if latest is None:
+                # Unknown chronology is not proof that the queued verdict was superseded.
+                log(f"drain: latest verdict at {head[:7]} of #{number} unverified — left queued")
+                continue
+            if gh.review_state(latest) != "CHANGES_REQUESTED":
                 st.queue_pop(seat, key)
-                log(f"drain: no changes-requested verdict at {head[:7]} of #{number} — dropped")
+                log(f"drain: latest verdict at {head[:7]} of #{number} is not changes requested — dropped")
                 continue
             payload = {"repository": {"full_name": loop["repo"]}, "action": "submitted",
-                       "review": changes[-1], "pull_request": short,
-                       "sender": changes[-1].get("user") or {}}
+                       "review": latest, "pull_request": short,
+                       "sender": latest.get("user") or {}}
             event, tag = "pull_request_review", f"drain-fix-{number}"
         else:
             if gate.reviewed_at_head(reviews, loop, head):

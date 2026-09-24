@@ -318,26 +318,15 @@ class LoopState:
         self._save(self.watch_file, data)
 
     def associated_review(self, number: int, identity: str, review_id: int) -> bool:
-        """Read an exact receipt association; absent/legacy records are unknown.
+        """No trusted host receipt issuer exists yet: *all* associations are unknown.
 
-        No gate currently writes these receipts: direct REST reviews and webhook snapshots
-        cannot prove which base was reviewed. This is intentionally fail-closed until a
-        trusted reviewer submission path can bind its returned ID to its dispatch identity.
+        A JSON record's ``source`` string is caller-forgeable, including the former
+        ``trusted-submission-receipt`` label. In particular a reviewer's process can
+        write state under the same HOME; neither file permissions nor a label attest
+        that the gateway dispatched this run. Never authorize stacked readiness from
+        this disk file until an actual host-attested issuer and verifier are integrated.
         """
-        if type(number) is not int or number < 1 or type(review_id) is not int or review_id < 1:
-            return False
-        if not isinstance(identity, str) or len(identity) != 64:
-            return False
-        records = self._load(self.review_situations, {})
-        if not isinstance(records, dict):
-            return False
-        entry = records.get(f"{self.loop['repo']}#{number}")
-        if not isinstance(entry, dict):
-            return False
-        receipt = entry.get(str(review_id))
-        return (isinstance(receipt, dict) and receipt.get("identity") == identity
-                and receipt.get("review_id") == review_id
-                and receipt.get("source") == "trusted-submission-receipt")
+        return False
 
 
 def state_for(loop: dict) -> LoopState:

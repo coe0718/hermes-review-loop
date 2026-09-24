@@ -107,6 +107,11 @@ def main() -> None:
         silence("verdict is on an older head — superseded")
 
     reviews = gate.fetch_reviews(loop, number)
+    latest = gate.latest_effective_review_at_head(reviews, loop, pr_head)
+    if (latest is None or latest.get("id") != review.get("id")
+            or gh.review_state(latest) != "CHANGES_REQUESTED"
+            or gate.reviewer_login(latest) != gate.reviewer_login(review)):
+        silence("changes-requested webhook is not the live latest effective verdict")
     prior = len(gate.verdicts(reviews, loop, exclude_id=review.get("id")))
     if st.inflight(f"fix:{number}:{pr_head}"):
         silence(f"a fix run for head {pr_head[:7]} is already out")

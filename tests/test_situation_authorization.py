@@ -82,14 +82,15 @@ class SituationAuthorization(unittest.TestCase):
         self.assertIn("unassociated", facts["parent_readiness"][1])
         self.assertFalse(self.state.review_situations.exists())
 
-    def test_exact_receipt_and_latest_verdict_required(self):
+    def test_forged_source_label_never_authorizes_stacked_approval(self):
         resolved = self.resolution()
         parent_identity = situation.Identity(A, "main", C, ())
         self.state.review_situations.parent.mkdir(parents=True)
         self.state.review_situations.write_text(json.dumps({f"{REPO}#1": {"101": {
             "identity": parent_identity.key, "review_id": 101,
             "source": "trusted-submission-receipt"}}}))
-        self.assertTrue(self.readiness(resolved)[0])
+        self.assertFalse(self.state.associated_review(1, parent_identity.key, 101))
+        self.assertFalse(self.readiness(resolved)[0])
         self.reviews[0]["state"] = "DISMISSED"
         self.assertFalse(self.readiness(resolved)[0])
         self.reviews[0]["state"] = "APPROVED"

@@ -663,10 +663,10 @@ def group_budget() -> None:
 
     section("fixer gate — the cap stops the fix, not just the review")
     # the fixer gate counts the OTHER verdicts; 2 prior + this one = the cap → adjudication
-    reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, rid=8),
-                                          review(REVIEWER, rid=9),
-                                          review(REVIEWER, rid=5)]}})
-    kind, out, err = run("gate_fixer.py", review_payload(rid=5))
+    reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, rid=5),
+                                          review(REVIEWER, rid=8),
+                                          review(REVIEWER, rid=9)]}})
+    kind, out, err = run("gate_fixer.py", review_payload(rid=9))
     check("verdict that hits the cap → no fix run", kind, "SILENT")
     check("  breach marker written",
           load_state("breach.json").get(f"{REPO}#7", {}).get("status"), "awaiting-adjudication")
@@ -817,14 +817,16 @@ def group_adjudicator() -> None:
     check("B wake remains claimable", run(route["script"],
           json.loads(RECEIVED[-1]["body"]))[0], "FIRE")
 
-    # The fixer gate takes its head from an old webhook, so unlike the
-    # reviewer request it has no earlier fresh-PR guard.
-    reset(prs={"7": {**pr(7, head=HEAD_A), "reviews": reviews}})
-    run("gate_fixer.py", review_payload(head=HEAD_A, rid=3))
-    set_prs({"7": {**pr(7, head=HEAD_B), "reviews": reviews}})
-    run("gate_fixer.py", review_payload(head=HEAD_B, rid=3))
+    # A current live verdict can breach; after B supersedes A, a replay of A
+    # must not replace B's marker. Both fixture verdicts have real live IDs.
+    reset(prs={"7": {**pr(7, head=HEAD_A), "reviews": reviews +
+                    [review(REVIEWER, head=HEAD_A, rid=4)]}})
+    run("gate_fixer.py", review_payload(head=HEAD_A, rid=4))
+    set_prs({"7": {**pr(7, head=HEAD_B), "reviews": reviews +
+                    [review(REVIEWER, head=HEAD_B, rid=4)]}})
+    run("gate_fixer.py", review_payload(head=HEAD_B, rid=4))
     before = len(RECEIVED)
-    run("gate_fixer.py", review_payload(head=HEAD_A, rid=3))
+    run("gate_fixer.py", review_payload(head=HEAD_A, rid=4))
     check("delayed fixer A cannot replace B",
           load_state("breach.json")[f"{REPO}#7"]["head"], HEAD_B)
     check("delayed fixer A does not deliver", len(RECEIVED) - before, 0)
@@ -1085,6 +1087,11 @@ def group_parallel() -> None:
     check("reviewer 2 → first review runs", kind_r7, "FIRE")
     check("reviewer 2 → second review runs too",
           run("gate_reviewer.py", pr_payload(9, head=newer))[0], "FIRE")
+    # The review runs have now returned a verdict on the current head.
+    set_prs({"7": {**pr(7, head=newer), "reviews": [review(REVIEWER, head=head, rid=4),
+                                                      review(REVIEWER, head=newer, rid=5)]},
+             "9": {**pr(9, head=newer), "reviews": [review(REVIEWER, head=head, rid=4),
+                                                      review(REVIEWER, head=newer, rid=6)]}})
     kind_f7, out_f7, _ = run("gate_fixer.py", review_payload(7, head=newer, rid=5))
     check("fixer 1 → its fix runs", kind_f7, "FIRE")
     check("  the fix released that PR's review slot",
@@ -2876,10 +2883,10 @@ def group_observer() -> None:
           "on an older head" in notice(observer_posts()[0])["message"], True)
 
     # -- escalation reports a durable pending marker before adjudicator delivery -----
-    reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, rid=8), review(REVIEWER, rid=9),
-                                          review(REVIEWER, rid=5)]}})
+    reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, rid=5), review(REVIEWER, rid=8),
+                                          review(REVIEWER, rid=9)]}})
     observer_route()
-    kind, out, err = run("gate_fixer.py", review_payload(rid=5))
+    kind, out, err = run("gate_fixer.py", review_payload(rid=9))
     check("cap spent: no fix run", kind, "SILENT")
     check("  the feed sees the durable marker before adjudicator delivery",
            [r["path"] for r in RECEIVED],
@@ -2890,7 +2897,7 @@ def group_observer() -> None:
           block["message"].splitlines()[0],
           f"⚠️ [widgets] #7 `{HEAD_A[:7]}` loop stopped — cap spent — 3/3 verdicts, "
           f"no approval · next: adjudicator delivery pending")
-    run("gate_fixer.py", review_payload(rid=5))
+    run("gate_fixer.py", review_payload(rid=9))
     check("  a redelivered cap event pings nobody twice",
           (len(observer_posts()), len([r for r in RECEIVED if r["path"].endswith("widgets-breach")])),
           (1, 1))
@@ -4477,11 +4484,12 @@ def group_reconciliation() -> None:
 
 def group_situation_authorization() -> None:
     section("stacked situation authorization — read-only fail closed")
-    test = subprocess.run([sys.executable, "-m", "unittest", "tests.test_situation_authorization"],
+    test = subprocess.run([sys.executable, "-m", "unittest",
+                           "tests.test_situation_authorization"],
                           cwd=ROOT, capture_output=True, text=True)
     if test.returncode:
         print(test.stdout + test.stderr)
-    check("generation-bound parent approval regression suite", test.returncode, 0)
+    check("generation-bound parent approval fail-closed suite", test.returncode, 0)
 
 
 GROUPS = {"routes": group_routes, "config": group_config, "reviewer": group_reviewer_gate, "budget": group_budget,
