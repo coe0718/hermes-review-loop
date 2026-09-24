@@ -107,14 +107,17 @@ def authorize(loop: dict, *, repo: str, number: int, head: str, role: str,
 
 
 def perform(loop: dict, *, repo: str, number: int, head: str, role: str,
-            branch: str, operation: str, verdict: str = "", body: str = "") -> object:
+            branch: str, operation: str, verdict: str = "", body: str = "",
+            require_verdict: bool = True) -> object:
     """One allowlisted REST write, with server-side destination and reviewer selection.
 
     For GitHub review submissions, commit_id pins the review to the exact checked head.
     This does not implement push (which needs a separate safe, transactional design).
+    ``require_verdict=False`` is only for a fixer's request after its own confirmed push:
+    the verdict was checked at the old head before the push, and the new head cannot have one.
     """
     login = authorize(loop, repo=repo, number=number, head=head, role=role,
-                      branch=branch, operation=operation)
+                      branch=branch, operation=operation, require_verdict=require_verdict)
     if operation == "review":
         if verdict not in ("APPROVE", "REQUEST_CHANGES", "COMMENT") or not body.strip():
             raise BrokerDenied("invalid review verdict or empty body")

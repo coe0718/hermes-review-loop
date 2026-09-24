@@ -235,7 +235,8 @@ class RunBroker:
             raise ProtocolError("run capability already used")
         # Consume BEFORE an external write: a lost response cannot lead to a replay.
         self._used = True
-        head = self._pushed_head if operation == "request_review" and self._pushed_head else self.scope.head
+        after_push = operation == "request_review" and bool(self._pushed_head)
+        head = self._pushed_head if after_push else self.scope.head
         self._pushed_head = None
         if operation == 'review' and self.scope.run_id is not None:
             from .review_receipt import ReceiptLedger, submit
@@ -247,7 +248,8 @@ class RunBroker:
                 raise ProtocolError('host review claim required')
             result = broker.perform(self._loop, repo=self.scope.repo, number=self.scope.number,
                                     head=head, role=self.scope.role, branch=self.scope.branch,
-                                    operation=operation, verdict=verdict, body=body)
+                                    operation=operation, verdict=verdict, body=body,
+                                    require_verdict=not after_push)
         self.completed = True
         return result
 

@@ -112,6 +112,41 @@ class BrokerIPCTests(unittest.TestCase):
         self.assertEqual(self.calls[-1], (f"/repos/{REPO}/pulls/7/requested_reviewers", "POST",
                                           {"reviewers": ["review"]}, "fix"))
 
+    def push_then_request(self, live_head_after_push):
+        from review_loop import config, run_supervisor, safe_push
+        pushed = "c" * 40
+        server = self.start(role="fixer")
+        object.__setattr__(server, "scope", broker_ipc.RunScope(
+            REPO, 7, HEAD, "fixer", "fix-7", "rid", "/nonexistent"))
+        supervisor = run_supervisor.Supervisor
+        with mock.patch.object(config, "by_repo", return_value=self.loop), \
+             mock.patch.object(config, "unattended_fixer_push_enabled", return_value=True), \
+             mock.patch.object(config, "push_policy_lock", return_value=mock.MagicMock()), \
+             mock.patch.object(supervisor, "__init__", return_value=None), \
+             mock.patch.object(supervisor, "push_admitted", return_value=True), \
+             mock.patch.object(supervisor, "begin_push"), \
+             mock.patch.object(supervisor, "confirm_push"), \
+             mock.patch.object(safe_push, "_manifest"), \
+             mock.patch.object(safe_push, "push", return_value={"new_head": pushed}):
+            self.assertTrue(self.send(server, {"operation": "push", "manifest": {}})["ok"])
+            self.pr["head"]["sha"] = live_head_after_push or pushed
+            result = self.send(server, {"operation": "request_review", "verdict": "", "body": ""})
+        return server, result
+
+    def test_confirmed_push_can_request_review_at_new_head(self):
+        # The verdict lives on the old head; the pushed head cannot carry one yet.
+        server, result = self.push_then_request(None)
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(server.completed)
+        self.assertEqual(self.calls[-1], (f"/repos/{REPO}/pulls/7/requested_reviewers", "POST",
+                                          {"reviewers": ["review"]}, "fix"))
+
+    def test_request_after_push_denied_when_head_moved_again(self):
+        server, result = self.push_then_request("d" * 40)
+        self.assertFalse(result["ok"])
+        self.assertFalse(server.completed)
+        self.assertFalse(any(call[0].endswith("/requested_reviewers") for call in self.calls))
+
     def test_new_approval_cancels_fixer_write_at_unchanged_head(self):
         self.reviews.append({'id': 42, 'state': 'APPROVED', 'commit_id': HEAD,
                              'submitted_at': '2026-01-01T00:01:00Z',
