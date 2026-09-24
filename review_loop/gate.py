@@ -197,6 +197,7 @@ def wake_adjudicator(loop: dict, number: int, head: str, rounds: int, reason: st
         log("no adjudicator route — the breach marker is the only record")
         return
     payload = {"repository": {"full_name": loop["repo"]},
+               "action": "review_loop_breach", "number": number,
                "_loop": {**loop_block(loop, number, head, round=rounds, reason=reason),
                          "role": "adjudicator"}}
     if routes.fire(loop["adjudicator"]["route"], "pull_request", payload,
