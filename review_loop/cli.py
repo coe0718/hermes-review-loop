@@ -16,9 +16,18 @@ import subprocess
 import sys
 import time
 
-from . import config, gate, gh, prompts, routes
+from . import config, doctor, gate, gh, prompts, routes
 
 SHIM_NAME = "review-loop-watchdog.py"
+
+
+def watchdog_job_name(loop: dict) -> str:
+    """The scheduler job name ``init`` registers for a loop's watchdog.
+
+    ``doctor`` looks for exactly this name when it checks the cron job, so it lives here as one
+    spelling rather than a format string in two files.
+    """
+    return f"review loop watchdog ({loop['id']})"
 
 SHIM = '''#!/usr/bin/env python3
 """Cron shim written by `hermes review-loop init`.
@@ -132,7 +141,7 @@ def _install_schedule(loop: dict, schedule: str, deliver: str) -> list[str]:
     shim.write_text(SHIM.format(watchdog=watchdog))
     shim.chmod(0o755)
     hermes = shutil.which("hermes") or "hermes"
-    cmd = [hermes, "cron", "create", schedule, "--name", f"review loop watchdog ({loop['id']})",
+    cmd = [hermes, "cron", "create", schedule, "--name", watchdog_job_name(loop),
            "--no-agent", "--script", SHIM_NAME, "--deliver", deliver]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
@@ -449,6 +458,29 @@ def cmd_explain(args) -> int:
     return 0
 
 
+def cmd_doctor(args) -> int:
+    """Read-only preflight: is this installation able to run the loop at all?
+
+    Every check is in ``doctor.py`` — what each state means and, deliberately, everything this
+    verb does *not* do (it writes nothing, and it never fires a route: a synthetic POST at a
+    seat's route is a real agent run). This is the installation-level counterpart of the
+    per-PR diagnosis in the watchdog, for the question `init` cannot answer about itself.
+    """
+    try:
+        loops = [config.load_id(args.loop)] if args.loop else config.all_loops()
+    except config.ConfigError as exc:
+        print(f"cannot preflight loop: {doctor._safe_report_text(str(exc))}")
+        return 2
+    if not loops:
+        print(f"no loops configured in {config.config_dir()}")
+        return 0
+    failed = 0
+    for loop in loops:
+        failed += doctor.report(loop, doctor.check_loop(loop, offline=args.offline),
+                                strict=args.strict)
+    return 1 if failed else 0
+
+
 def cmd_arm(args) -> int:
     for loop in ([config.load_id(args.loop)] if args.loop else config.all_loops()):
         for line in _set_hooks(loop, not args.pause, args.admin_token):
@@ -578,6 +610,15 @@ def register_cli(ctx, settings: dict | None = None) -> None:
         explain.add_argument("--loop", help="loop id (default: the only configured loop)")
         explain.add_argument("--pr", type=int, required=True, help="pull request number to explain")
         explain.set_defaults(func=cmd_explain)
+
+        preflight = sub.add_parser("doctor", help="Preflight a loop read-only: profiles, tokens, "
+                                                  "routes, hooks, scripts, cron, clone")
+        preflight.add_argument("--loop")
+        preflight.add_argument("--offline", action="store_true",
+                               help="skip the two network probes (gateway reachability, repo hooks)")
+        preflight.add_argument("--strict", action="store_true",
+                               help="treat a check that could not be decided as a failure")
+        preflight.set_defaults(func=cmd_doctor)
 
         change = sub.add_parser("set", help="Change a loop's settings in place")
         change.add_argument("--loop", required=True)

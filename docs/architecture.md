@@ -253,6 +253,50 @@ state (locks, queue, in-flight marks, breach marker). Rails, because this delete
   operator-only override (the webhook and plugin CLI never pass it);
 - the clone itself is out of scope by construction.
 
+## Preflight: can this installation run?
+
+`init` writes the config, the routes, the hooks and the cron job; it cannot check itself. So
+`hermes review-loop doctor --loop <id>` walks the installation read-only and answers one question:
+**can this loop wake a seat and post a verdict?** It is the installation-level counterpart of the
+watchdog — the watchdog asks "is this PR stalled?", the preflight asks "is this loop wired at all?"
+
+| check | what it proves |
+|---|---|
+| `config` | the loop file is there and parses |
+| `profile:reviewer` / `profile:fixer` | each seat's Hermes profile home exists (`~/.hermes/profiles/<name>`, or `~/.hermes` itself for `default`) |
+| `credential:<seat>` | a nonempty token file is mapped for that seat's login through `gh.token_path`; profile `GH_TOKEN` alone is not used by the gates |
+| `token:<login>` | every credential file named in the config exists, is non-empty, and is not readable by group or other users |
+| `read_token` | the login the gates read GitHub as is one of those mappings |
+| `route:<name>` | the gateway's registry holds the route, it wakes *this* seat's profile, it carries a secret and a prompt, it runs the right gate script for the right event, and it resolves to this loop's own gateway origin |
+| `scripts` | the plugin's `watchdog.py`, both gates and `cleanup.py` are on disk |
+| `cron:shim` | `~/.hermes/scripts/review-loop-watchdog.py` exists **and is pinned to the plugin install that is here now** — an upgrade that moves the directory leaves the scheduler running an old path |
+| `cron:job` | the scheduler's own store holds this loop's watchdog job and it is not paused |
+| `clone` | the clone exists, is a git checkout, and is not inside the loop's artifacts root — the cleanup deletes that whole tree |
+| `state_dir` / `roots` | the loop can write its locks and queue there; every cleanup root is a directory |
+| `gateway` | a TCP connect to the loop's webhook origin is accepted |
+| `hook:<route>` | the repo hook posts at the route's URL, subscribes to that seat's event, and is active |
+
+Four states, and the difference between the last two is the point:
+
+* ✅ **verified** — checked, and correct;
+* ❌ **absent** — not there at all;
+* ❌ **mismatch** — there, but not what this loop needs: a route waking another profile, a hook on
+  another gateway, a shim pinned to a stale plugin path, a world-readable PAT;
+* ⚠️ **unknown** — could not be decided from here: a hooks read the token was not allowed to make
+  (reading a repo's hooks needs `admin:repo_hook`), or a probe skipped with `--offline`.
+
+**Unknown is never folded into absent.** "The API refused to tell me" and "there are no hooks" are
+different claims, and printing the second when the first is true sends the operator hunting for a
+hook that exists. Failures exit 1 and each one carries the single command that fixes it;
+`--strict` makes an `unknown` a failure too, for installs that require a fully proved preflight.
+
+Read-only is a hard rule here, twice over. The preflight writes no config, route, state or hook —
+a check that repairs what it looks at cannot be trusted to describe what is wrong — and it never
+fires a route, because a synthetic POST at a seat's route **is** a real agent run with a real
+budget. The entire network side of the preflight is a TCP connect to the gateway and, when the
+token is permitted, a read of the repo's hooks. There is deliberately no test-fire mode: the way
+to test a route is to hand GitHub a real event.
+
 ## What a plugin can and cannot own
 
 This ships as a general Hermes plugin, which means it can register a CLI command, tools, hooks,

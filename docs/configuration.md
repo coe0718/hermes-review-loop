@@ -8,6 +8,11 @@ one install serve several repositories with different seats, budgets and credent
 on purpose — a loop that cannot be resolved to a repository, a base branch and two seats is a
 configuration error, not a run that guesses.
 
+Before arming a loop, `hermes review-loop doctor --loop <id>` checks that everything this file
+*names* actually exists — the seat profiles, the token files, the routes and their secrets, the
+GitHub hooks, the cron shim and job, the clone and the gateway — and writes nothing while doing it.
+See [Preflight](architecture.md#preflight-can-this-installation-run).
+
 ## Required
 
 | key | meaning |

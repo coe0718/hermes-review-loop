@@ -103,6 +103,7 @@ registry is visible, but crash durability is unconfirmed; do not assume the oper
 hermes review-loop list                 # what is configured
 hermes review-loop status --loop name   # parallel setting, live runs, queue, breaches
 hermes review-loop explain --loop name --pr 123   # why that PR is not moving, and what is next
+hermes review-loop doctor --loop name   # preflight the install: profiles, tokens, routes, hooks, cron
 hermes review-loop settings             # the plugin-level defaults, and where each came from
 hermes review-loop apply --loop name    # push those defaults onto an existing loop (--dry-run)
 hermes review-loop set --loop name --reviewer-concurrency 2   # two reviews at once, one fix at a time
@@ -118,6 +119,110 @@ hermes review-loop uninstall --loop name
 `--ttl-min` — through the same validation `init` uses, so a capacity above 1 without a clone is
 refused here exactly as it is at init. Prompts are rendered from the payload at fire time, so a
 change takes effect on the next event with nothing to re-install.
+
+### Preflight: `doctor`
+
+`init` writes the config, the routes and (optionally) the hooks and the cron job — but a
+syntactically valid file is not proof that any of it can run. The reviewer's profile may not
+exist, the token file named for the fixer may have gone in a key rotation, the route in the
+gateway registry may wake a *different* profile than the loop config says, the repo hook may
+point at your previous gateway, or the cron shim may still be pinned to the plugin directory a
+previous upgrade left behind. Every one of those is a loop that looks armed and cannot wake a
+seat — so `doctor` checks the installation itself, read-only, before anyone arms it:
+
+```bash
+hermes review-loop doctor --loop attest             # one loop; without --loop it preflights them all
+hermes review-loop doctor --loop attest --offline   # skip the gateway probe and the hooks read
+hermes review-loop doctor --loop attest --strict    # an undecided check counts as a failure
+```
+
+One line per check, in one of four states:
+
+| state | meaning |
+|---|---|
+| ✅ verified | checked, and correct |
+| ❌ absent | the thing is not there — a missing profile, token file, route, hook, job or script |
+| ❌ mismatch | present, but not what this loop needs — a route waking another profile, a hook on another gateway, a shim pinned to a stale plugin path, a world-readable PAT |
+| ⚠️ unknown | could not be decided *from here* — a hooks read the token was not allowed to make, or a probe skipped with `--offline` |
+
+Each failure is followed by the one command that fixes it, failures exit 1, and `unknown` is never
+reported as `absent`: "the API refused to tell me" and "there are no hooks" are different claims,
+and printing the second when the first is true sends you hunting for a hook that exists (reading
+the repo's hooks needs `admin:repo_hook`, so a token without it shows ⚠️, not ❌).
+
+It writes nothing — no config, no route registry, no state, no GitHub hook — and it never fires a
+route, because a synthetic POST at a seat's route is a real agent run with a real budget. The
+network side is a TCP connect to the gateway (is anything listening?) and, when the token is
+allowed to, a read of the repo's hooks.
+
+A correct installation:
+
+```
+$ hermes review-loop doctor --loop widgets
+[widgets] acme/widgets — preflight (read-only: it writes nothing and fires nothing)
+  ✅ config               doctor-demo/loops/widgets.json (repo acme/widgets, cap 3, base main)
+  ✅ profile:reviewer     reviewer-profile → doctor-demo/hermes-home/profiles/reviewer-profile
+  ✅ credential:reviewer  rev-coach → a nonempty token file (identity and API access not checked)
+  ✅ profile:fixer        fixer-profile → doctor-demo/hermes-home/profiles/fixer-profile
+  ✅ credential:fixer     dev-fixer → a tokens entry
+  ✅ token:dev-fixer      doctor-demo/fix.pat (mode 600, non-empty)
+  ✅ token:rev-coach      doctor-demo/rev.pat (mode 600, non-empty)
+  ✅ read_token           rev-coach (mapped in tokens)
+  ✅ route:widgets-review reviewer-profile · pull_request · http://127.0.0.1:43651/p/reviewer-profile/webhooks/widgets-review
+  ✅ route:widgets-fix    fixer-profile · pull_request_review · http://127.0.0.1:43651/p/fixer-profile/webhooks/widgets-fix
+  ✅ route:widgets-breach default · adjudication wake
+  ✅ scripts              /home/jeremy/projects/rl-15-doctor/scripts (watchdog, both gates, cleanup)
+  ✅ cron:shim            doctor-demo/hermes-home/scripts/review-loop-watchdog.py → /home/jeremy/projects/rl-15-doctor/scripts/watchdog.py
+  ✅ cron:job             8f21c0 every 15m, next 2026-09-23T22:15:00Z
+  ✅ clone                doctor-demo/clone (git checkout)
+  ✅ state_dir            doctor-demo/state (created under doctor-demo on the first run)
+  ✅ roots                1 configured: doctor-demo/reviews
+  ✅ gateway              127.0.0.1:43651 accepts a connection
+  ✅ hook:widgets-review  hook 41 → http://127.0.0.1:43651/p/reviewer-profile/webhooks/widgets-review (pull_request, active)
+  ✅ hook:widgets-fix     hook 42 → http://127.0.0.1:43651/p/fixer-profile/webhooks/widgets-fix (pull_request_review, active)
+
+widgets: 20 verified, 0 failed, 0 unknown (of 20 checks)
+  every check passed — this loop can wake a seat and post a verdict.
+```
+
+and the same loop with six of the ways it really breaks:
+
+```
+$ hermes review-loop doctor --loop widgets
+[widgets] acme/widgets — preflight (read-only: it writes nothing and fires nothing)
+  ✅ config               doctor-demo/loops/widgets.json (repo acme/widgets, cap 3, base main)
+  ✅ profile:reviewer     reviewer-profile → doctor-demo/hermes-home/profiles/reviewer-profile
+  ✅ credential:reviewer  rev-coach → a nonempty token file (identity and API access not checked)
+  ❌ profile:fixer        no profile home at doctor-demo/hermes-home/profiles/fixer-profile
+      fix: `hermes profile create fixer-profile`, or re-run init with --fixer-profile pointing at a profile that exists: the run happens as this profile
+  ✅ credential:fixer     dev-fixer → a tokens entry
+  ❌ token:dev-fixer      no file at doctor-demo/fix.pat
+      fix: write the PAT for dev-fixer to doctor-demo/fix.pat (chmod 600), or re-run init with --token dev-fixer=<a path that exists>
+  ✅ token:rev-coach      doctor-demo/rev.pat (mode 600, non-empty)
+  ✅ read_token           rev-coach (mapped in tokens)
+  ❌ route:widgets-review registered at https://old-gateway.example, but the loop is armed at http://127.0.0.1:43651
+      fix: re-run init to rewrite the route for http://127.0.0.1:43651: a hook or a manual POST still goes to the recorded origin
+  ❌ route:widgets-fix    wakes profile 'some-other-agent', but seats.fixer.profile is 'fixer-profile' — the wake would run the wrong agent
+      fix: re-run init with --fixer-profile fixer-profile so the route and the loop config agree
+  ✅ route:widgets-breach default · adjudication wake
+  ✅ scripts              /home/jeremy/projects/rl-15-doctor/scripts (watchdog, both gates, cleanup)
+  ❌ cron:shim            pinned to /opt/old/plugins/hermes-review-loop/scripts/watchdog.py, this install runs /home/jeremy/projects/rl-15-doctor/scripts/watchdog.py
+      fix: re-run init --schedule 15m for this loop: the shim was written by a different plugin install, and the scheduler keeps running that path
+  ❌ cron:job             8f21c0 (review loop watchdog (widgets)) is paused
+      fix: `hermes cron resume 8f21c0`: a paused watchdog never reports a stall
+  ✅ clone                doctor-demo/clone (git checkout)
+  ✅ state_dir            doctor-demo/state (created under doctor-demo on the first run)
+  ✅ roots                1 configured: doctor-demo/reviews
+  ✅ gateway              127.0.0.1:43651 accepts a connection
+  ⚠️ hooks                could not read /repos/acme/widgets/hooks — nothing was proved about 2 hook(s) (a token without admin:repo_hook reads as denied)
+
+widgets: 12 verified, 6 failed, 1 unknown (of 19 checks)
+  6 failed: profile:fixer, token:dev-fixer, route:widgets-review, route:widgets-fix, cron:shim, cron:job — fix the ❌ lines above before this loop is armed.
+```
+
+(Both transcripts are real output from the suite's isolated demo home — a loopback gateway
+sink for the probe, a stubbed GitHub, short relative paths. A run against a live install
+prints the same lines with absolute paths and the real hook list.)
 
 Each seat needs its own GitHub token, and that is deliberate: the token that reviews, the token
 that pushes and the token that reads are separate and revocable one at a time. A classic PAT with
@@ -282,23 +387,26 @@ never copied into `~/.hermes/skills/`.
 
 Exercised and passing:
 
-- `python3 tests/run_tests.py` — no network: every gate branch, the cap, the one-PR-one-
+- `python3 tests/run_tests.py` — offline checks: every gate branch, the cap, the one-PR-one-
   seat rule (including the handoff that must *not* deadlock the gates), per-seat capacity and
   queueing, an approval freeing its slot and starting the next queued PR, **real isolation** (real
   clones — one per PR *and* per seat — checked out at the head, with no token in them), the `set` /
   `apply` / `settings` verbs (including the round trip a stranger's install depends on, and that
-  `plugin.yaml`'s `config_schema` still matches the keys the code reads), all four watchdog stall
-  shapes, `explain`'s golden cases (a review in flight, a review with no verdict, a verdict with no
-  fix, a head nobody asked about, a PR queued behind a full seat, a spent budget, a paused loop, a
-  closed PR, a missing PR, a failed GitHub read) plus the proof that two runs of it change nothing,
-  and the cleanup rails against a real git clone.
+  `plugin.yaml`'s `config_schema` still matches the keys the code reads), the `doctor` preflight
+  (a correct install passes; a missing profile, token, route, hook, script, cron job, clone or
+  gateway fails with a remediation; an API-denied hooks read is `unknown`, never "absent"), all
+  four watchdog stall shapes, `explain`'s golden cases (a review in flight, a review with no verdict,
+  a verdict with no fix, a head nobody asked about, a PR queued behind a full seat, a spent budget,
+  a paused loop, a closed PR, a missing PR, a failed GitHub read) plus the proof that two runs of it
+  change nothing, and the cleanup rails against a real git clone.
 - Live use on a private repository: two seats, dozens of PRs, review → verdict → fix → cleanup.
 
 Not proven, and worth knowing before you trust it:
 
 - The plugin's own `init` path has been exercised against a test gateway, not against every gateway
   layout in the wild. The intended checks after `init` are `hermes plugins validate` and
-  `hermes review-loop status`.
+  `hermes review-loop doctor --loop <id>` — and `doctor` has itself only been run against the
+  suite's stubbed GitHub and isolated homes, not against a live repo's hook list.
 - Cleanup reports **file bytes removed** (`du`), which is not the same as disk recovered on a
   compressed or reflink-sharing volume — quote the `df` delta too.
 - `explain` has been exercised by the suite and by hand against stubbed GitHub, not yet against a
@@ -312,7 +420,8 @@ Not proven, and worth knowing before you trust it:
 ```
 plugin.yaml                manifest (no hidden capabilities: no hooks, no tools, no middleware)
 __init__.py                registers the CLI and the skill
-review_loop/               the library: config, state, gh, routes, prompts, gate runtime, CLI
+review_loop/               the library: config, state, gh, routes, prompts, gate runtime, CLI,
+                           and the read-only `doctor` preflight
 scripts/gate_reviewer.py   between a pull_request event and a review run
 scripts/gate_fixer.py      between a pull_request_review event and a fix run
 scripts/watchdog.py        cron: stall detection, stuck state, queue draining
