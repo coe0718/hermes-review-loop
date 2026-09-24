@@ -23,8 +23,29 @@ class SituationTest(unittest.TestCase):
         by_number = {p["number"]: p for p in others}
         by_number[child["number"]] = child
         with mock.patch.object(situation.gh, "pr", side_effect=lambda _loop, n: by_number.get(n)), mock.patch.object(
-                situation.gh, "open_prs_read", return_value=(list(others), "") if open_prs is None else open_prs):
+                situation.gh, "open_prs_read", return_value=(list(others), "") if open_prs is None else open_prs), mock.patch.object(
+                situation.gh, "fetch", return_value=({"ref": "refs/heads/main", "object": {"type": "commit", "sha": A}}, "")):
             return situation.resolve(LOOP, child["number"])
+
+    def test_direct_base_requires_live_matching_trunk_ref(self):
+        direct = pr(184, "child", C, "main", A)
+        path = "/repos/acme/widgets/git/ref/heads/main"
+        cases = (({"ref": "refs/heads/main", "object": {"type": "commit", "sha": B}}, ""),
+                 ({"ref": "refs/heads/other", "object": {"type": "commit", "sha": A}}, ""),
+                 ({"ref": "refs/heads/main", "object": {"type": "tag", "sha": A}}, ""),
+                 ({"ref": "refs/heads/main", "object": {"type": "commit", "sha": "bad"}}, ""),
+                 ({"ref": "refs/heads/main", "object": {"type": "commit"}}, ""),
+                 ([], ""), (None, "HTTP 404"))
+        for response in cases:
+            with self.subTest(response=response), mock.patch.object(gh, "pr", return_value=direct), \
+                 mock.patch.object(gh, "fetch", return_value=response) as fetch:
+                resolution = situation.resolve(LOOP, 184)
+                self.assertEqual(resolution.status, "blocked")
+                self.assertIsNone(resolution.identity)
+                fetch.assert_called_once_with(LOOP, path)
+        with mock.patch.object(gh, "pr", return_value=direct), mock.patch.object(
+                gh, "fetch", return_value=({"ref": "refs/heads/main", "object": {"type": "commit", "sha": A.upper()}}, "")):
+            self.assertEqual(situation.resolve(LOOP, 184).status, "eligible")
 
     def test_direct_and_stacked_identity(self):
         direct = pr(182, "parent", B, "main", A)

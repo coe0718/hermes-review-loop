@@ -2720,7 +2720,7 @@ def group_explain() -> None:
           any("hook state unreadable" in text for text in decide(armed=None)["blockers"]), True)
     check("paused → re-arm", decide(armed=False)["next"]["kind"], "rearm")
     check("a draft → ready_for_review", decide(pr=pr(7, draft=True))["next"]["kind"], "ready")
-    check("a wrong base → nothing", decide(pr=pr(7, base="release"))["next"]["kind"], "none")
+    check("unverified stacked base → retry, not a run", decide(pr=pr(7, base="release"))["next"]["kind"], "retry")
     check("someone else's PR → nothing", decide(pr=pr(7, author="outsider"))["next"]["kind"], "none")
     check("approved at the head → nothing",
           decide(reviews=[review(REVIEWER, state="approved")])["next"]["kind"], "none")

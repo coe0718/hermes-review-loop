@@ -1225,6 +1225,9 @@ def cmd_explain(args) -> int:
         print(f"  {'read:':<12}{report['read_at']} (GitHub pulls/reviews/hooks + local state; "
               f"read once, nothing written)")
         print(f"  {'state:':<12}{report['state_line']}")
+        if report['chain']['status'] != 'direct':
+            print(f"  {'chain:':<12}{report['chain']['status']} · "
+                  f"parents {report['chain']['parents']} · {report['chain']['reason']}")
         print(f"  {'budget:':<12}{report['budget']}")
         print(f"  {'seat:':<12}{report['seat']}")
         print(f"  {'queue:':<12}{report['queue']}")
