@@ -147,7 +147,7 @@ hermes review-loop explain --loop widgets --pr 7    # --loop may be omitted when
   hooks:      armed — both seat routes are active repo hooks
   sweep:      no watchdog sweep recorded — nothing has read this loop's PRs yet
   blocked:    the changes-requested verdict at head aaaaaaa has no fix run out — the fixer gate did not start one for that delivery
-  next:       the fixer pushes a fix and re-requests review of head aaaaaaa: gh api -X POST repos/acme/widgets/pulls/7/requested_reviewers -f 'reviewers[]=rev-seat' — the verdict landed and no fix run is out
+  next:       re-deliver the changes-requested review event for head aaaaaaa to the fixer gate after checking why its run did not start — no fixer is running to push a fix
 ```
 
 A PR that is waiting rather than broken says so, instead of looking like a failure:
@@ -175,9 +175,10 @@ Three rules keep it honest:
   queue, the breach marker, the armed check), in the gates' own guard order. A gate stops at the
   first guard that silences it; `explain` reports every guard and names the one that is holding the
   PR. What it says cannot drift from what the loop would do, because it is the same code.
-* **Unknown is not a guess.** A failed GitHub read, an unreadable review list, an unreadable hook
-  list, a missing PR: each is printed as unknown, with the reason and the retry, instead of being
-  rendered as "0 verdicts" or "closed". Every timestamp is labelled with where it came from — the
+* **Unknown is not a guess.** A transient GitHub failure, an unreadable review list or hook list,
+  or a malformed PR head is printed as unknown and needs a retry, not a guessed verdict or review
+  request. HTTP 404 means missing *or inaccessible* and calls for checking the number and access,
+  not treating it as a transient failure. Every timestamp is labelled with where it came from — the
   read itself, the verdict's `submitted_at`, or the state file's own mark.
 * **Read-only, byte for byte.** No claim, no queue entry, no inflight mark, no drain, no webhook
   POST, no token printed, and it does not even prune an expired lock while looking at it. Run it

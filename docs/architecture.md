@@ -196,8 +196,8 @@ It is **the gates' own logic, walked differently**, and that is the design const
 | effect | a claim, a queue entry, a mark, a POST | none |
 
 The predicates are shared, not copied: `verdicts` (the round count), `reviews_at_head` /
-`reviewed_at_head` / `changes_at_head` / `approved_at_head`, `seat_key`, `config.seat_concurrency`,
-the seat ledgers, the queue, the breach marker and `hooks_read`. Re-deriving any of them would be
+`reviewed_at_head` / `changes_at_head` / `approved_at_head`, `seat_key`, `seat_capacity`,
+`breach_delivery_status`, the seat ledgers, the queue and `hooks_read`. Re-deriving any of them would be
 the drift this report exists to rule out — an operator who is told "awaiting the fixer" while the
 fixer gate would in fact have fired has learned nothing.
 
@@ -208,18 +208,23 @@ loop would stop at:
 2. is the PR closed or merged (the loop is over; the closed path reclaims the disk);
 3. is the loop armed — a paused loop can be woken by nothing;
 4. is this a PR the reviewer gate serves at all (draft, wrong base, author is not a fixer);
-5. the budget: an approval ends the loop, and a spent cap means adjudication;
-6. who holds the PR right now (one PR, one seat) — a held seat *is* the next event;
-7. is it queued (no capacity: the wait ends when the holding run hands off or its lock expires);
+5. the budget: an approval ends the loop; a spent cap with pending delivery needs retry before any
+   ruling can be expected, while an acknowledged marker means adjudication;
+6. who holds the PR right now (one PR, one seat) — only a lock for the live head can imply its next
+   verdict or push; an old-head lock must be released or expire;
+7. is it queued for this exact head (a stale queued SHA is dropped, never retargeted; a current
+   queue waits for capacity); even without a queue entry, locks held by other PRs can fill a seat;
 8. is this exact head marked in flight (a run is already out for it);
-9. a verdict at this head with no fix run out (the fixer gate did not start one);
-10. a review at this head with no verdict (a comment consumes no round, and neither gate wakes on
-    it — the ping-pong that looks like progress);
+9. a verdict at this head with no fix run out (retry the fixer gate event, not an absent fixer's push);
+10. a non-verdict review at this head (a comment consumes no round and does not suppress a new
+    review request in the reviewer gate);
 11. nothing at this head: the fixer's request is what wakes the reviewer, and GitHub clears it when
-    a verdict lands, so a missing request is the classic silent stall.
+    a verdict lands, so a missing request is the classic silent stall. A pending request *without*
+    a run needs its gate event re-delivered, not a verdict from a reviewer who never started.
 
-Every report ends in exactly one `next:` line: a reviewer verdict, a review request, a fixer push
-plus request, a released slot, an adjudication, a re-arm, a retry, or nothing at all. Timestamps
+Every report ends in exactly one `next:` line: a reviewer verdict, a review request, a retry of the
+fixer event, a fixer push plus request when a run exists, a released slot, an adjudication, a re-arm,
+a read retry, or nothing at all. Timestamps
 carry their source (the read itself, the verdict's `submitted_at`, or the state mark's own epoch),
 and anything that could not be read is printed as unknown with the reason.
 
@@ -227,7 +232,7 @@ and anything that could not be read is printed as unknown with the reason.
 expired locks *and writes them back* — but `st.live_locks()`, its read-only twin; it reads inflight
 marks with `inflight_at`, and never touches the queue except to count it. The suite runs it twice
 with an expired lock, a queue entry and a breach marker on disk, and asserts every file (both loops'
-configs, every state file, the route registry and the stub world) is byte-for-byte unchanged and that
+configs, every state file, the route registry and the stub world) has the same SHA-256 hash and that
 no webhook was fired.
 
 ## Cleanup

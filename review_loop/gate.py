@@ -174,11 +174,11 @@ def hooks_read(loop: dict) -> tuple[bool | None, str]:
     hooks, error = gh.fetch(loop, gh.hooks_path(loop))
     if error or not isinstance(hooks, list):
         return None, error or "GitHub returned no hook list"
-    wanted = {loop["seats"]["reviewer"]["route"], loop["seats"]["fixer"]["route"]}
-    found = [h for h in hooks
-             if isinstance(h, dict)
-             and any(name in (h.get("config") or {}).get("url", "") for name in wanted)]
-    return bool(found) and all(h.get("active") for h in found), ""
+    missing = [seat for seat in ("reviewer", "fixer")
+               if not any(isinstance(h, dict)
+                          and loop["seats"][seat]["route"] in (h.get("config") or {}).get("url", "")
+                          and h.get("active") is True for h in hooks)]
+    return not missing, ", ".join(missing)
 
 
 def hooks_armed(loop: dict) -> bool:
@@ -196,7 +196,7 @@ def hooks_armed(loop: dict) -> bool:
 # flight, what the watchdog last saw).
 #
 # So ``explain`` gathers both halves read-only and runs them through the *same* predicates the
-# gates run — ``verdicts``, ``reviewed_at_head``, ``changes_at_head``, ``approved_at_head``,
+# gates run — ``verdicts``, verdict-only ``reviewed_at_head``, ``changes_at_head``, ``approved_at_head``,
 # ``seat_key``, the seat ledgers, the queue, the breach marker, ``hooks_read`` — in the gates' own
 # guard order. It re-derives no rule, so it cannot drift from what the loop would do, and it writes
 # nothing: no claim, no queue entry, no drain, no webhook POST, no token. Two runs leave GitHub and
@@ -208,7 +208,7 @@ def hooks_armed(loop: dict) -> bool:
 
 # The vocabulary of ``next.kind``. The suite asserts every conclusion is one of these, so a new
 # branch cannot quietly invent a kind nobody is checking for.
-EXPLAIN_KINDS = ("review-verdict", "review-request", "fixer-push", "release", "adjudication",
+EXPLAIN_KINDS = ("review-verdict", "review-request", "fixer-retry", "fixer-push", "release", "adjudication",
                  "rearm", "ready", "retry", "none")
 
 
@@ -233,6 +233,14 @@ def _adjudication_next(loop: dict, head: str) -> str:
     return (f"human adjudication: the adjudicator rules at head {short} and reports; nothing else "
             f"fires for this PR (both gates stop at the cap)")
 
+def seat_capacity(loop: dict, st: state_mod.LoopState, seat: str) -> tuple[int, int]:
+    """The gate's capacity predicate, with a read-only ledger view for explain."""
+    return len(st.live_locks(seat)), config.seat_concurrency(loop, seat)
+
+def breach_delivery_status(marker: dict, head: str) -> str:
+    """Only a marker for the live head can park or retry this PR."""
+    return str(marker.get("status") or "") if marker.get("head") == head else ""
+
 
 def _explain_state(loop: dict, st: state_mod.LoopState, key: str, number: int, head: str,
                    now: float) -> dict:
@@ -243,8 +251,11 @@ def _explain_state(loop: dict, st: state_mod.LoopState, key: str, number: int, h
     and nothing is queued" is as much an answer as a queue entry is.
     """
     held: dict[str, dict] = {}
+    capacity: dict[str, tuple[int, int]] = {}
     for seat in ("reviewer", "fixer"):
-        entry = st.live_locks(seat).get(key)
+        live = st.live_locks(seat)
+        capacity[seat] = seat_capacity(loop, st, seat)
+        entry = live.get(key)
         if isinstance(entry, dict):
             held[seat] = entry
     seat_line = " · ".join(
@@ -255,10 +266,16 @@ def _explain_state(loop: dict, st: state_mod.LoopState, key: str, number: int, h
     queue_bits: list[str] = []
     queued_seat = ""
     queued_reason = ""
+    stale_queues: list[str] = []
     for seat in ("reviewer", "fixer"):
         items = st.queue_items(seat)
         entry = items.get(key)
         if not isinstance(entry, dict):
+            continue
+        if head and entry.get("head") != head:
+            stale_queues.append(f"{seat} queue targets head {str(entry.get('head') or '?')[:7]}, "
+                                f"not current head {head[:7]} — the watchdog drops it, not retargets it")
+            queue_bits.append(stale_queues[-1])
             continue
         order = sorted(items, key=lambda name: _mark_time(items.get(name), 0.0))
         position = order.index(key) + 1 if key in order else 0
@@ -287,8 +304,8 @@ def _explain_state(loop: dict, st: state_mod.LoopState, key: str, number: int, h
 
     raw_marker = st.breach_get(number)
     marker = raw_marker if isinstance(raw_marker, dict) else {}
-    parked = bool(marker) and marker.get("head") == head \
-        and str(marker.get("status") or "") == "awaiting-adjudication"
+    delivery_status = breach_delivery_status(marker, head)
+    parked = delivery_status in {"awaiting-adjudication", "adjudicating"}
     escalation_line = (
         f"{marker.get('status') or 'recorded'} at head {str(marker.get('head') or '?')[:7]} since "
         f"{marker.get('at') or 'an unrecorded time'} — {marker.get('reason') or 'no reason recorded'}"
@@ -303,8 +320,10 @@ def _explain_state(loop: dict, st: state_mod.LoopState, key: str, number: int, h
 
     return {"seat": seat_line, "queue": queue_line, "inflight": inflight_line,
             "escalation": escalation_line, "held": held, "queued_seat": queued_seat,
-            "queued_reason": queued_reason, "inflight_review": inflight_review,
-            "inflight_fix": inflight_fix, "parked": parked, "marker": marker, "sweep": sweep}
+            "queued_reason": queued_reason, "stale_queues": stale_queues,
+            "inflight_review": inflight_review,
+            "inflight_fix": inflight_fix, "parked": parked, "delivery_status": delivery_status,
+            "capacity": capacity, "marker": marker, "sweep": sweep}
 
 
 def _explain_hooks(armed, armed_error: str) -> str:
@@ -312,7 +331,8 @@ def _explain_hooks(armed, armed_error: str) -> str:
     if armed is True:
         return "armed — both seat routes are active repo hooks"
     if armed is False:
-        return "PAUSED — the repo hooks are inactive, so no event can reach a seat"
+        return ("PAUSED — seat route(s) without an active repo hook: "
+                f"{armed_error or 'unknown'}; those seats cannot receive events")
     return (f"unknown — the repo's hooks could not be read "
             f"({armed_error or 'no reason given'}); 'paused' is not claimed")
 
@@ -324,6 +344,8 @@ def explain_facts(loop: dict, number: int) -> dict:
     reading (``live_locks``, ``inflight_at`` and ``queue_items`` never persist their pruning).
     """
     pr, pr_error = gh.fetch(loop, gh.pr_path(loop, number))
+    if pr is None and (pr_error == "HTTP 404" or pr_error.startswith("HTTP 404 ")):
+        pr_error = ""  # GitHub hides inaccessible resources behind 404 as well.
     reviews, reviews_error = gh.fetch(loop, gh.reviews_path(loop, number))
     armed, armed_error = hooks_read(loop)
     return {"pr": pr, "pr_error": pr_error, "reviews": reviews, "reviews_error": reviews_error,
@@ -349,7 +371,9 @@ def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> di
     key = seat_key(loop, number)
     cap = loop["cap"]
     repo = loop["repo"]
-    head = str(((pr or {}).get("head") or {}).get("sha") or "")
+    head_data = (pr or {}).get("head")
+    raw_head = head_data.get("sha") if isinstance(head_data, dict) else None
+    head = raw_head if isinstance(raw_head, str) else ""
     short = head[:7] if head else "?"
     base = str(((pr or {}).get("base") or {}).get("ref") or "")
     author = str(((pr or {}).get("user") or {}).get("login") or "").lower()
@@ -389,9 +413,9 @@ def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> di
                   f"{reviewer_login(last) or 'an unrecorded reviewer'}")
     elif approved:
         budget = f"{spent}/{cap} verdicts spent · approved at head {short}"
-    elif reviewed:
-        budget = (f"{spent}/{cap} verdicts spent · a review at head {short} with no verdict "
-                  f"({'/'.join(head_states) or 'state unrecorded'})")
+    elif head_states:
+        budget = (f"{spent}/{cap} verdicts spent · a non-verdict review at head {short} "
+                  f"({'/'.join(head_states)}) — reviewer gate still accepts a fresh request")
     elif head:
         budget = f"{spent}/{cap} verdicts spent · nothing at head {short}"
     else:
@@ -407,6 +431,15 @@ def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> di
     inflight_fix = local["inflight_fix"]
     marker = local["marker"]
     parked = local["parked"]
+    # A dismissed verdict can lower the live count after a failed POST. The
+    # watchdog only retries a pending marker while the cap remains spent.
+    pending_delivery = (local["delivery_status"] == "delivery-pending"
+                        and spent is not None and spent >= cap)
+    stale_held = {seat for seat, entry in held.items() if entry.get("head") != head}
+    needed_seat = ("fixer" if at_head else "reviewer" if request_pending else "")
+    used, limit = local["capacity"].get(needed_seat, (0, 0))
+    full_seat = bool(needed_seat and used >= limit and needed_seat not in held
+                     and not (inflight_fix if needed_seat == "fixer" else inflight_review))
     hooks_line = _explain_hooks(armed, armed_error)
 
     # -- every guard, in the gates' order, reported instead of silencing ----------------------
@@ -423,8 +456,8 @@ def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> di
                             f"its disk and drops any queue entry for it")
         else:
             if armed is False:
-                blockers.append("paused loop: the repo hooks are inactive, so no event can reach "
-                                "a seat")
+                blockers.append(f"paused loop: seat route(s) without an active repo hook: "
+                                f"{armed_error or 'unknown'}")
             elif armed is None:
                 blockers.append(f"hook state unreadable ({armed_error or 'no reason given'}) — "
                                 f"'paused' is not claimed: not seeing the hooks is not evidence they "
@@ -433,6 +466,8 @@ def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> di
                 blockers.append(f"the review list could not be read "
                                 f"({reviews_error or 'no reason given'}) — the verdict count is "
                                 f"unknown, never guessed")
+            if not head:
+                blockers.append("PR head missing or malformed — no gate can authorize a run")
             if pr.get("draft"):
                 blockers.append("draft PR: the reviewer gate stays silent until ready_for_review")
             if base and base != loop["base"]:
@@ -444,17 +479,25 @@ def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> di
                 blockers.append(f"escalated: the PR is parked awaiting adjudication at head "
                                 f"{str(marker.get('head') or '?')[:7]} since "
                                 f"{marker.get('at') or 'an unrecorded time'}")
+            elif pending_delivery:
+                blockers.append(f"adjudicator delivery pending at head {short} — no ruling is "
+                                "promised until the route acknowledges delivery")
             elif spent is not None and spent >= cap:
                 blockers.append(f"{spent}/{cap} verdicts spent with no approval and no escalation "
                                 f"marker — the cap may not have fired (the watchdog reports this "
                                 f"shape too)")
             if queued_seat:
                 blockers.append(f"no capacity: queued with the {queued_seat} seat — {queued_reason}")
-            if reviewed and not at_head and not approved:
-                blockers.append(f"the reviewer left a review at head {short} with state "
-                                f"{'/'.join(head_states) or 'unrecorded'} and no verdict — a round "
-                                f"is consumed by changes-requested, and only an approval ends the "
-                                f"loop, so both gates stay silent")
+            elif full_seat:
+                blockers.append(f"no capacity: {needed_seat} seat at capacity {used}/{limit} "
+                                "on other PRs — this PR has no queue entry yet")
+            blockers.extend(local["stale_queues"])
+            for seat in sorted(stale_held):
+                blockers.append(f"{seat} lock targets an older head, not current head {short} "
+                                "— it cannot authorize a verdict or push at this head")
+            if head_states and not reviewed:
+                blockers.append(f"non-verdict review at head {short} ({'/'.join(head_states)}) "
+                                "does not suppress a fresh reviewer request")
             if at_head and "fixer" not in held and not inflight_fix and not queued_seat:
                 blockers.append(f"the changes-requested verdict at head {short} has no fix run out "
                                 f"— the fixer gate did not start one for that delivery")
@@ -485,7 +528,11 @@ def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> di
     elif armed is False:
         kind = "rearm"
         action = (f"re-arm the loop — hermes review-loop arm --loop {loop['id']} — no event can "
-                  f"reach a seat while the repo hooks are inactive")
+                  f"reach both seats while a repo hook is missing or inactive")
+    elif not head:
+        kind = "retry"
+        action = (f"retry the PR read for {repo}#{number} — its head is missing or malformed; "
+                  "no review can be requested without a known head")
     elif pr.get("draft"):
         kind = "ready"
         action = ("mark the PR ready for review (the ready_for_review event) — the reviewer gate "
@@ -506,9 +553,37 @@ def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> di
     elif approved:
         kind = "none"
         action = f"nothing — head {short} is approved; a human merges it"
-    elif parked or (spent is not None and spent >= cap):
+    elif pending_delivery and not (loop.get("adjudicator") or {}).get("route"):
         kind = "adjudication"
         action = _adjudication_next(loop, head)
+    elif pending_delivery:
+        kind = "retry"
+        action = (f"retry adjudicator delivery for head {short} on the next armed watchdog sweep "
+                  "after checking the current head and review cap — no ruling is underway yet")
+    elif parked:
+        kind = "adjudication"
+        action = _adjudication_next(loop, head)
+    elif spent is not None and spent >= cap:
+        if not (loop.get("adjudicator") or {}).get("route"):
+            kind = "adjudication"
+            action = _adjudication_next(loop, head)
+        else:
+            kind = "retry"
+            action = (f"re-deliver the {'changes-requested review' if at_head else 'review request'} "
+                      f"event for head {short} to the {'fixer' if at_head else 'reviewer'} gate "
+                      "to create and deliver the missing breach marker — no ruling is underway yet")
+    elif stale_held == {"reviewer"} and at_head:
+        kind = "fixer-retry"
+        action = (f"re-deliver the changes-requested review event for head {short} to the fixer gate "
+                  "— that verdict hands off the PR and releases the stale reviewer lock")
+    elif stale_held == {"fixer"} and request_pending:
+        kind = "retry"
+        action = (f"re-deliver the review_requested event for head {short} to the reviewer gate "
+                  "— that request hands off the PR and releases the stale fixer lock")
+    elif stale_held:
+        kind = "release"
+        action = (f"release or wait for the stale {', '.join(sorted(stale_held))} lock to expire "
+                  f"before re-driving the current head {short}; an old-head run cannot finish it")
     elif "reviewer" in held and not at_head:
         kind = "review-verdict"
         action = (f"the reviewer's verdict at head {short} "
@@ -521,6 +596,12 @@ def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> di
         kind = "release"
         action = (f"a {queued_seat} slot frees — the queued run starts then (a verdict or a handoff "
                   f"ends the run holding it; the lock expiry at {loop['ttl_min']}m is the backstop)")
+    elif full_seat:
+        kind = "retry"
+        action = (f"re-deliver the {'changes-requested review' if at_head else 'review_requested'} "
+                  f"event for head {short} now — the {needed_seat} gate will queue it at "
+                  f"capacity {used}/{limit}; a {needed_seat} slot on another PR freeing then "
+                  "starts the queued run")
     elif inflight_review:
         kind = "review-verdict"
         action = (f"the reviewer's verdict at head {short} (round {(spent or 0) + 1} of {cap}) — a "
@@ -530,18 +611,14 @@ def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> di
         action = (f"the fixer pushes a fix and re-requests review of head {short} — a fix run for "
                   f"this head is already marked in flight")
     elif at_head:
-        kind = "fixer-push"
-        action = (f"the fixer pushes a fix and re-requests review of head {short}: gh api -X POST "
-                  f"repos/{repo}/pulls/{number}/requested_reviewers -f "
-                  f"'reviewers[]={loop['reviewer_seat']}' — the verdict landed and no fix run is out")
-    elif reviewed:
-        kind = "review-verdict"
-        action = (f"the reviewer posts a verdict at head {short} (approve or changes-requested) — a "
-                  f"review that is neither leaves both gates waiting on each other")
+        kind = "fixer-retry"
+        action = (f"re-deliver the changes-requested review event for head {short} to the fixer gate "
+                  "after checking why its run did not start — no fixer is running to push a fix")
     elif request_pending:
-        kind = "review-verdict"
-        action = (f"the reviewer's verdict at head {short} — the request for "
-                  f"{loop['reviewer_seat']} is pending and no review run is out")
+        kind = "retry"
+        action = (f"re-deliver the review_requested event for head {short} to the reviewer gate "
+                  f"after checking why the pending request for {loop['reviewer_seat']} did not "
+                  "start a run — no verdict can arrive without one")
     else:
         kind = "review-request"
         detail = ("a fresh PR also wakes the reviewer on opened / ready_for_review, so re-driving "
@@ -723,7 +800,8 @@ def take_seat(loop: dict, st: state_mod.LoopState, seat: str, number: int, head:
         silence(f"the {other} seat is working this PR — queued until it hands off")
 
     live = st.active(seat)
-    if len(live) >= capacity:
+    used, limit = seat_capacity(loop, st, seat)
+    if used >= limit:
         held = ", ".join(f"{k} ({int(time.time() - v.get('at', time.time()))}s)"
                          for k, v in sorted(live.items()))
         st.queue_add(seat, key, head, pr_url(loop, number),

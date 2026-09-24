@@ -186,7 +186,7 @@ def retry_pending_breaches(loop: dict, st: state_mod.LoopState, prs: list) -> No
         if type(number) is not int or not head:
             continue
         marker = markers.get(f"{loop['repo']}#{number}")
-        if (not isinstance(marker, dict) or marker.get("status") != "delivery-pending"
+        if (not isinstance(marker, dict) or gate.breach_delivery_status(marker, head) != "delivery-pending"
                 or marker.get("head") != head):
             continue
         reviews = gh.reviews(loop, number)
@@ -296,7 +296,7 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
         at_head = gate.changes_at_head(reviews, loop, head)
         changes = gate.verdicts(reviews, loop)
         marker = breach.get(f"{loop['repo']}#{number}") or {}
-        if marker.get("head") == head and marker.get("status") == "delivery-pending":
+        if gate.breach_delivery_status(marker, head) == "delivery-pending":
             continue  # failed delivery is not a silent stall
         observed_at = current_heads[str(number)]["observed_at"]
         head_postdates_arming = TEST or observed_at is not None
