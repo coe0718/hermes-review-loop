@@ -430,7 +430,10 @@ def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> di
     inflight_review = local["inflight_review"]
     inflight_fix = local["inflight_fix"]
     marker = local["marker"]
-    parked = local["parked"]
+    # A marker records a past escalation, not a permanent veto. A dismissed
+    # verdict can lower the live count, and the reviewer gate then starts a new
+    # review even when the marker still says awaiting-adjudication/adjudicating.
+    parked = local["parked"] and spent is not None and spent >= cap
     # A dismissed verdict can lower the live count after a failed POST. The
     # watchdog only retries a pending marker while the cap remains spent.
     pending_delivery = (local["delivery_status"] == "delivery-pending"

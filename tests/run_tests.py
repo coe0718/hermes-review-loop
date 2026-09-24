@@ -1982,6 +1982,37 @@ def group_explain() -> None:
     check("old marker does not park new head", gate.breach_delivery_status(
           {"head": HEAD_A, "status": "awaiting-adjudication"}, HEAD_B), "")
 
+    # The third verdict was dismissed after escalation. Its historical marker
+    # remains on this head, but the live gate can start round three again.
+    for status in ("awaiting-adjudication", "adjudicating"):
+        reset(prs={"7": {**pr(7, head=HEAD_B, requested=SEAT),
+                         "reviews": [*spent_reviews[:-1],
+                                     review(REVIEWER, state="dismissed", head="e" * 40,
+                                            rid=3)]}})
+        state_file("breach.json").write_text(json.dumps(
+            {f"{REPO}#7": {"pr": 7, "head": HEAD_B, "rounds": 3, "cap": 3,
+                            "at": PAST, "status": status, "reason": "review cap reached"}}))
+        report = gate.explain(config.load_id("widgets"),
+                              state_mod.state_for(config.load_id("widgets")), 7,
+                              {"pr": pr(7, head=HEAD_B, requested=SEAT),
+                               "reviews": DATA["world"]["prs"]["7"]["reviews"],
+                               "armed": True})
+        check(f"dismissed third verdict / {status}: live count", report["spent"], 2)
+        check(f"dismissed third verdict / {status}: no parked blocker",
+              any("parked awaiting adjudication" in b for b in report["blockers"]), False)
+        check(f"dismissed third verdict / {status}: explain asks for gate replay",
+              (report["next"]["kind"],
+               "re-deliver the review_requested event" in report["next"]["action"]),
+              ("retry", True))
+        check(f"dismissed third verdict / {status}: marker stays diagnostic",
+              report["escalation"].startswith(f"{status} at head bbbbbbb"), True)
+        outcome, output, error = run("gate_reviewer.py",
+                                     pr_payload(head=HEAD_B),
+                                     extra_env={"REVIEW_LOOP_TEST": "1"})
+        check(f"dismissed third verdict / {status}: reviewer gate starts round three",
+              (outcome, json.loads(output).get("_loop", {}).get("round")
+               if outcome == "FIRE" else error), ("FIRE", 3))
+
     reset(prs={"7": {**pr(7, head=HEAD_B), "reviews": spent_reviews}})
     rc, out = explain()
     check("cap spent with no marker: the gate never fired", "no escalation marker" in out, True)
