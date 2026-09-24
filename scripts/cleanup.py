@@ -268,33 +268,36 @@ def clear_state(loop: dict, number: int, quiet: bool) -> list[str]:
     st = state_mod.state_for(loop)
     key = f"{loop['repo']}#{number}"
     cleared: list[str] = []
-    for path in (st.locks, st.pending, st.inflight_file, st.breach):
-        data = st._load(path, {}) or {}
-        if not isinstance(data, dict):
-            continue
-        before = json.dumps(data, sort_keys=True)
-        data.pop(key, None)
-        if path == st.inflight_file:
-            # Marks are role:PR:SHA; require exact fields, not a string prefix.
-            for mark in list(data):
-                if not isinstance(mark, str):
+    # The same locks the gates take: a gate claiming a seat between our read and our write
+    # would otherwise be erased by this rewrite.
+    with st.locked(), st._breach_lock():
+        for path in (st.locks, st.pending, st.inflight_file, st.breach):
+            data = st._load(path, {}) or {}
+            if not isinstance(data, dict):
+                continue
+            before = json.dumps(data, sort_keys=True)
+            data.pop(key, None)
+            if path == st.inflight_file:
+                # Marks are role:PR:SHA; require exact fields, not a string prefix.
+                for mark in list(data):
+                    if not isinstance(mark, str):
+                        continue
+                    parts = mark.split(":")
+                    if (len(parts) == 3 and parts[0] in ("review", "fix")
+                            and parts[1] == str(number) and parts[2]):
+                        data.pop(mark)
+            for seat, entry in list(data.items()):
+                if not isinstance(entry, dict):
                     continue
-                parts = mark.split(":")
-                if (len(parts) == 3 and parts[0] in ("review", "fix")
-                        and parts[1] == str(number) and parts[2]):
-                    data.pop(mark)
-        for seat, entry in list(data.items()):
-            if not isinstance(entry, dict):
-                continue
-            if entry.get("key") == key:              # a seat lock holding this PR
-                data.pop(seat, None)
-                continue
-            entry.pop(key, None)                     # a queue keyed by PR
-            if not entry:
-                data.pop(seat, None)
-        if json.dumps(data, sort_keys=True) != before:
-            st._save(path, data)
-            cleared.append(path.name)
+                if entry.get("key") == key:              # a seat lock holding this PR
+                    data.pop(seat, None)
+                    continue
+                entry.pop(key, None)                     # a queue keyed by PR
+                if not entry:
+                    data.pop(seat, None)
+            if json.dumps(data, sort_keys=True) != before:
+                st._save(path, data)
+                cleared.append(path.name)
     if cleared:
         log(f"    state cleared: {', '.join(cleared)}", quiet)
     return cleared

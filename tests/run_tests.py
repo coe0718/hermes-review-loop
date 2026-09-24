@@ -4443,6 +4443,64 @@ def group_doctor() -> None:
     check("an unknown loop is refused", rc, 2)
     check("  with the reason", "cannot preflight loop" in out, True)
 
+STATE_RACE_CHILD = r"""
+import json, os, sys, time
+sys.path.insert(0, os.environ["ROOT"])
+from review_loop import config, gate, isolation, state
+loop = config.load_id("widgets")
+st = state.state_for(loop)
+mode, who = sys.argv[1], int(sys.argv[2])
+if mode == "acquire":
+    for i in range(50):
+        st.acquire("reviewer", f"acme/widgets#{who * 1000 + i}", "h", "race")
+        st.queue_add("fixer", f"acme/widgets#{who * 1000 + i}", "h", "u", "race")
+        st.inflight(f"review:{who * 1000 + i}:h", record=True)
+else:
+    # Widen the window between the capacity read and the claim, as a slow disk would.
+    read = gate.seat_capacity
+    def slow(*a, **k):
+        out = read(*a, **k)
+        time.sleep(0.2)
+        return out
+    gate.seat_capacity = slow
+    isolation.ensure = lambda *a, **k: None
+    try:
+        gate.take_seat(loop, st, "reviewer", 100 + who, "h", "race")
+        print("CLAIMED")
+    except SystemExit:
+        print("QUEUED")
+"""
+
+
+def group_state_race() -> None:
+    section("state — concurrent gates never lose each other's entries")
+    reset(prs={})
+    script = TMP / "state_race_child.py"
+    script.write_text(STATE_RACE_CHILD)
+    child_env = {**env(), "ROOT": str(ROOT)}
+
+    def spawn(mode: str, n: int) -> list[str]:
+        procs = [subprocess.Popen([sys.executable, str(script), mode, str(i)], env=child_env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                 for i in range(n)]
+        return [proc.communicate(timeout=180)[0].strip().rsplit("\n", 1)[-1] for proc in procs]
+
+    spawn("acquire", 4)
+    check("4 procs x 50 acquires keep every seat lock",
+          len(load_state("locks.json").get("reviewer") or {}), 200)
+    check("  and every queue entry", len(load_state("pending.json").get("fixer") or {}), 200)
+    check("  and every in-flight mark", len(load_state("inflight.json")), 200)
+    check("  and no temp file is left behind",
+          sorted(p.name for p in STATE_DIR.iterdir() if p.name.startswith(".")), [])
+
+    for name in ("locks.json", "pending.json", "inflight.json"):
+        state_file(name).unlink()
+    outcomes = spawn("claim", 4)
+    check("concurrent take_seat at capacity 1 claims once", outcomes.count("CLAIMED"), 1)
+    check("  the rest are queued", outcomes.count("QUEUED"), 3)
+    check("  and the ledger holds one run", len(load_state("locks.json").get("reviewer") or {}), 1)
+
+
 def group_reconciliation() -> None:
     section("seat reconciliation — route, hook and config rollback")
     test = subprocess.run([sys.executable, str(ROOT / "tests" / "test_reconciliation.py")],
@@ -4460,7 +4518,7 @@ GROUPS = {"routes": group_routes, "config": group_config, "reviewer": group_revi
           "plugin_settings": group_plugin_settings, "seat_identity": group_seat_identity,
           "watchdog": group_watchdog, "explain": group_explain,
           "cleanup": group_cleanup, "doctor": group_doctor,
-          "reconciliation": group_reconciliation,
+          "reconciliation": group_reconciliation, "state_race": group_state_race,
            "observer": group_observer, "observer_safety": group_observer_safety,
            "observer_cli": group_observer_cli}
 

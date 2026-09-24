@@ -12,6 +12,11 @@ Two rules the shapes below encode:
   because a crashed run must not wedge a loop forever.
 * **One wake per head.** Every marker is keyed by PR *and* head sha: a new commit is a new
   situation, the same commit is not.
+
+Every file is written atomically (temp file, fsync, ``os.replace``) and every read-modify-write
+of the ledger, the queue and the in-flight marks happens under one per-loop ``flock``. Gates run
+as separate processes per webhook; without both, a reader could see a half-written file, fall
+back to ``{}``, and the next save would silently drop every other PR's claim.
 """
 
 from __future__ import annotations
@@ -22,12 +27,39 @@ import json
 import os
 import pathlib
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import Callable
 
 from . import config
 from .util import log
+
+# Per-thread depth of the state lock we already hold, keyed by lock path. ``flock`` is tied to
+# the open file description, so a second ``open`` + ``flock`` in the same thread would deadlock
+# against itself; nested sections (``take_seat`` queueing under its own claim) reuse the outer one.
+_HELD = threading.local()
+
+
+def _atomic_write(path: pathlib.Path, data) -> None:
+    """Publish ``data`` to ``path`` whole or not at all, and durably before returning."""
+    name = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=f".{path.stem}-",
+                                         delete=False) as file:
+            name = file.name
+            json.dump(data, file, indent=2)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(name, path)
+        directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if name and os.path.exists(name):
+            os.unlink(name)
 
 
 class LoopState:
@@ -53,9 +85,41 @@ class LoopState:
     def _save(self, path: pathlib.Path, data) -> None:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(data, indent=2))
+            _atomic_write(path, data)
         except Exception as exc:
             log(f"state write failed ({path.name}): {exc}")
+
+    @contextlib.contextmanager
+    def locked(self):
+        """Hold the loop's state lock across a read-modify-write of locks/pending/inflight.
+
+        One lock for all three files, because the gate's claim spans them (check the ledger,
+        write the ledger, drop the queue entry) and must be one step to every other process.
+        Reentrant within a thread, so a locked caller can use the ordinary methods.
+        """
+        path = str(self.dir / "state.lock")
+        held = getattr(_HELD, "paths", None)
+        if held is None:
+            held = _HELD.paths = {}
+        if held.get(path):
+            held[path] += 1
+            try:
+                yield
+            finally:
+                held[path] -= 1
+            return
+        self.dir.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            held[path] = 1
+            try:
+                yield
+            finally:
+                held.pop(path, None)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
     def note(self, message: str) -> None:
         try:
@@ -86,16 +150,17 @@ class LoopState:
         The ledger is per *seat* and keyed by PR, because isolation is per *PR*: two PRs may run
         at once when ``concurrency`` allows it, but the same PR never runs twice.
         """
-        data = self._load(self.locks, {}) or {}
-        entries = data.get(seat) or {}
-        live = self.live_locks(seat)
-        if live != entries:
-            if live:
-                data[seat] = live
-            else:
-                data.pop(seat, None)
-            self._save(self.locks, data)
-        return live
+        with self.locked():
+            data = self._load(self.locks, {}) or {}
+            entries = data.get(seat) or {}
+            live = self.live_locks(seat)
+            if live != entries:
+                if live:
+                    data[seat] = live
+                else:
+                    data.pop(seat, None)
+                self._save(self.locks, data)
+            return live
 
     def active_count(self, seat: str) -> int:
         return len(self.active(seat))
@@ -120,34 +185,38 @@ class LoopState:
         return None
 
     def acquire(self, seat: str, key: str, head: str = "", why: str = "") -> None:
-        data = self._load(self.locks, {}) or {}
-        data.setdefault(seat, {})[key] = {"at": time.time(), "head": head, "why": why}
-        self._save(self.locks, data)
+        with self.locked():
+            data = self._load(self.locks, {}) or {}
+            data.setdefault(seat, {})[key] = {"at": time.time(), "head": head, "why": why}
+            self._save(self.locks, data)
 
     def release_if(self, seat: str, key: str) -> bool:
         """Free a seat only for *this* PR's turn — never another PR's in-flight work."""
-        data = self._load(self.locks, {}) or {}
-        if (data.get(seat) or {}).pop(key, None) is None:
-            return False
-        if not data[seat]:
-            data.pop(seat, None)
-        self._save(self.locks, data)
-        return True
+        with self.locked():
+            data = self._load(self.locks, {}) or {}
+            if (data.get(seat) or {}).pop(key, None) is None:
+                return False
+            if not data[seat]:
+                data.pop(seat, None)
+            self._save(self.locks, data)
+            return True
 
     def release_all(self, seat: str) -> int:
-        data = self._load(self.locks, {}) or {}
-        count = len(data.pop(seat, {}) or {})
-        if count:
-            self._save(self.locks, data)
-        return count
+        with self.locked():
+            data = self._load(self.locks, {}) or {}
+            count = len(data.pop(seat, {}) or {})
+            if count:
+                self._save(self.locks, data)
+            return count
 
     # -- queue --------------------------------------------------------------
 
     def queue_add(self, seat: str, key: str, head: str, url: str, reason: str) -> None:
-        data = self._load(self.pending, {}) or {}
-        data.setdefault(seat, {})[key] = {"at": time.time(), "head": head, "url": url,
-                                          "reason": reason}
-        self._save(self.pending, data)
+        with self.locked():
+            data = self._load(self.pending, {}) or {}
+            data.setdefault(seat, {})[key] = {"at": time.time(), "head": head, "url": url,
+                                              "reason": reason}
+            self._save(self.pending, data)
 
     def queue_items(self, seat: str) -> dict:
         return (self._load(self.pending, {}) or {}).get(seat) or {}
@@ -156,12 +225,13 @@ class LoopState:
         return self._load(self.pending, {}) or {}
 
     def queue_pop(self, seat: str, key: str) -> None:
-        data = self._load(self.pending, {}) or {}
-        items = data.get(seat) or {}
-        if items.pop(key, None) is not None:
-            if not items:
-                data.pop(seat, None)
-            self._save(self.pending, data)
+        with self.locked():
+            data = self._load(self.pending, {}) or {}
+            items = data.get(seat) or {}
+            if items.pop(key, None) is not None:
+                if not items:
+                    data.pop(seat, None)
+                self._save(self.pending, data)
 
     # -- in-flight marks ----------------------------------------------------
 
@@ -171,13 +241,15 @@ class LoopState:
         Guards the burst the platform cannot see: several events for the same head arriving
         before the first verdict lands. TTL-bounded so a crashed run cannot wedge the head.
         """
-        data = self._load(self.inflight_file, {}) or {}
         now = time.time()
         if record:
-            data[key] = now
-            data = {k: v for k, v in data.items() if now - v < 24 * 3600}
-            self._save(self.inflight_file, data)
+            with self.locked():
+                data = self._load(self.inflight_file, {}) or {}
+                data[key] = now
+                data = {k: v for k, v in data.items() if now - v < 24 * 3600}
+                self._save(self.inflight_file, data)
             return False
+        data = self._load(self.inflight_file, {}) or {}
         return now - data.get(key, 0) < self.loop["inflight_ttl_min"] * 60
 
     def inflight_at(self, key: str) -> float:
@@ -202,24 +274,11 @@ class LoopState:
             os.close(fd)
 
     def _breach_save(self, data: dict) -> None:
-        """Persist a claim before releasing the lock or allowing the route to fire."""
-        name = None
-        try:
-            with tempfile.NamedTemporaryFile(mode="w", dir=self.dir, prefix=".breach-",
-                                             delete=False) as file:
-                name = file.name
-                json.dump(data, file, indent=2)
-                file.flush()
-                os.fsync(file.fileno())
-            os.replace(name, self.breach)
-            directory = os.open(self.dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
-        finally:
-            if name and os.path.exists(name):
-                os.unlink(name)
+        """Persist a claim before releasing the lock or allowing the route to fire.
+
+        Unlike ``_save`` this raises: a breach claim that did not reach disk must not fire.
+        """
+        _atomic_write(self.breach, data)
 
     def breach_get(self, number: int) -> dict:
         return (self._load(self.breach, {}) or {}).get(f"{self.loop['repo']}#{number}") or {}
