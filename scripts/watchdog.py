@@ -190,7 +190,10 @@ def retry_pending_breaches(loop: dict, st: state_mod.LoopState, prs: list) -> No
                 or marker.get("head") != head):
             continue
         reviews = gh.reviews(loop, number)
-        if not isinstance(reviews, list) or gate.approved_at_head(reviews, loop, head):
+        if not isinstance(reviews, list):
+            continue
+        latest = gate.latest_effective_review_at_head(reviews, loop, head)
+        if latest is not None and gh.review_state(latest) == "APPROVED":
             continue
         changes = gate.verdicts(reviews, loop)
         if len(changes) >= loop["cap"]:
@@ -265,6 +268,9 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
     if first_sweep:
         st.note("loop observed armed — head snapshot set; existing heads excluded")
         drain_queued(loop, st, lines)
+        if observer.retry(loop, st):
+            log("observer: retried an undelivered notice")
+        observer.flush(loop, st, wait_s=0 if TEST else observer.digest_wait(loop))
         return lines
 
     grace = 0.0 if TEST else loop["grace_min"]
@@ -290,10 +296,13 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
         reviews = gh.reviews(loop, number)
         if not isinstance(reviews, list):
             continue                              # unknown beats wrong
-        if gate.approved_at_head(reviews, loop, head):
+        latest = gate.latest_effective_review_at_head(reviews, loop, head)
+        if latest is not None and gh.review_state(latest) == "APPROVED":
             continue                              # approved at this head: the loop is done here
 
-        at_head = gate.changes_at_head(reviews, loop, head)
+        at_head = (gate.changes_at_head(reviews, loop, head)
+                   if latest is not None and gh.review_state(latest) == "CHANGES_REQUESTED"
+                   else [])
         changes = gate.verdicts(reviews, loop)
         marker = breach.get(f"{loop['repo']}#{number}") or {}
         if gate.breach_delivery_status(marker, head) == "delivery-pending":

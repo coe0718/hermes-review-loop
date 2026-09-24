@@ -689,6 +689,10 @@ def cmd_init(args) -> int:
         print(f"refused: loop {loop['id']!r} already exists; use `hermes review-loop set` "
               "to change it without losing observer destination/receipt bindings")
         return 2
+    observer_name = (loop.get("observer") or {}).get("route")
+    if observer_name and routes.route(observer_name):
+        print(f"refused: route {observer_name!r} already exists and is not this observer's route")
+        return 2
     previous_config = None
     previous_routes = {name: routes.route(name) for name in _routes_of(loop).values()}
     try:

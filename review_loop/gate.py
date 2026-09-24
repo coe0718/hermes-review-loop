@@ -371,13 +371,13 @@ def _explain_hooks(armed, armed_error: str) -> str:
 def explain_facts(loop: dict, number: int) -> dict:
     """Everything ``explain`` reasons about, read once, with the reason any read failed.
 
-    Read-only by construction: three GETs, and a state directory that is only ever opened for
+    Read-only by construction: PR/review/hook GETs, and a state directory that is only ever opened for
     reading (``live_locks``, ``inflight_at`` and ``queue_items`` never persist their pruning).
     """
     pr, pr_error = gh.fetch(loop, gh.pr_path(loop, number))
     if pr is None and (pr_error == "HTTP 404" or pr_error.startswith("HTTP 404 ")):
         pr_error = ""  # GitHub hides inaccessible resources behind 404 as well.
-    reviews, reviews_error = gh.fetch(loop, gh.reviews_path(loop, number))
+    reviews, reviews_error = gh.reviews_read(loop, number)
     armed, armed_error = hooks_read(loop)
     return {"pr": pr, "pr_error": pr_error, "reviews": reviews, "reviews_error": reviews_error,
             "armed": armed, "armed_error": armed_error, "read_at": time.time()}
@@ -427,9 +427,12 @@ def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> di
     if reviews is not None:
         spent = len(verdicts(reviews, loop))
         if head:
-            changes = changes_at_head(reviews, loop, head)
+            latest = latest_effective_review_at_head(reviews, loop, head)
+            changes = (changes_at_head(reviews, loop, head)
+                       if latest is not None and gh.review_state(latest) == "CHANGES_REQUESTED"
+                       else [])
             at_head = len(changes)
-            approved = approved_at_head(reviews, loop, head)
+            approved = latest is not None and gh.review_state(latest) == "APPROVED"
             reviewed = reviewed_at_head(reviews, loop, head)
             head_states = sorted({gh.review_state(r) for r in reviews_at_head(reviews, loop, head)})
 

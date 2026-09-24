@@ -27,6 +27,9 @@ import urllib.request
 from .util import log
 
 API = "https://api.github.com"
+REVIEW_PAGE_SIZE = 100
+# A persistently full endpoint must not loop forever or authorize a partial history.
+MAX_REVIEW_PAGES = 100
 
 
 class GitHubError(Exception):
@@ -149,8 +152,33 @@ def pr_url(loop: dict, number: int) -> str:
     return f"https://github.com/{loop['repo']}/pull/{number}"
 
 
+def reviews_read(loop: dict, number: int) -> tuple[list[dict] | None, str]:
+    """Read the entire review history, or return unknown without partial results.
+
+    A full page does not prove it is the last page. The first path remains unchanged for
+    existing API stubs; subsequent pages use GitHub's ordinary page query parameter.
+    """
+    path = reviews_path(loop, number)
+    result: list[dict] = []
+    for page in range(1, MAX_REVIEW_PAGES + 1):
+        page_path = path if page == 1 else f"{path}&page={page}"
+        items, error = fetch(loop, page_path)
+        if error:
+            return None, f"review page {page}: {error}"
+        if not isinstance(items, list) or len(items) > REVIEW_PAGE_SIZE or not all(
+                isinstance(item, dict) for item in items):
+            return None, f"review page {page}: invalid review list"
+        result.extend(items)
+        if len(items) < REVIEW_PAGE_SIZE:
+            return result, ""
+    return None, f"review history exceeds {MAX_REVIEW_PAGES} full pages"
+
+
 def reviews(loop: dict, number: int):
-    return api(loop, reviews_path(loop, number))
+    result, error = reviews_read(loop, number)
+    if error:
+        log(f"gh GET {reviews_path(loop, number)} failed: {error}")
+    return result
 
 
 def open_prs(loop: dict):
