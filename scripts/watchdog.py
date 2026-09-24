@@ -197,15 +197,21 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
             continue
 
         reviews = gh.reviews(loop, number)
-        if reviews is None:
+        if not isinstance(reviews, list):
             continue                              # unknown beats wrong
-        reviews = reviews if isinstance(reviews, list) else []
         if gate.approved_at_head(reviews, loop, head):
             continue                              # approved at this head: the loop is done here
 
         at_head = gate.changes_at_head(reviews, loop, head)
         changes = gate.verdicts(reviews, loop)
         marker = breach.get(f"{loop['repo']}#{number}") or {}
+        if (marker.get("head") == head and marker.get("status") == "delivery-pending"
+                and len(changes) >= loop["cap"]):
+            # The original POST failed (or the sender crashed). A sweep can
+            # recover without relying on GitHub redelivering the cap event.
+            gate.breach(loop, st, number, head, marker.get("rounds", len(changes)),
+                        marker.get("reason", "review cap reached"))
+            marker = st.breach_get(number)
         pushed_epoch = gh.commit_epoch(loop, head)
         head_postdates_arming = TEST or pushed_epoch > armed_since
         kind = ""
@@ -255,8 +261,8 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
         if stuck:
             lines.append(f"⚠️ Review loop {header} — {len(stuck)} stuck state(s):")
             lines.extend(stuck)
-        lines.append("Nothing here is retrying itself. Check the gateway log for the run, or "
-                     "re-drive the route by hand.")
+        lines.append("Pending adjudicator delivery retries on the next sweep; other stalls "
+                     "need investigation. Check the gateway log before re-driving a route.")
         for seat in ("reviewer", "fixer"):
             if drain(loop, st, seat, quiet=True):
                 lines.append(f"started the queued {seat} run whose wait was over")

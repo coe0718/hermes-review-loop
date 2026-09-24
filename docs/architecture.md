@@ -129,10 +129,13 @@ turns; the third `changes_requested` escalates.
 
 ## Escalation
 
-When the cap is spent, the gate writes a breach marker (keyed by PR *and* head) and POSTs at the
-adjudicator route — a route bound to the adjudicator's own profile, so the ruling happens as the
-adjudicator and not as the seat that just went quiet. One wake per head: a PR parked at sha X stays
-parked, so repeated events cannot spawn a ruling each time.
+When the cap is spent, the gate verifies the live PR head, writes a durable `delivery-pending`
+breach marker, and POSTs at the adjudicator route under a cross-process lock. A successful 2xx
+promotes it to `awaiting-adjudication`; a failed delivery remains pending for a later event or
+watchdog sweep to retry. The route is bound to the adjudicator's own profile, not the seat that
+went quiet. One accepted wake per head: repeated events cannot spawn a second ruling, and a late
+event for an older head cannot replace the current marker. After an ambiguous transport timeout,
+a retry may deliver another POST, but the adjudicator gate atomically claims only one run per head.
 
 The adjudicator is told to read both positions, rule with a reason, post the ruling on the PR, and
 **not** merge or push. The operator is the veto, not the reviewer — overriding a ruling should cost
@@ -149,7 +152,8 @@ seen armed (`armed_since`, which is what keeps a loop's history out of its alert
 4. the cap is spent at this head with no approval and no escalation marker — i.e. *the gate did not
    fire*, which is the failure the loop cannot see about itself.
 
-It also reports stuck seats (a lock older than a run could plausibly live, a request waiting past
+It also retries pending adjudicator deliveries for current heads with a verified spent cap and
+reports stuck seats (a lock older than a run could plausibly live, a request waiting past
 the grace period) and drains the queue when it can be proven safe: the seat is free, the PR is still
 open, the head has not moved, and the verdict has not already landed. A drain that fails these
 checks drops the entry instead of firing — a stale queue entry must die quietly, not start a run

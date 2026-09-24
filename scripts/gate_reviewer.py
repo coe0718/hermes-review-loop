@@ -25,7 +25,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from review_loop import gate  # noqa: E402
+from review_loop import gate, gh  # noqa: E402
 from review_loop.util import log, silence  # noqa: E402
 
 ACTIONS = {"opened", "ready_for_review", "reopened", "review_requested"}
@@ -66,6 +66,16 @@ def main() -> None:
     seat = "reviewer"
     number = gate.number_of(payload, pr)
     head = gate.head_of(pr)
+    if action == "review_requested":
+        current = gh.pr(loop, number)
+        if (not isinstance(current, dict) or current.get("number") != number
+                or current.get("state") != "open"
+                or (current.get("head") or {}).get("sha") != head):
+            silence("review request is stale or current PR is unavailable")
+        # Eligibility must be judged against current facts, not only the old snapshot.
+        if (current.get("draft") or (current.get("base") or {}).get("ref") != loop["base"]
+                or ((current.get("user") or {}).get("login") or "").lower() not in loop["fixers"]):
+            silence("current PR is no longer eligible for this review")
 
     reviews = gate.fetch_reviews(loop, number)
     if gate.reviewed_at_head(reviews, loop, head):
