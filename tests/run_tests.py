@@ -446,6 +446,24 @@ def group_reviewer_gate() -> None:
     check("unreadable review list → silent (never guess)", kind, "SILENT")
     check("  and it says why", "unavailable" in err or "not guessing" in err, True)
 
+    # A syntactically valid but wrong-shaped API response is still an unknown
+    # round count. It must not release an already occupied reviewer seat.
+    reset(prs={"7": {**pr(7), "reviews": {"message": "bad response"}}})
+    state_file("locks.json").write_text(json.dumps({"fixer": {
+        f"{REPO}#7": {"at": time.time(), "head": HEAD_A}}}))
+    check("object review list fails closed", run("gate_reviewer.py", pr_payload())[0], "SILENT")
+    check("  malformed list keeps fixer seat", f"{REPO}#7" in
+          load_state("locks.json").get("fixer", {}), True)
+    check("  malformed list never claims reviewer seat",
+          load_state("locks.json").get("reviewer", {}), {})
+    reset(prs={"7": {**pr(7), "reviews": {"message": "bad response"}}})
+    state_file("locks.json").write_text(json.dumps({"reviewer": {
+        f"{REPO}#7": {"at": time.time(), "head": HEAD_A}}}))
+    check("fixer refuses malformed review list",
+          run("gate_fixer.py", review_payload())[0], "SILENT")
+    check("  malformed list keeps reviewer seat", f"{REPO}#7" in
+          load_state("locks.json").get("reviewer", {}), True)
+
 
 def group_settings() -> None:
     """`hermes review-loop set` — changing the knobs without hand-editing JSON."""
@@ -690,6 +708,66 @@ def group_adjudicator() -> None:
     route = json.loads(SUBS.read_text())["widgets-breach"]
     check("fixer-triggered breach reaches ruling run", run(route["script"], json.loads(wake["body"]))[0],
           "FIRE")
+
+    section("adjudicator — failed delivery retries and delayed heads cannot regress")
+    reviews = [review(REVIEWER, head=ch * 40, rid=i) for i, ch in enumerate("cde", 1)]
+    reset(prs={"7": {**pr(7, head=HEAD_A), "reviews": reviews}})
+    # Refuse the first POST at the transport layer; the marker must stay
+    # retryable rather than pretending the adjudicator received it.
+    cfg = json.loads((LOOPS_DIR / "widgets.json").read_text())
+    cfg["host"] = "http://127.0.0.1:9"
+    (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
+    check("failed POST leaves gate silent", run("gate_reviewer.py", pr_payload())[0], "SILENT")
+    check("failed POST leaves retryable marker",
+          load_state("breach.json")[f"{REPO}#7"].get("status"), "delivery-pending")
+    check("failed POST delivered nothing", len(RECEIVED), 0)
+    cfg["host"] = HOST
+    (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
+    before = len(RECEIVED)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(lambda _: run("gate_reviewer.py", pr_payload())[0], range(4)))
+    check("concurrent recovery delivers exactly once", len(RECEIVED) - before, 1)
+    check("recovered marker is claimable", run(route["script"],
+          json.loads(RECEIVED[-1]["body"]))[0], "FIRE")
+
+    # B is the current head and has been escalated. An A event arriving late
+    # cannot replace its marker or send a second POST for stale A.
+    set_prs({"7": {**pr(7, head=HEAD_B), "reviews": reviews}})
+    run("gate_reviewer.py", pr_payload(head=HEAD_B))
+    before = len(RECEIVED)
+    check("B marker installed", load_state("breach.json")[f"{REPO}#7"]["head"], HEAD_B)
+    run("gate_reviewer.py", pr_payload(head=HEAD_A))
+    check("delayed A cannot displace B", load_state("breach.json")[f"{REPO}#7"]["head"], HEAD_B)
+    check("delayed A cannot POST", len(RECEIVED) - before, 0)
+    check("B wake remains claimable", run(route["script"],
+          json.loads(RECEIVED[-1]["body"]))[0], "FIRE")
+
+    # The fixer gate takes its head from an old webhook, so unlike the
+    # reviewer request it has no earlier fresh-PR guard.
+    reset(prs={"7": {**pr(7, head=HEAD_A), "reviews": reviews}})
+    run("gate_fixer.py", review_payload(head=HEAD_A, rid=3))
+    set_prs({"7": {**pr(7, head=HEAD_B), "reviews": reviews}})
+    run("gate_fixer.py", review_payload(head=HEAD_B, rid=3))
+    before = len(RECEIVED)
+    run("gate_fixer.py", review_payload(head=HEAD_A, rid=3))
+    check("delayed fixer A cannot replace B",
+          load_state("breach.json")[f"{REPO}#7"]["head"], HEAD_B)
+    check("delayed fixer A does not deliver", len(RECEIVED) - before, 0)
+
+    # No new webhook is needed: the periodic sweep recovers a persisted
+    # pending marker after the endpoint comes back.
+    reset(prs={"7": {**pr(7, head=HEAD_B), "reviews": reviews}})
+    cfg = json.loads((LOOPS_DIR / "widgets.json").read_text())
+    cfg["host"] = "http://127.0.0.1:9"
+    (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
+    run("gate_reviewer.py", pr_payload(head=HEAD_B))
+    cfg["host"] = HOST
+    (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
+    state_file("watchdog.json").write_text(json.dumps({"armed_since": time.time() - 86400}))
+    run("watchdog.py", None, "--loop", "widgets")
+    check("sweep delivers pending breach without another webhook", len(RECEIVED), 1)
+    check("sweep marks successful delivery",
+          load_state("breach.json")[f"{REPO}#7"]["status"], "awaiting-adjudication")
 
 
 def group_fixer_gate() -> None:
