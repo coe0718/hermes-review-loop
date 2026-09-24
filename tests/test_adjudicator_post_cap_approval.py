@@ -88,20 +88,20 @@ class PostCapApprovalTest(unittest.TestCase):
     def test_old_head_approval_does_not_block_current_breach(self):
         result = self.run_gate(OLD_HEAD)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout)["_loop"]["head"], HEAD)
-        self.assertEqual(self.st.breach_get(7)["status"], "adjudicating")
+        self.assertEqual(result.stdout.strip(), "[SILENT]")
+        self.assertEqual(self.st.breach_get(7)["status"], "awaiting-adjudication")
 
     def test_no_approval_allows_current_breach(self):
         result = self.run_gate(None)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout)["_loop"]["head"], HEAD)
-        self.assertEqual(self.st.breach_get(7)["status"], "adjudicating")
+        self.assertEqual(result.stdout.strip(), "[SILENT]")
+        self.assertEqual(self.st.breach_get(7)["status"], "awaiting-adjudication")
 
     def test_older_approval_then_newer_changes_at_cap_claims_breach(self):
         result = self.run_gate(HEAD, later_verdict="CHANGES_REQUESTED")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout)["_loop"]["head"], HEAD)
-        self.assertEqual(self.st.breach_get(7)["status"], "adjudicating")
+        self.assertEqual(result.stdout.strip(), "[SILENT]")
+        self.assertEqual(self.st.breach_get(7)["status"], "awaiting-adjudication")
 
     def test_latest_approval_suppresses_earlier_changes_at_cap(self):
         result = self.run_gate(None, earlier_verdict="CHANGES_REQUESTED",

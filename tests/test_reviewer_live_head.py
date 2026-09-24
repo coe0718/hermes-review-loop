@@ -45,16 +45,14 @@ class ReviewerLiveHeadTest(unittest.TestCase):
               mock.patch.object(gate_reviewer.gh, "pr", return_value=current) as live,
               mock.patch.object(gate_reviewer.gate, "fetch_reviews", return_value=[]) as reviews,
               mock.patch.object(gate_reviewer.gate, "drain_seat") as drain,
-              mock.patch.object(gate_reviewer.gate, "take_seat", return_value=None) as take,
-              mock.patch.object(gate_reviewer.gate, "loop_block", return_value={"head": HEAD_A}),
-              mock.patch.object(gate_reviewer.gate, "start_text", return_value="starting"),
-              mock.patch.object(gate_reviewer.gate, "ping_start"),
+              mock.patch.object(gate_reviewer.gate, "block_pr_agent",
+                                side_effect=lambda *a, **kw: gate_reviewer.silence()) as block,
               mock.patch.object(gate_reviewer.observer, "notify")):
             try:
                 gate_reviewer.main()
             except SystemExit as exc:
                 self.assertEqual(exc.code, 0)
-        return output.getvalue(), live, reviews, drain, take
+        return output.getvalue(), live, reviews, drain, block
 
     def test_stale_open_head_never_starts_or_mutates_seats(self):
         for action in ACTIONS:
@@ -82,11 +80,12 @@ class ReviewerLiveHeadTest(unittest.TestCase):
     def test_matching_live_head_starts_each_trigger(self):
         for action in ACTIONS:
             with self.subTest(action=action):
-                output, live, reviews, _, take = self.run_gate(action, pr())
-                self.assertEqual(json.loads(output)["_loop"]["head"], HEAD_A)
+                output, live, reviews, _, block = self.run_gate(action, pr())
+                self.assertEqual(output.strip(), "[SILENT]")
                 live.assert_called_once_with(self.loop, 7)
                 reviews.assert_called_once_with(self.loop, 7)
-                take.assert_called_once()
+                block.assert_called_once()
+                self.assertEqual(block.call_args.args[4], HEAD_A)
 
 
 if __name__ == "__main__":

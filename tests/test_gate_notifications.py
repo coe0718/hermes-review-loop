@@ -75,8 +75,8 @@ class NotificationFreshnessTest(unittest.TestCase):
                 self.state.reset_mock()
                 live, _, drain, notify = self.invoke(gate_fixer, payload, current)
                 live.assert_called_once_with(self.loop, 7)
-                self.state.release_if.assert_called_once_with("reviewer", "acme/widgets#7")
-                drain.assert_called_once_with(self.loop, "reviewer")
+                self.state.release_if.assert_not_called()
+                drain.assert_not_called()
                 notify.assert_called_once()
                 self.assertNotEqual(notify.call_args.kwargs["next_turn"], "you merge")
 
@@ -101,6 +101,19 @@ class NotificationFreshnessTest(unittest.TestCase):
             with self.subTest(reviews=reviews):
                 _, _, _, notify = self.invoke(gate_fixer, payload, pr(), reviews)
                 self.assertNotEqual(notify.call_args.kwargs["next_turn"], "you merge")
+
+    def test_delayed_rejection_after_approval_neither_releases_nor_notifies(self):
+        rejection = {"id": 43, "state": "changes_requested", "commit_id": HEAD_A,
+                     "user": {"login": "reviewer"}, "submitted_at": "2026-01-01T00:00:00Z"}
+        approval = rejection | {"id": 44, "state": "APPROVED",
+                                "submitted_at": "2026-01-01T00:01:00Z"}
+        payload = {"action": "submitted", "number": 7, "pull_request": pr(),
+                   "review": rejection}
+        _, _, drain, notify = self.invoke(gate_fixer, payload, pr(), [approval, rejection])
+        self.state.release_if.assert_not_called()
+        drain.assert_not_called()
+        notify.assert_not_called()
+        self.state.breach_get.assert_not_called()
 
     def test_dismissed_and_stale_head_reviews_do_not_override_live_approval(self):
         approval = {"id": 43, "state": "approved", "commit_id": HEAD_A,

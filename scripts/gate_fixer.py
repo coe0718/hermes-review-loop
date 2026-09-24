@@ -11,7 +11,7 @@ when a verdict it must answer lands:
   no reviewer will read is how a loop burns a night; the PR goes to adjudication instead.
 
 stdin : a GitHub webhook payload
-stdout: that payload with a ``_loop`` block, or ``[SILENT]``
+stdout: ``[SILENT]`` (eligible runs queue; whole-agent isolation not available)
 """
 
 from __future__ import annotations
@@ -43,6 +43,12 @@ def main() -> None:
     if gate.reviewer_login(review) not in set(loop["reviewers"]):
         silence(f"verdict author {gate.reviewer_login(review) or 'unknown'} is not a reviewer")
 
+    user = pr.get("user")
+    author = user.get("login") if isinstance(user, dict) else None
+    author = author.lower() if isinstance(author, str) else ""
+    if author not in set(loop["fixers"]):
+        silence(f"PR author {author or 'unknown'} is not an authorized fixer")
+
     seat = "fixer"
     number = gate.number_of(payload, pr)
     key = gate.seat_key(loop, number)
@@ -52,9 +58,6 @@ def main() -> None:
         # An approval ends the reviewer's turn exactly as a rejection does, and nothing else would
         # free that slot before it expired. A slot that leaks for `ttl_min` is a queue that stops
         # moving — on a busy repo, that is the difference between ten review slots and nine.
-        if st.release_if("reviewer", key):
-            log(f"released reviewer seat for {key}")
-        gate.drain_seat(loop, "reviewer")
         # The webhook PR is a snapshot: an approval can arrive after a push, close or failed
         # lookup. Only a matching, currently open live head authorizes a merge handoff.
         approved_head = review.get("commit_id") or ""
@@ -79,10 +82,14 @@ def main() -> None:
             outcome, next_turn = "", "you merge"
         else:
             outcome, next_turn = "current approval/head unverified — no merge handoff", "check current PR state"
+        if next_turn == "you merge":
+            if st.release_if("reviewer", key):
+                log(f"released reviewer seat for {key}")
+            gate.drain_seat(loop, "reviewer")
         observer.notify(loop, st, "approved", number, approved_head,
                         identity=review.get("id"), actor=gate.reviewer_login(review),
                         outcome=outcome, next_turn=next_turn)
-        silence(f"#{number} approved — reviewer's slot freed, nothing for the fixer to do")
+        silence(f"#{number} approval event — no fixer dispatch")
     if state != "CHANGES_REQUESTED":
         silence(f"verdict state {review.get('state')!r} needs no fix")
 
@@ -90,7 +97,19 @@ def main() -> None:
     if review.get("commit_id") != pr_head:
         silence("verdict is on an older head — superseded")
 
+    current = gh.pr(loop, number)
+    if (not isinstance(current, dict) or current.get("number") != number
+            or current.get("state") != "open" or current.get("draft")
+            or (current.get("base") or {}).get("ref") != loop["base"]
+            or ((current.get("user") or {}).get("login") or "").lower() not in loop["fixers"]
+            or (current.get("head") or {}).get("sha") != pr_head):
+        silence("verdict PR is stale or current state is unverified")
     reviews = gate.fetch_reviews(loop, number)
+    latest = gate.latest_effective_review_at_head(reviews, loop, pr_head)
+    if (latest is None or latest.get("id") != review.get("id")
+            or gh.review_state(latest) != "CHANGES_REQUESTED"
+            or gate.reviewer_login(latest) != gate.reviewer_login(review)):
+        silence("verdict is not the latest effective same-head rejection")
     prior = len(gate.verdicts(reviews, loop, exclude_id=review.get("id")))
     if st.inflight(f"fix:{number}:{pr_head}"):
         silence(f"a fix run for head {pr_head[:7]} is already out")
@@ -106,24 +125,12 @@ def main() -> None:
                     f"({loop['cap']} reviews / {loop['cap'] - 1} fixes)")
         silence(f"cap reached on #{number} — handed to adjudication instead of a fix")
 
-    workspace = gate.take_seat(loop, st, seat, number, pr_head, f"fix #{number} @ {pr_head[:7]}",
-                              login=(loop["seats"][seat].get("login") or ""))
-
-    payload["_loop"] = gate.loop_block(loop, number, pr_head, workspace, seat=seat, round=prior + 1,
-                                       role="fixer", verdict="changes_requested",
-                                       reviewer=gate.reviewer_login(review))
-    st.inflight(f"fix:{number}:{pr_head}", record=True)
-    gate.ping_start(loop, seat, gate.start_text(
-        loop, seat, number, pr_head, prior + 1,
-        note=f"on a changes-requested verdict from {gate.reviewer_login(review)}"))
-    # The feed is told last, after the seat is claimed and the run recorded: a destination that
-    # hangs costs seconds at the end of this gate and never the fixer's slot or the queue behind
-    # it. Keyed by the review's own id, so a redelivered `pull_request_review` — which happens,
-    # and is why the in-flight marks exist — cannot ping twice for one verdict.
-    observer.notify(loop, st, "verdict", number, pr_head, identity=review.get("id"),
-                    outcome="changes requested", actor=gate.reviewer_login(review),
-                    next_turn="fixer", round_no=prior + 1)
-    print(json.dumps(payload))
+    gate.block_pr_agent(
+        loop, st, seat, number, pr_head,
+        on_queued=lambda: observer.notify(
+            loop, st, "verdict", number, pr_head, identity=review.get("id"),
+            outcome="changes requested", actor=gate.reviewer_login(review),
+            next_turn="fixer queued", round_no=prior + 1))
 
 
 if __name__ == "__main__":

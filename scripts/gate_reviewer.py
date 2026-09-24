@@ -14,7 +14,7 @@ when its turn *starts*:
   let it go. No agent runs, no tokens.
 
 stdin : a GitHub webhook payload
-stdout: that payload with a ``_loop`` block, or ``[SILENT]``
+stdout: ``[SILENT]`` (eligible runs queue; whole-agent isolation not available)
 """
 
 from __future__ import annotations
@@ -109,21 +109,12 @@ def main() -> None:
         log(f"released fixer seat for {gate.seat_key(loop, number)}")
     gate.drain_seat(loop, "fixer")
 
-    workspace = gate.take_seat(loop, st, seat, number, head, f"review #{number} @ {head[:7]}",
-                               login=(loop["seats"][seat].get("login") or ""))
-
-    payload["_loop"] = gate.loop_block(loop, number, head, workspace, seat=seat, round=rounds + 1,
-                                       role="reviewer")
-    st.inflight(f"review:{number}:{head}", record=True)
-    gate.ping_start(loop, seat, gate.start_text(loop, seat, number, head, rounds + 1))
-    # The feed is told last: by now the seat is claimed, the run is recorded and the seat's own
-    # channel has been pinged, so a destination that hangs costs seconds at the end of a gate and
-    # never a handoff, a queue slot or a seat. `handoff` is the fixer's push-then-ask; everything
-    # else here is a first look at a head nobody has reviewed yet.
-    observer.notify(loop, st, "handoff" if action == "review_requested" else "opened", number, head,
-                    identity=action, actor=sender if action == "review_requested" else author,
-                    next_turn="reviewer", round_no=rounds + 1)
-    print(json.dumps(payload))
+    gate.block_pr_agent(
+        loop, st, seat, number, head,
+        on_queued=lambda: observer.notify(
+            loop, st, "handoff" if action == "review_requested" else "opened", number, head,
+            identity=action, actor=sender if action == "review_requested" else author,
+            next_turn="reviewer queued", round_no=rounds + 1))
 
 
 if __name__ == "__main__":

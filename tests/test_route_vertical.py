@@ -1,0 +1,141 @@
+"""Offline route-script subprocess acceptance probes; never use a live gateway or CLI.
+
+The fixture creates both HOME and HERMES_HOME before starting *any* child.
+Only the stub executable is permitted to answer the gate's GitHub reads.
+"""
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import sqlite3
+import time
+import unittest
+
+ROOT = Path(__file__).resolve().parents[1]
+HEAD = "a" * 40
+
+
+class RouteSubprocess(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR") or
+                                                "/home/jeremy/.hermes/cache/scratch")
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        home = self.root / "home"
+        home.mkdir()
+        loops = home / "review-loops.d"
+        loops.mkdir()
+        self.env = {"PATH": "/usr/bin:/bin", "HOME": str(home),
+                    "HERMES_HOME": str(home), "REVIEW_LOOP_CONFIG_DIR": str(loops),
+                    "REVIEW_LOOP_GH_STUB": str(self.root / "gh-stub.py"),
+                    "GH_WORLD": str(self.root / "world.json"),
+                    "PYTHONDONTWRITEBYTECODE": "1", "GIT_TERMINAL_PROMPT": "0"}
+        self.loop = {"id": "widgets", "repo": "acme/widgets", "base": "main", "cap": 3,
+                     "fixers": ["dev"], "reviewers": ["reviewer"], "reviewer_seat": "reviewer",
+                     "seats": {"reviewer": {"profile": "fixture-reviewer", "route": "review"},
+                               "fixer": {"profile": "fixture-fixer", "route": "fix"}},
+                     "state_dir": str(home / "state"), "tokens": {}, "read_token": "",
+                     "host": "http://127.0.0.1:9"}
+        (loops / "widgets.json").write_text(json.dumps(self.loop))
+        (self.root / "gh-stub.py").write_text(
+            "#!/usr/bin/python3\nimport json, os, sys\n"
+            "assert os.environ['HOME'] == os.environ['HERMES_HOME']\n"
+            "assert os.environ['HOME'].startswith(os.path.dirname(os.environ['GH_WORLD']))\n"
+            "world=json.load(open(os.environ['GH_WORLD']))\n"
+            "path=sys.argv[1]\n"
+            "if path.endswith('/reviews?per_page=100'):\n"
+            " print(json.dumps(world['reviews']))\n"
+            "else:\n print(json.dumps(world['pr']))\n")
+        (self.root / "gh-stub.py").chmod(0o700)
+        self.world = self.root / "world.json"
+        self.pr = {"number": 7, "state": "open", "draft": False, "user": {"login": "dev"},
+                   "base": {"ref": "main"}, "head": {"sha": HEAD, "ref": "fix-7"}}
+        self.world.write_text(json.dumps({"pr": self.pr, "reviews": []}))
+
+    def route(self, script, payload):
+        return subprocess.run([sys.executable, str(ROOT / "scripts" / script)],
+                              input=json.dumps(payload), text=True, capture_output=True,
+                              env=self.env, cwd=self.root, timeout=15)
+
+    def test_without_runtime_eligible_reviewer_stays_silent_and_records_hold(self):
+        payload = {"repository": {"full_name": "acme/widgets"}, "action": "opened",
+                   "number": 7, "pull_request": self.pr, "sender": {"login": "dev"}}
+        result = self.route("gate_reviewer.py", payload)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "[SILENT]")
+        pending = json.loads((Path(self.loop["state_dir"]) / "pending.json").read_text())
+        self.assertIn("isolated worker unavailable", json.dumps(pending).lower())
+        self.assertNotIn("token", result.stdout.lower())
+        # This is an explicit blocker, not evidence that a whole-agent turn ran:
+        # the current route script queues in the old gate state, not Supervisor.
+        self.assertFalse(list(self.root.rglob("*.sqlite")))
+
+    def test_eligible_fixer_and_ineligible_events_stay_silent(self):
+        verdict = {"id": 10, "state": "changes_requested", "commit_id": HEAD,
+                   "user": {"login": "reviewer"}, "submitted_at": "2026-01-01T00:00:00Z"}
+        self.world.write_text(json.dumps({"pr": self.pr, "reviews": [verdict]}))
+        eligible = {"repository": {"full_name": "acme/widgets"}, "action": "submitted",
+                    "number": 7, "pull_request": self.pr, "review": verdict}
+        for script, payload in (("gate_fixer.py", eligible),
+                                ("gate_reviewer.py", {**eligible, "action": "synchronize"}),
+                                ("gate_fixer.py", {**eligible, "review": {**verdict, "commit_id": "b" * 40}})):
+            with self.subTest(script=script, action=payload["action"],
+                              head=payload["review"]["commit_id"]):
+                result = self.route(script, payload)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), "[SILENT]")
+        pending = json.loads((Path(self.loop["state_dir"]) / "pending.json").read_text())
+        self.assertIn("fixer", json.dumps(pending))
+
+    def test_untrusted_sender_and_wrong_repository_do_not_queue(self):
+        payload = {"repository": {"full_name": "acme/widgets"}, "action": "opened",
+                   "number": 7, "pull_request": self.pr}
+        for changed in ({"repository": {"full_name": "other/widgets"}},
+                        {"pull_request": {**self.pr, "user": {"login": "stranger"}}},
+                        {"pull_request": {**self.pr, "draft": True}}):
+            with self.subTest(changed=changed):
+                result = self.route("gate_reviewer.py", {**payload, **changed})
+                self.assertEqual((result.returncode, result.stdout.strip()),
+                                 (0, "[SILENT]"), result.stderr)
+        self.assertFalse((Path(self.loop["state_dir"]) / "pending.json").exists())
+
+    def test_outsider_review_verdict_never_queues_fixer(self):
+        payload = {"repository": {"full_name": "acme/widgets"}, "action": "submitted",
+                   "number": 7, "pull_request": {**self.pr, "user": {"login": "outsider"}},
+                   "review": {"id": 10, "state": "changes_requested", "commit_id": HEAD,
+                              "user": {"login": "reviewer"}}}
+        result = self.route("gate_fixer.py", payload)
+        self.assertEqual((result.returncode, result.stdout.strip()), (0, "[SILENT]"), result.stderr)
+        self.assertFalse((Path(self.loop["state_dir"]) / "pending.json").exists())
+        self.assertIn("not an authorized fixer", result.stderr)
+
+    def test_route_enqueues_deduplicates_and_detached_worker_fails_closed(self):
+        runtime = Path(self.env["HERMES_HOME"]) / "review-loop-runtime.json"
+        runtime.write_text("{}")  # invalid production settings; no network or key access
+        runtime.chmod(0o600)
+        payload = {"repository": {"full_name": "acme/widgets"}, "action": "opened",
+                   "number": 7, "pull_request": self.pr, "sender": {"login": "dev"}}
+        first = self.route("gate_reviewer.py", payload)
+        second = self.route("gate_reviewer.py", payload)
+        for result in (first, second):
+            self.assertEqual((result.returncode, result.stdout.strip()), (0, "[SILENT]"),
+                             result.stderr)
+        db = Path(self.env["HERMES_HOME"]) / "state" / "review-loop-runs.sqlite"
+        deadline = time.monotonic() + 10
+        rows = []
+        while time.monotonic() < deadline:
+            with sqlite3.connect(db) as conn:
+                rows = conn.execute("SELECT state, attempts, error FROM runs").fetchall()
+            if rows and rows[0][0] == "failed":
+                break
+            time.sleep(0.05)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0:2], ("failed", 1))
+        self.assertIn("review generation unavailable", rows[0][2])
+        self.assertFalse((Path(self.loop["state_dir"]) / "pending.json").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

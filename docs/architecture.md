@@ -1,5 +1,14 @@
 # Architecture
 
+> **Current status:** the diagrams below describe the intended operational loop,
+> not a safely running one. Gates presently queue eligible PR events and return
+> `[SILENT]` before gateway dispatch; breach wake is blocked as well. This is a
+> deliberate safety hold pending an enforced, credentialless whole-agent runner.
+> `review_loop/broker.py` contains trusted REST authorization primitives and
+> `review_loop/broker_ipc.py` a scoped Unix-socket service; an offline worker
+> exercises a bubblewrapped Hermes turn. This is NOT production authorization
+> for unattended fixer pushes.
+
 Five processes, four state files, one rule: **the control plane never guesses.**
 
 ```
