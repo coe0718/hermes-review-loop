@@ -396,6 +396,24 @@ def group_reviewer_gate() -> None:
     reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER)]}})
     check("head already reviewed → silent", run("gate_reviewer.py", pr_payload())[0], "SILENT")
 
+    # Only a submitted verdict closes this head. COMMENTED is an ordinary review
+    # comment, PENDING is not submitted, and DISMISSED has lost its verdict.
+    for state in ("COMMENTED", "PENDING", "DISMISSED"):
+        reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, state=state)]}})
+        kind, out, _ = run("gate_reviewer.py", pr_payload())
+        check(f"{state} at head does not suppress review_requested", kind, "FIRE")
+        if kind == "FIRE":
+            check(f"  {state} does not spend a round", json.loads(out)["_loop"]["round"], 1)
+
+    for state in ("APPROVED", "CHANGES_REQUESTED"):
+        reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, state=state)]}})
+        check(f"{state} at head suppresses duplicate request",
+              run("gate_reviewer.py", pr_payload())[0], "SILENT")
+
+    reset(prs={"7": {**pr(7), "reviews": [review("unconfigured", state="APPROVED")]}})
+    check("unconfigured reviewer's verdict does not suppress request",
+          run("gate_reviewer.py", pr_payload())[0], "FIRE")
+
     # an approved head
     reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, state="approved")]}})
     check("new commit after a verdict fires",
@@ -1212,6 +1230,21 @@ def group_watchdog() -> None:
     run("watchdog.py", None, "--loop", "widgets", "--drain", "--seat", "reviewer")
     check("already-reviewed queue entry is dropped", len(RECEIVED) - before, 0)
     check("  and removed from the queue", load_state("pending.json"), {})
+
+    for state in ("COMMENTED", "PENDING", "DISMISSED", "APPROVED", "CHANGES_REQUESTED"):
+        reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, state=state)]}})
+        state_file("pending.json").write_text(json.dumps(
+            {"reviewer": {f"{REPO}#7": {"at": time.time(), "head": HEAD_A,
+                                         "url": "u", "reason": "busy"}}}))
+        before = len(RECEIVED)
+        run("watchdog.py", None, "--loop", "widgets", "--drain", "--seat", "reviewer")
+        expected = state in ("COMMENTED", "PENDING", "DISMISSED")
+        check(f"queued review with {state} {'fires' if expected else 'drops'}",
+              len(RECEIVED) - before, 1 if expected else 0)
+        check(f"  {state} queue entry cleared", load_state("pending.json"), {})
+        if expected and len(RECEIVED) > before:
+            check(f"  {state} wake targets requested head",
+                  json.loads(RECEIVED[-1]["body"])["pull_request"]["head"]["sha"], HEAD_A)
 
     # a full seat fires nothing
     reset(prs={"7": pr(7)})

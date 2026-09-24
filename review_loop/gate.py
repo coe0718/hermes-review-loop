@@ -140,7 +140,9 @@ def verdicts(reviews: list, loop: dict, exclude_id=None) -> list:
 
 
 def reviewed_at_head(reviews: list, loop: dict, head: str) -> bool:
+    """A submitted verdict at this head, not a comment, draft, or dismissed review."""
     return any(is_reviewer(r, loop) and r.get("commit_id") == head
+               and gh.review_state(r) in {"APPROVED", "CHANGES_REQUESTED"}
                for r in reviews if isinstance(r, dict))
 
 
