@@ -456,6 +456,11 @@ def group_reviewer_gate() -> None:
           run("gate_reviewer.py", pr_payload(sender="passer-by"))[0], "SILENT")
 
     reset(prs={"7": pr(7)})
+    # No hardcoded account outside the loop's own config may hand a PR to review.
+    check("request from an unconfigured org account is silent",
+          run("gate_reviewer.py", pr_payload(sender="patchhive"))[0], "SILENT")
+
+    reset(prs={"7": pr(7)})
     check("a plain push (synchronize) is silent",
           run("gate_reviewer.py", pr_payload(action="synchronize"))[0], "SILENT")
 

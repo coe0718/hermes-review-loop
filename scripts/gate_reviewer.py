@@ -62,7 +62,7 @@ def main() -> None:
         requested = ((payload.get("requested_reviewer") or {}).get("login") or "").lower()
         if requested != loop["reviewer_seat"]:
             silence(f"review requested from {requested or 'nobody'} — not this seat")
-        if sender not in set(loop["fixers"]) | {"patchhive"} and sender not in loop["reviewers"]:
+        if sender not in set(loop["fixers"]) and sender not in loop["reviewers"]:
             silence(f"sender {sender or 'unknown'} is not a fixer")
 
     if pr.get("draft"):
