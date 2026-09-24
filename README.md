@@ -544,9 +544,9 @@ Exercised and passing:
   an API-denied hooks read is `unknown`, never "absent"), all four watchdog stall shapes, `explain`'s
   golden cases (in-flight/no-verdict/no-fix reviews, unrequested head, queued/full seat, spent
   budget, paused loop, closed/missing PR, failed GitHub read) and its read-only proof, the route/hook
-  reconciliation rollback cases,, the cleanup rails against a real git clone, and the observer feed (one notice per
-  verdict and handoff, no duplicate on redelivery, a 5xx destination never blocking queue
-  drain, escalation delivered before adjudication, and mute/digest/misconfiguration inert).
+  reconciliation rollback cases, the cleanup rails against a real git clone, and the observer feed
+  (one notice per verdict and handoff, no duplicate on redelivery, a 5xx destination never blocking
+  queue drain, escalation delivered before adjudication, and mute/digest/misconfiguration inert).
 - Live use on a private repository: two seats, dozens of PRs, review → verdict → fix → cleanup.
 
 Not proven, and worth knowing before you trust it:

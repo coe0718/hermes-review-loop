@@ -338,6 +338,8 @@ def _busy_seats(loop: dict, roles: set[str]) -> list[str]:
                              for key, entry in sorted(live.items()))
             lines.append(f"{seat} is in flight on {held}")
     return lines
+
+
 def _observer_check(loop: dict) -> None:
     """Refuse an observer destination the gateway could not deliver without waking an agent.
 
@@ -1373,7 +1375,6 @@ def register_cli(ctx, settings: dict | None = None) -> None:
         init.add_argument("--adjudicator-profile", default="",
                           help="Hermes profile for the adjudicator (default: the plugin setting, "
                                "else the launch profile)")
-        init.add_argument("--adjudicator-profile", default="default")
         init.add_argument("--observer-route", default="",
                           help="route name for the read-only observer feed "
                                "(default: <id>-observe)")

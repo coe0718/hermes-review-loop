@@ -3148,13 +3148,19 @@ def group_observer_cli() -> None:
         return rc, buf.getvalue()
 
     reset(prs={})
+    write_profiles("rv", "fx")
     parser = parser_for()
     args = parser.parse_args(["init", "--repo", "acme/feed", "--fixer", FIXER,
                               "--reviewer", REVIEWER, "--reviewer-profile", "rv",
                               "--fixer-profile", "fx", "--host", HOST,
+                              "--token", f"{REVIEWER}={SEAT_PATS[0]}",
+                              "--token", f"{FIXER}={SEAT_PATS[1]}",
                               "--observer-profile", "tuck"])
-    with contextlib.redirect_stdout(io.StringIO()):
+    init_output = io.StringIO()
+    with contextlib.redirect_stdout(init_output):
         rc = args.func(args)
+    if rc:
+        print(init_output.getvalue())
     check("init with an observer profile succeeds", rc, 0)
     loop = config.load_id("feed")
     check("  the feed is on, named after the loop", loop["observer"]["route"], "feed-observe")
@@ -3169,6 +3175,16 @@ def group_observer_cli() -> None:
           [subs[name].get("deliver_only") for name in ("feed-review", "feed-fix")], [None, None])
 
     check("  registered at the operator's own gateway", subs["feed-observe"]["host"], HOST)
+    args.repo = "acme/conflict"
+    args.observer_route = "widgets-review"
+    with contextlib.redirect_stdout(io.StringIO()):
+        rc = args.func(args)
+    check("observer cannot take another loop's reviewer route", rc, 2)
+    check("  collision writes no loop config", (LOOPS_DIR / "conflict.json").exists(), False)
+    check("  existing reviewer route survives", json.loads(SUBS.read_text())["widgets-review"],
+          subs["widgets-review"])
+    args.repo = "acme/feed"
+    args.observer_route = ""
     args.host = "https://attacker.example"
     with contextlib.redirect_stdout(io.StringIO()):
         rc = args.func(args)
