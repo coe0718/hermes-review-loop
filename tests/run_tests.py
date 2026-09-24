@@ -1156,7 +1156,7 @@ def group_seat_identity() -> None:
                                         "reason": "capacity"}}}))
     before = len(RECEIVED)
     out, _, _ = run("watchdog.py", None, "--loop", "seats", "--drain", "--seat", "reviewer")
-    check("the drain starts the queued review", "started the queued run" in out, True)
+    check("HTTP-only drain does not claim queued review started", "started the queued run" in out, False)
     check("  and it wakes the reviewer at the profile the form chose",
           RECEIVED[-1]["path"] if len(RECEIVED) > before else None,
           "/p/vex/webhooks/seats-review")
@@ -1728,11 +1728,12 @@ def group_watchdog() -> None:
         {"reviewer": {f"{REPO}#7": {"at": time.time(), "head": HEAD_A,
                                     "url": f"https://github.com/{REPO}/pull/7", "reason": "busy"}}}))
     out, _, _ = run("watchdog.py", None, "--loop", "widgets", "--drain", "--seat", "reviewer")
-    check("queued review starts", "started the queued run" in out, True)
+    check("HTTP-only queued review remains unacknowledged", "started the queued run" in out, False)
     check("  it asked for the reviewer seat",
           json.loads(RECEIVED[-1]["body"])["requested_reviewer"]["login"], SEAT)
     check("  signature is valid for that route", verify_sig(RECEIVED[-1], "widgets-review"), True)
-    check("  queue is now empty", load_state("pending.json"), {})
+    check("  queue remains until the gate acknowledges enqueue",
+          f"{REPO}#7" in load_state("pending.json").get("reviewer", {}), True)
 
     # A queued A must not turn into a synthetic request for B. A fresh event can
     # subsequently enqueue B, but the stale request has no authority to wake it.
@@ -1790,7 +1791,8 @@ def group_watchdog() -> None:
         expected = state in ("COMMENTED", "PENDING", "DISMISSED")
         check(f"queued review with {state} {'fires' if expected else 'drops'}",
               len(RECEIVED) - before, 1 if expected else 0)
-        check(f"  {state} queue entry cleared", load_state("pending.json"), {})
+        check(f"  {state} queue {'held' if expected else 'cleared'}",
+              f"{REPO}#7" in load_state("pending.json").get("reviewer", {}), expected)
         if expected and len(RECEIVED) > before:
             check(f"  {state} wake targets requested head",
                   json.loads(RECEIVED[-1]["body"])["pull_request"]["head"]["sha"], HEAD_A)
@@ -1817,11 +1819,12 @@ def group_watchdog() -> None:
     check("zero-alert sweep wakes queued PR after lock expiry", len(RECEIVED) - before, 1)
     check("  the eligible PR was woken", json.loads(RECEIVED[-1]["body"])["number"] if RECEIVED else None, 7)
     check("  no stall warning is required", "silent stall" in out or "stuck state" in out, False)
-    check("  queue is cleared", load_state("pending.json"), {})
+    check("  HTTP-only queue remains unacknowledged",
+          f"{REPO}#7" in load_state("pending.json").get("reviewer", {}), True)
     check("  expired lock is cleared", load_state("locks.json"), {})
     before = len(RECEIVED)
     run("watchdog.py", None, "--loop", "widgets", extra_env={"REVIEW_LOOP_TEST": ""})
-    check("  repeated sweep does not wake twice", len(RECEIVED) - before, 0)
+    check("  uncertain route is not automatically replayed", len(RECEIVED) - before, 0)
 
     # A spare slot must not wake a PR already held by that seat.
     reset(prs={"7": pr(7)})
@@ -1847,7 +1850,8 @@ def group_watchdog() -> None:
     run("watchdog.py", None, "--loop", "widgets", extra_env={"REVIEW_LOOP_TEST": ""})
     check("zero-alert sweep drains eligible fixer", len(RECEIVED) - before, 1)
     check("  fixer route received the verdict", RECEIVED[-1]["event"], "pull_request_review")
-    check("  fixer queue cleared", load_state("pending.json"), {})
+    check("  fixer hold remains until gate acknowledgement",
+          f"{REPO}#7" in load_state("pending.json").get("fixer", {}), True)
 
     # shape 1: the reviewer never posted a verdict
     reset(prs={"7": pr(7, head=HEAD_A)})
@@ -2005,8 +2009,11 @@ def group_watchdog() -> None:
               load_state("pending.json").get("reviewer", {}), True)
         out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
         check(f"{label} next sweep does not prematurely alert", "silent stall" in out, False)
-        check(f"{label} rejects stale queued head", load_state("pending.json"), {})
-        check(f"{label} never wakes stale head", len(RECEIVED) - before, 1)
+        check(f"{label} retains uncertain first head but drops stale second head",
+              set(load_state("pending.json").get("reviewer", {})),
+              {f"{REPO}#7"})
+        check(f"{label} never replays uncertain first head or wakes stale second head",
+              len(RECEIVED) - before, 1)
 
     # Failed listing cannot establish a safe recovery baseline or drain.
     reset(prs={"7": pr(7)})

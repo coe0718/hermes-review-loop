@@ -143,11 +143,47 @@ class LoopState:
 
     # -- queue --------------------------------------------------------------
 
+    @contextlib.contextmanager
+    def _queue_lock(self):
+        self.dir.mkdir(parents=True, exist_ok=True)
+        with (self.dir / "pending.lock").open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+
+    def _save_queue(self, data: dict) -> None:
+        """Publish queue bytes atomically so unlocked readers never see a partial file."""
+        fd, temp = tempfile.mkstemp(prefix=".pending-", dir=self.dir)
+        try:
+            with os.fdopen(fd, "w") as output:
+                json.dump(data, output, indent=2)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(temp, self.pending)
+        finally:
+            if os.path.exists(temp):
+                os.unlink(temp)
+
     def queue_add(self, seat: str, key: str, head: str, url: str, reason: str) -> None:
-        data = self._load(self.pending, {}) or {}
-        data.setdefault(seat, {})[key] = {"at": time.time(), "head": head, "url": url,
-                                          "reason": reason}
-        self._save(self.pending, data)
+        with self._queue_lock():
+            data = self._load(self.pending, {}) or {}
+            data.setdefault(seat, {})[key] = {"at": time.time(), "head": head, "url": url,
+                                              "reason": reason, "id": uuid.uuid4().hex}
+            self._save_queue(data)
+
+    def queue_replace_if(self, seat: str, key: str, expected: dict | None,
+                         head: str, url: str, reason: str) -> bool:
+        """Record a failed dispatch only if no newer event replaced its queue entry."""
+        with self._queue_lock():
+            data = self._load(self.pending, {}) or {}
+            if (data.get(seat) or {}).get(key) != expected:
+                return False
+            data.setdefault(seat, {})[key] = {"at": time.time(), "head": head, "url": url,
+                                              "reason": reason, "id": uuid.uuid4().hex}
+            self._save_queue(data)
+            return True
 
     def queue_items(self, seat: str) -> dict:
         return (self._load(self.pending, {}) or {}).get(seat) or {}
@@ -156,12 +192,26 @@ class LoopState:
         return self._load(self.pending, {}) or {}
 
     def queue_pop(self, seat: str, key: str) -> None:
-        data = self._load(self.pending, {}) or {}
-        items = data.get(seat) or {}
-        if items.pop(key, None) is not None:
+        with self._queue_lock():
+            data = self._load(self.pending, {}) or {}
+            items = data.get(seat) or {}
+            if items.pop(key, None) is not None:
+                if not items:
+                    data.pop(seat, None)
+                self._save_queue(data)
+
+    def queue_pop_if(self, seat: str, key: str, expected: dict | None) -> bool:
+        """Acknowledge only the entry observed before enqueue, never its replacement."""
+        with self._queue_lock():
+            data = self._load(self.pending, {}) or {}
+            items = data.get(seat) or {}
+            if expected is None or items.get(key) != expected:
+                return False
+            items.pop(key)
             if not items:
                 data.pop(seat, None)
-            self._save(self.pending, data)
+            self._save_queue(data)
+            return True
 
     # -- in-flight marks ----------------------------------------------------
 

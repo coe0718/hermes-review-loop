@@ -85,6 +85,7 @@ class BoundaryTests(unittest.TestCase):
 
     def test_gate_blocks_before_workspace_or_gateway_payload(self):
         st = mock.Mock()
+        st.queue_items.return_value = {}
         with mock.patch.object(gate.isolation, "ensure") as ensure:
             with mock.patch("sys.stdout", new_callable=__import__("io").StringIO) as stdout:
                 with self.assertRaises(SystemExit) as caught:
@@ -92,7 +93,7 @@ class BoundaryTests(unittest.TestCase):
                 self.assertEqual(caught.exception.code, 0)
                 self.assertEqual(stdout.getvalue().strip(), "[SILENT]")
             ensure.assert_not_called()
-        self.assertIn("isolated worker unavailable", st.queue_add.call_args.args[-1])
+        self.assertIn("isolated worker unavailable", st.queue_replace_if.call_args.args[-1])
 
     def test_clone_removes_inherited_credential_helper(self):
         repo = self.root / "repo"

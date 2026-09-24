@@ -77,10 +77,13 @@ def drain(loop: dict, st: state_mod.LoopState, seat: str, quiet: bool = False) -
             # A free *other* slot is not permission to wake this PR twice.
             continue
         entry = items[key]
+        if str(entry.get("reason") or "").startswith("route delivery uncertain —"):
+            log(f"drain: {key} has an unverified POST — manual reconciliation required")
+            continue
         try:
             number = int(str(key).split("#")[-1])
         except Exception:
-            st.queue_pop(seat, key)
+            st.queue_pop_if(seat, key, entry)
             continue
 
         held = st.held_by_other(seat, key)
@@ -95,7 +98,7 @@ def drain(loop: dict, st: state_mod.LoopState, seat: str, quiet: bool = False) -
             log(f"drain: PR #{number} unreadable — left queued")
             continue
         if pr.get("state") != "open":
-            st.queue_pop(seat, key)
+            st.queue_pop_if(seat, key, entry)
             log(f"drain: PR #{number} is {pr.get('state')} — dropped from queue")
             continue
         head = (pr.get("head") or {}).get("sha") or ""
@@ -105,13 +108,13 @@ def drain(loop: dict, st: state_mod.LoopState, seat: str, quiet: bool = False) -
         if entry.get("head") != head:
             # A queued event is authorization for exactly its observed head. Drop it;
             # a new webhook for the new SHA must be evaluated through the normal gate.
-            st.queue_pop(seat, key)
+            st.queue_pop_if(seat, key, entry)
             log(f"drain: PR #{number} moved since queued — stale head dropped")
             continue
         base = (pr.get("base") or {}).get("ref") or ""
         author = ((pr.get("user") or {}).get("login") or "").lower()
         if pr.get("draft") or base != loop["base"] or author not in set(loop["fixers"]):
-            st.queue_pop(seat, key)
+            st.queue_pop_if(seat, key, entry)
             log(f"drain: PR #{number} is not a fixer PR on {loop['base']} — dropped")
             continue
 
@@ -124,18 +127,21 @@ def drain(loop: dict, st: state_mod.LoopState, seat: str, quiet: bool = False) -
                  "title": pr.get("title", ""), "html_url": pr.get("html_url", "")}
 
         if seat == "fixer":
-            changes = gate.changes_at_head(reviews, loop, head)
-            if not changes:
-                st.queue_pop(seat, key)
-                log(f"drain: no changes-requested verdict at {head[:7]} of #{number} — dropped")
+            latest = gate.latest_effective_review_at_head(reviews, loop, head)
+            if latest is None:
+                log(f"drain: latest verdict at {head[:7]} of #{number} unknown — left queued")
+                continue
+            if gh.review_state(latest) != "CHANGES_REQUESTED":
+                st.queue_pop_if(seat, key, entry)
+                log(f"drain: latest verdict at {head[:7]} of #{number} is not changes-requested — dropped")
                 continue
             payload = {"repository": {"full_name": loop["repo"]}, "action": "submitted",
-                       "review": changes[-1], "pull_request": short,
-                       "sender": changes[-1].get("user") or {}}
+                       "review": latest, "pull_request": short,
+                       "sender": latest.get("user") or {}}
             event, tag = "pull_request_review", f"drain-fix-{number}"
         else:
             if gate.reviewed_at_head(reviews, loop, head):
-                st.queue_pop(seat, key)
+                st.queue_pop_if(seat, key, entry)
                 log(f"drain: #{number} head {head[:7]} already reviewed — dropped")
                 continue
             payload = {"repository": {"full_name": loop["repo"]}, "action": "review_requested",
@@ -144,8 +150,18 @@ def drain(loop: dict, st: state_mod.LoopState, seat: str, quiet: bool = False) -
                        "pull_request": short}
             event, tag = "pull_request", f"drain-review-{number}"
 
-        if routes.fire(loop["seats"][seat]["route"], event, payload, tag, loop.get("host")):
-            st.queue_pop(seat, key)
+        attempted = False
+        def mark_attempt() -> None:
+            nonlocal attempted
+            attempted = True
+
+        posted = routes.fire(loop["seats"][seat]["route"], event, payload, tag,
+                             loop.get("host"), on_attempt=mark_attempt)
+        # HTTP 2xx only acknowledges webhook receipt: the gate may have emitted [SILENT]
+        # because no private runtime exists. Only the gate can remove its observed queue
+        # entry, after Supervisor.enqueue succeeds. Never pop a replacement here.
+        current = st.queue_items(seat).get(key)
+        if posted and current is None:
             st.note(f"drained {seat} for {key}")
             if not quiet:
                 print(f"{seat}: started the queued run for PR #{number} (head {head[:7]})")
@@ -153,6 +169,11 @@ def drain(loop: dict, st: state_mod.LoopState, seat: str, quiet: bool = False) -
             if started >= free:
                 break
             continue
+        if current == entry and (attempted or posted):
+            st.queue_replace_if(seat, key, entry, entry["head"], entry.get("url", ""),
+                                "route delivery uncertain — manual reconciliation required")
+        # Known pre-POST failure remains retryable; a potentially sent POST
+        # without a gate acknowledgement requires operator inspection.
         break
     return started
 

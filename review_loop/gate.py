@@ -94,6 +94,8 @@ def block_pr_agent(loop: dict, st: state_mod.LoopState, seat: str,
     from .run_supervisor import Supervisor
 
     runtime = config.home() / "review-loop-runtime.json"
+    key = seat_key(loop, number)
+    queued = st.queue_items(seat).get(key)
     try:
         supervisor = Supervisor(
             config.home() / "state" / "review-loop-runs.sqlite",
@@ -104,10 +106,11 @@ def block_pr_agent(loop: dict, st: state_mod.LoopState, seat: str,
         delivery = f"{loop['repo']}:{number}:{head}:{seat}"
         supervisor.enqueue(delivery + (f':{turn_key}' if turn_key else ''),
                            loop["repo"], number, head, seat, turn_key=turn_key)
+        st.queue_pop_if(seat, key, queued)
         log(f"#{number} @ {head[:7]} {seat} enqueued for isolated worker")
     except Exception as exc:
         reason = f"isolated worker unavailable: {type(exc).__name__}: {exc}"
-        st.queue_add(seat, seat_key(loop, number), head, pr_url(loop, number), reason)
+        st.queue_replace_if(seat, key, queued, head, pr_url(loop, number), reason)
         log(f"#{number} @ {head[:7]} {seat} held: {reason}")
     if on_queued is not None:
         try:
