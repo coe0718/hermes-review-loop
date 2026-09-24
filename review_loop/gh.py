@@ -181,8 +181,28 @@ def reviews(loop: dict, number: int):
     return result
 
 
+def open_prs_read(loop: dict) -> tuple[list[dict] | None, str]:
+    """Complete bounded listing: a full last page cannot authorize a partial chain."""
+    path = f"/repos/{loop['repo']}/pulls?state=open&per_page=100"
+    result: list[dict] = []
+    for page in range(1, MAX_REVIEW_PAGES + 1):
+        items, error = fetch(loop, path if page == 1 else f"{path}&page={page}")
+        if error:
+            return None, f"open PR page {page}: {error}"
+        if not isinstance(items, list) or len(items) > REVIEW_PAGE_SIZE or not all(
+                isinstance(item, dict) for item in items):
+            return None, f"open PR page {page}: invalid PR list"
+        result.extend(items)
+        if len(items) < REVIEW_PAGE_SIZE:
+            return result, ""
+    return None, f"open PR list exceeds {MAX_REVIEW_PAGES} full pages"
+
+
 def open_prs(loop: dict):
-    return api(loop, f"/repos/{loop['repo']}/pulls?state=open&per_page=100")
+    result, error = open_prs_read(loop)
+    if error:
+        log(f"gh open PR list failed: {error}")
+    return result
 
 
 
