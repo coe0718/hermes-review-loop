@@ -86,6 +86,13 @@ That writes exactly four things, all of them visible and reversible:
 3. two GitHub hooks, on `pull_request` and `pull_request_review`, pointing at those routes
 4. one cron job plus a 5-line shim in `~/.hermes/scripts/` that forwards to the plugin's watchdog
 
+Route edits are serialized only among cooperating review-loop plugin processes, using a sibling
+lock file and atomic replacement. Native Hermes CLI and dashboard subscription edits do **not**
+take that lock, so concurrent native/plugin edits can still overwrite each other. Fully solving
+that race requires an upstream shared lock/protocol for every registry writer. If directory sync
+fails after replacement, the plugin raises `RegistryDurabilityError(published=True)`: the new
+registry is visible, but crash durability is unconfirmed; do not assume the operation rolled back.
+
 ```bash
 hermes review-loop list                 # what is configured
 hermes review-loop status --loop name   # parallel setting, live runs, queue, breaches

@@ -10,13 +10,16 @@ A route's URL is derived from its ``profile``: the gateway serves the launch pro
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import hmac
 import json
 import os
 import pathlib
+import tempfile
 import time
 import urllib.request
+from contextlib import contextmanager
 
 from . import config
 from .util import log
@@ -32,6 +35,79 @@ def all_routes() -> dict:
         return json.loads(subs_path().read_text())
     except Exception:
         return {}
+
+
+def _read_for_write(path: pathlib.Path) -> dict:
+    """Unlike best-effort reads, writes must not replace an unreadable registry."""
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError(f"route registry {path} must be a JSON object")
+    return data
+
+
+@contextmanager
+def _registry_lock(path: pathlib.Path):
+    """Serialize cooperating plugin writers on a persistent sibling inode.
+
+    Hermes CLI/dashboard subscription writers do not take this lock.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock = path.with_name(path.name + ".lock")
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(lock, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+class RegistryDurabilityError(OSError):
+    """Replacement is visible, but directory sync failed; durability is unconfirmed."""
+
+    published = True
+
+
+def _write_registry(path: pathlib.Path, data: dict) -> None:
+    """Publish owner-only bytes atomically, then sync the containing directory.
+
+    Before replacement, failures leave the old inode intact. After replacement,
+    a directory sync failure raises RegistryDurabilityError: the new bytes are
+    visible but their survival across a crash has not been confirmed.
+    """
+    body = json.dumps(data, indent=2).encode()
+    fd, temp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        try:
+            os.fchmod(fd, 0o600)
+            view = memoryview(body)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError("short write to route registry")
+                view = view[written:]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(temp, path)
+        try:
+            directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        except OSError as exc:
+            raise RegistryDurabilityError(
+                f"route registry {path} was published but directory sync failed; durability unconfirmed"
+            ) from exc
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
 
 
 def route(name: str) -> dict | None:
@@ -97,32 +173,35 @@ def new_route(name: str, *, profile: str, prompt: str, events: list[str], script
     import secrets as _secrets
 
     path = subs_path()
-    data = all_routes()
-    prior = data.get(name) or {}
-    entry = {
-        "description": description or prior.get("description", ""),
-        "events": list(events),
-        "secret": prior.get("secret") or _secrets.token_hex(32),
-        "prompt": prompt,
-        "skills": list(skills or prior.get("skills") or []),
-        "deliver": deliver,
-        "profile": profile,
-        "created_at": prior.get("created_at") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "script": script,
-    }
-    if host:
-        entry["host"] = host
-    data[name] = entry
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2))
-    os.chmod(path, 0o600)
-    return entry
+    with _registry_lock(path):
+        data = _read_for_write(path)
+        prior = data.get(name) or {}
+        if not isinstance(prior, dict):
+            raise ValueError(f"route {name!r} must be a JSON object")
+        entry = {
+            "description": description or prior.get("description", ""),
+            "events": list(events),
+            "secret": prior.get("secret") or _secrets.token_hex(32),
+            "prompt": prompt,
+            "skills": list(skills or prior.get("skills") or []),
+            "deliver": deliver,
+            "profile": profile,
+            "created_at": prior.get("created_at") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "script": script,
+        }
+        if host:
+            entry["host"] = host
+        data[name] = entry
+        _write_registry(path, data)
+        return entry
 
 
 def remove_route(name: str) -> bool:
-    data = all_routes()
-    if data.pop(name, None) is None:
-        return False
-    subs_path().write_text(json.dumps(data, indent=2))
-    os.chmod(subs_path(), 0o600)
-    return True
+    path = subs_path()
+    with _registry_lock(path):
+        data = _read_for_write(path)
+        if name not in data:
+            return False
+        data.pop(name)
+        _write_registry(path, data)
+        return True

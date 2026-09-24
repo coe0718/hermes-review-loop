@@ -1080,7 +1080,16 @@ def group_cleanup() -> None:
     check("sweep reports a total", "reclaimed" in out, True)
 
 
-GROUPS = {"config": group_config, "reviewer": group_reviewer_gate, "budget": group_budget,
+def group_routes() -> None:
+    section("routes — atomic owner-only cross-process registry edits")
+    test = subprocess.run([sys.executable, str(ROOT / "tests" / "test_routes_atomic.py")],
+                          capture_output=True, text=True)
+    if test.returncode:
+        print(test.stdout + test.stderr)
+    check("route registry regression suite", test.returncode, 0)
+
+
+GROUPS = {"routes": group_routes, "config": group_config, "reviewer": group_reviewer_gate, "budget": group_budget,
           "fixer": group_fixer_gate, "seats": group_seats, "parallel": group_parallel,
           "exclusive": group_exclusive, "settings": group_settings,
           "plugin_settings": group_plugin_settings, "watchdog": group_watchdog,
