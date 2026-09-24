@@ -92,6 +92,11 @@ erase one when you run `apply`. A public GitHub webhook should use HTTPS.
 | `watchdog.log` | one line per sweep, and per breach |
 | `artifacts/<PR>/<seat>/` | where a run must keep its worktrees, build dirs and logs — per PR *and* per seat, so the two never share a checkout |
 
+`hermes review-loop status` prints the shape of these files, and `hermes review-loop explain --pr N`
+reads them (with the same predicates the gates use) to say why one PR is not moving. `explain` is
+read-only down to the byte: it uses the non-pruning readers, so asking twice leaves every file above
+exactly as it was.
+
 ## Environment overrides
 
 | variable | effect |

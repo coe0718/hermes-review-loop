@@ -64,6 +64,19 @@ class LoopState:
 
     # -- active runs per seat (the concurrency ledger) ----------------------
 
+    def live_locks(self, seat: str) -> dict:
+        """A seat's unexpired entries, read *without* the pruning ``active`` persists.
+
+        ``explain`` is read-only down to the state files: adopting ``active`` there would rewrite
+        ``locks.json`` on every question the operator asks, which is a mutation nobody asked for
+        and exactly what the acceptance test for a read-only command looks at.
+        """
+        entries = (self._load(self.locks, {}) or {}).get(seat) or {}
+        ttl = self.loop["ttl_min"] * 60
+        now = time.time()
+        return {k: v for k, v in entries.items()
+                if isinstance(v, dict) and now - v.get("at", 0) <= ttl}
+
     def active(self, seat: str) -> dict:
         """This seat's live runs, ``{key: entry}``, expired ones dropped and persisted away.
 
@@ -72,10 +85,7 @@ class LoopState:
         """
         data = self._load(self.locks, {}) or {}
         entries = data.get(seat) or {}
-        ttl = self.loop["ttl_min"] * 60
-        now = time.time()
-        live = {k: v for k, v in entries.items()
-                if isinstance(v, dict) and now - v.get("at", 0) <= ttl}
+        live = self.live_locks(seat)
         if live != entries:
             if live:
                 data[seat] = live
@@ -166,6 +176,14 @@ class LoopState:
             self._save(self.inflight_file, data)
             return False
         return now - data.get(key, 0) < self.loop["inflight_ttl_min"] * 60
+
+    def inflight_at(self, key: str) -> float:
+        """When this head's in-flight mark was armed, or 0.0 — the mark's own clock, read-only.
+
+        ``inflight()`` answers yes/no; an operator asking "how long has this been out" needs the
+        timestamp, and recomputing the TTL comparison anywhere else would be a second rule.
+        """
+        return float((self._load(self.inflight_file, {}) or {}).get(key, 0) or 0)
 
     # -- breach markers -----------------------------------------------------
 

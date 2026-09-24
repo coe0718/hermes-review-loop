@@ -89,4 +89,7 @@ directly rather than trusting anyone's summary. That means three things for how 
 Say it plainly in your summary — a gate that fired when it should not have, a stale head, a
 missing queue entry, work you were asked to do twice. The loop's whole value is that a failure is
 visible instead of silent, and the operator's next action depends on your report being accurate
-rather than flattering.
+rather than flattering. The operator has `hermes review-loop explain --pr N` for the other side of
+that: it reads the head, the verdicts at that head, the seat and the queue and prints the one event
+that has to happen next. It changes nothing, so it is always safe to say "run explain on this PR"
+in a summary instead of guessing what the loop is waiting for.

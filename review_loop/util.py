@@ -39,6 +39,15 @@ def now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def iso_at(when: float) -> str:
+    """A local mark's epoch as the same UTC ISO-8601 GitHub stamps its own timestamps with.
+
+    One spelling for every timestamp a report shows means an operator can compare them without
+    wondering which clock wrote which line.
+    """
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(when)) if when else ""
+
+
 def epoch(iso: str | None) -> float:
     """GitHub timestamps are UTC ISO-8601. Parse as UTC, never as local time."""
     if not iso:

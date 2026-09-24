@@ -51,21 +51,6 @@ def valid_clock(value: object, now: float) -> float | None:
     return clock if math.isfinite(clock) and 0 < clock <= now else None
 
 
-# -- is the loop actually live? -------------------------------------------------
-
-
-def hooks_armed(loop: dict) -> bool:
-    """Both seat routes must exist as active repo hooks, or the loop is parked."""
-    hooks = gh.api(loop, f"/repos/{loop['repo']}/hooks?per_page=100")
-    if not isinstance(hooks, list):
-        return False
-    wanted = {loop["seats"]["reviewer"]["route"], loop["seats"]["fixer"]["route"]}
-    found = [h for h in hooks
-             if isinstance(h, dict) and any(name in (h.get("config") or {}).get("url", "")
-                                            for name in wanted)]
-    return bool(found) and all(h.get("active") for h in found)
-
-
 # -- draining ------------------------------------------------------------------
 
 
@@ -201,7 +186,7 @@ def retry_pending_breaches(loop: dict, st: state_mod.LoopState, prs: list) -> No
         if type(number) is not int or not head:
             continue
         marker = markers.get(f"{loop['repo']}#{number}")
-        if (not isinstance(marker, dict) or marker.get("status") != "delivery-pending"
+        if (not isinstance(marker, dict) or gate.breach_delivery_status(marker, head) != "delivery-pending"
                 or marker.get("head") != head):
             continue
         reviews = gh.reviews(loop, number)
@@ -218,7 +203,7 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
     watch = st.watch()
     now = time.time()
 
-    if not TEST and not hooks_armed(loop):
+    if not TEST and not gate.hooks_armed(loop):
         return lines                              # parked on purpose: say nothing, ever
 
     prs = gh.open_prs(loop)
@@ -311,7 +296,7 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
         at_head = gate.changes_at_head(reviews, loop, head)
         changes = gate.verdicts(reviews, loop)
         marker = breach.get(f"{loop['repo']}#{number}") or {}
-        if marker.get("head") == head and marker.get("status") == "delivery-pending":
+        if gate.breach_delivery_status(marker, head) == "delivery-pending":
             continue  # failed delivery is not a silent stall
         observed_at = current_heads[str(number)]["observed_at"]
         head_postdates_arming = TEST or observed_at is not None
@@ -390,7 +375,7 @@ def main() -> None:
     if args.drain:
         for loop in loops:
             st = state_mod.state_for(loop)
-            if not TEST and not hooks_armed(loop):
+            if not TEST and not gate.hooks_armed(loop):
                 if args.loop:
                     print(f"{loop['id']}: hooks are paused — nothing drained")
                 continue

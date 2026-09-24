@@ -47,43 +47,48 @@ def token(loop: dict, login: str | None = None) -> str:
     return path.read_text().strip()
 
 
-def _stub(path: str, method: str, body) -> object | None:
+def _stub(path: str, method: str, body) -> tuple[object | None, str]:
+    """``(payload, error)`` answered by the stub executable.
+
+    ``(None, "")`` means the stub answered "no such resource" — the same shape ``api`` gives a
+    real 404. An empty error and a non-empty one are therefore different facts, which is the
+    whole reason this returns a pair instead of ``None`` for both.
+    """
     stub = os.environ.get("REVIEW_LOOP_GH_STUB")
     if not stub:
-        return None
+        return None, ""
     argv = [stub, path] if not body else [stub, path, json.dumps(body)]
     env = {**os.environ, "GH_METHOD": method}
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=30, env=env)
     except Exception as exc:
-        log(f"gh stub failed: {exc}")
-        return None
+        return None, f"gh stub failed: {exc}"
     if proc.returncode != 0:
-        log(f"gh stub rc={proc.returncode}: {proc.stderr.strip()[:120]}")
-        return None
+        return None, f"gh stub rc={proc.returncode}: {proc.stderr.strip()[:120]}"
     out = proc.stdout.strip()
     if not out:
-        return None
+        return None, "gh stub printed nothing"
     try:
-        return json.loads(out)
+        return json.loads(out), ""
     except Exception:
-        return None
+        return None, "gh stub printed invalid JSON"
 
 
-def api(loop: dict, path: str, method: str = "GET", body=None, login: str | None = None):
-    """One REST call. Returns parsed JSON, or None when the call did not succeed.
+def fetch(loop: dict, path: str, method: str = "GET", body=None,
+          login: str | None = None) -> tuple[object | None, str]:
+    """One REST call as ``(payload, error)``. No logging, no interpretation.
 
-    Callers are expected to treat None as "unknown" and stay quiet: a loop that cannot
-    read the review list must not guess how many rounds are left.
+    ``api`` is this call for callers that only need the payload and read every failure as
+    "unknown". ``explain`` needs the difference: a 404 is a fact about the pull request (it is
+    not there), a timeout is a fact about the network — and "check the number" and "retry the
+    read" are not interchangeable answers to an operator at 2am.
     """
-    stub = _stub(path, method, body)
-    if stub is not None or os.environ.get("REVIEW_LOOP_GH_STUB"):
-        return stub
+    if os.environ.get("REVIEW_LOOP_GH_STUB"):
+        return _stub(path, method, body)
     try:
         tok = token(loop, login)
     except GitHubError as exc:
-        log(str(exc))
-        return None
+        return None, str(exc)
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(
         f"{API}{path}", data=data, method=method,
@@ -92,24 +97,50 @@ def api(loop: dict, path: str, method: str = "GET", body=None, login: str | None
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             raw = resp.read().decode() or "null"
-            return json.loads(raw)
+            return json.loads(raw), ""
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode()[:120]
-        log(f"gh {method} {path} -> HTTP {exc.code}: {detail}")
+        detail = exc.read().decode()[:120].strip()
+        return None, f"HTTP {exc.code}{f' {detail}' if detail else ''}"
     except Exception as exc:
-        log(f"gh {method} {path} failed: {exc}")
-    return None
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def api(loop: dict, path: str, method: str = "GET", body=None, login: str | None = None):
+    """One REST call. Returns parsed JSON, or None when the call did not succeed.
+
+    Callers are expected to treat None as "unknown" and stay quiet: a loop that cannot
+    read the review list must not guess how many rounds are left.
+    """
+    data, error = fetch(loop, path, method, body, login)
+    if error:
+        log(f"gh {method} {path} failed: {error}")
+    return data
 
 
 # -- convenience --------------------------------------------------------------
+#
+# The paths live in one place each: a second copy of "/repos/{repo}/pulls/{n}" is exactly the
+# kind of thing that drifts between a gate and the command that explains the gate.
+
+
+def pr_path(loop: dict, number: int) -> str:
+    return f"/repos/{loop['repo']}/pulls/{number}"
+
+
+def reviews_path(loop: dict, number: int) -> str:
+    return f"{pr_path(loop, number)}/reviews?per_page=100"
+
+
+def hooks_path(loop: dict) -> str:
+    return f"/repos/{loop['repo']}/hooks?per_page=100"
 
 
 def pr(loop: dict, number: int):
-    return api(loop, f"/repos/{loop['repo']}/pulls/{number}")
+    return api(loop, pr_path(loop, number))
 
 
 def reviews(loop: dict, number: int):
-    return api(loop, f"/repos/{loop['repo']}/pulls/{number}/reviews?per_page=100")
+    return api(loop, reviews_path(loop, number))
 
 
 def open_prs(loop: dict):

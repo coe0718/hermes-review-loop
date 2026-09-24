@@ -14,6 +14,8 @@ GitHub ──pull_request──────────▶ gate_reviewer.py ─�
        └──(merge/close)─────────▶ gate_reviewer.py ──▶ cleanup.py   (disk, no agent)
 
 cron (15m, no agent) ──▶ watchdog.py ──▶ alerts in the operator's chat, drains the queue
+
+operator ──▶ review-loop explain ──▶ reads GitHub + the state files, writes neither
 ```
 
 ## The seats
@@ -169,6 +171,69 @@ the grace period) and drains the queue when it can be proven safe: the seat is f
 open, the head has not moved, and the verdict has not already landed. A drain that fails these
 checks drops the entry instead of firing — a stale queue entry must die quietly, not start a run
 against a head that moved on.
+
+The "is this loop armed at all?" question is answered by `gate.hooks_read`, which the watchdog and
+`explain` share: both seat routes must exist as active repo hooks. An unreadable hook list is
+**not** "paused" — a token without `admin:repo_hook` cannot see hooks that may well be active — so
+the watchdog stays silent there and `explain` prints "unknown" rather than guessing in either
+direction.
+
+## Explain — why is this PR not moving?
+
+A loop that stopped being driven looks exactly like a loop with nothing to do, and no single file
+answers "why". Half the answer is in GitHub (the head, the verdicts *at that head*, whether an
+approval exists) and half is on disk (who holds the PR, what is queued, what is marked in flight,
+what the watchdog last saw). `hermes review-loop explain --pr N` reads both and prints one report.
+
+It is **the gates' own logic, walked differently**, and that is the design constraint that matters:
+
+| | a gate | `explain` |
+|---|---|---|
+| input | a webhook payload | GitHub + the state directory |
+| guards | the same guards, in the same order | the same guards, in the same order |
+| at a guard | stops — `silence()`, and the operator sees only that nothing happened | reports all of them, and names the one that is holding the PR |
+| output | `[SILENT]`, or a payload with `_loop` | labelled facts, `blocked:` reasons, one `next:` event |
+| effect | a claim, a queue entry, a mark, a POST | none |
+
+The predicates are shared, not copied: `verdicts` (the round count), `reviews_at_head` /
+`reviewed_at_head` / `changes_at_head` / `approved_at_head`, `seat_key`, `seat_capacity`,
+`breach_delivery_status`, the seat ledgers, the queue and `hooks_read`. Re-deriving any of them would be
+the drift this report exists to rule out — an operator who is told "awaiting the fixer" while the
+fixer gate would in fact have fired has learned nothing.
+
+The guards report in the gates' own order, so the first one that names an action *is* the guard the
+loop would stop at:
+
+1. can GitHub be read at all (a failed read is unknown, never "closed");
+2. is the PR closed or merged (the loop is over; the closed path reclaims the disk);
+3. is the loop armed — a paused loop can be woken by nothing;
+4. is this a PR the reviewer gate serves at all (draft, wrong base, author is not a fixer);
+5. the budget: an approval ends the loop; a spent cap with pending delivery needs retry before any
+   ruling can be expected, while an acknowledged marker means adjudication;
+6. who holds the PR right now (one PR, one seat) — only a lock for the live head can imply its next
+   verdict or push; an old-head lock must be released or expire;
+7. is it queued for this exact head (a stale queued SHA is dropped, never retargeted; a current
+   queue waits for capacity); even without a queue entry, locks held by other PRs can fill a seat;
+8. is this exact head marked in flight (a run is already out for it);
+9. a verdict at this head with no fix run out (retry the fixer gate event, not an absent fixer's push);
+10. a non-verdict review at this head (a comment consumes no round and does not suppress a new
+    review request in the reviewer gate);
+11. nothing at this head: the fixer's request is what wakes the reviewer, and GitHub clears it when
+    a verdict lands, so a missing request is the classic silent stall. A pending request *without*
+    a run needs its gate event re-delivered, not a verdict from a reviewer who never started.
+
+Every report ends in exactly one `next:` line: a reviewer verdict, a review request, a retry of the
+fixer event, a fixer push plus request when a run exists, a released slot, an adjudication, a re-arm,
+a read retry, or nothing at all. Timestamps
+carry their source (the read itself, the verdict's `submitted_at`, or the state mark's own epoch),
+and anything that could not be read is printed as unknown with the reason.
+
+**Zero mutation is a property, not a promise.** `explain` does not call `st.active()` — which prunes
+expired locks *and writes them back* — but `st.live_locks()`, its read-only twin; it reads inflight
+marks with `inflight_at`, and never touches the queue except to count it. The suite runs it twice
+with an expired lock, a queue entry and a breach marker on disk, and asserts every file (both loops'
+configs, every state file, the route registry and the stub world) has the same SHA-256 hash and that
+no webhook was fired.
 
 ## Cleanup
 

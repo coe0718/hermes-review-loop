@@ -92,11 +92,18 @@ def world(prs: dict | None = None, hooks_active: bool = True) -> dict:
 
 def pr(number: int, head: str = HEAD_A, state: str = "open", draft: bool = False,
        author: str = FIXER, base: str = "main", title: str = "a change",
-       merged: str | None = None) -> dict:
+       merged: str | None = None, requested: str | None = None) -> dict:
+    """A pull request as the REST API renders it.
+
+    ``requested`` is the reviewer whose request is still pending — GitHub's own
+    ``requested_reviewers``, which it clears the moment a verdict lands. ``explain`` reads it, so
+    the fixtures carry it rather than inventing a queue entry for something GitHub owns.
+    """
     return {"number": number, "state": state, "draft": draft, "merged_at": merged,
             "title": title, "html_url": f"https://github.com/{REPO}/pull/{number}",
             "base": {"ref": base}, "user": {"login": author},
-            "head": {"sha": head, "ref": "fix-thing"}}
+            "head": {"sha": head, "ref": "fix-thing"},
+            "requested_reviewers": [{"login": requested}] if requested else []}
 
 
 def review(login: str, state: str = "changes_requested", head: str = HEAD_A, rid: int = 1) -> dict:
@@ -1166,6 +1173,7 @@ def group_plugin_settings() -> None:
     for argv in (["list"], ["settings"], ["status", "--loop", "widgets"],
                  ["apply", "--loop", "widgets", "--dry-run"],
                  ["set", "--loop", "widgets", "--cap", "4"],
+                 ["explain", "--loop", "widgets", "--pr", "7"],
                  ["arm", "--loop", "widgets"], ["cleanup", "--loop", "widgets"],
                  ["uninstall", "--loop", "widgets"]):
         parsed = parser.parse_args(argv)
@@ -1750,6 +1758,434 @@ def group_watchdog() -> None:
     check("paused loop drains nothing", "hooks are paused" in out, True)
 
 
+def group_explain() -> None:
+    """``explain`` — the answer to "why is this PR not moving?".
+
+    The golden cases are the states an operator actually meets at 2am: a review that went out, a
+    review with no verdict, a verdict with no fix, a head nobody asked about, a PR queued behind a
+    full seat, a spent budget, a paused loop, a closed PR, a PR that does not exist, and a GitHub
+    call that failed. Two properties get their own checks: the conclusions come from the gates' own
+    predicates (so the report cannot drift from what the loop does), and none of it writes.
+    """
+    section("explain — why is this PR not moving?")
+
+    import argparse
+
+    from review_loop import cli, config, gate, gh, state as state_mod
+
+    def explain(loop: str | None = "widgets", pr_number: int = 7,
+                extra_env: dict | None = None) -> tuple[int, str]:
+        """The verb as the CLI runs it, with stdout captured and any stub override restored."""
+        saved = {key: os.environ.get(key) for key in (extra_env or {})}
+        os.environ.update(extra_env or {})
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = cli.cmd_explain(ns(loop=loop, pr=pr_number))
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        return rc, buf.getvalue()
+
+    def held(seat: str, head: str = HEAD_A, age_min: float = 4, number: int = 7) -> None:
+        state_file("locks.json").write_text(json.dumps(
+            {seat: {f"{REPO}#{number}": {"at": time.time() - age_min * 60, "head": head,
+                                         "why": f"{seat} run"}}}))
+
+    def without_adjudicator(loop_id: str) -> None:
+        """A second loop over the same repo, with no adjudicator route configured."""
+        loop_cfg = config.normalize(
+            {"id": loop_id, "repo": REPO, "base": "main", "cap": 2,
+             "fixers": [FIXER], "reviewers": [REVIEWER], "reviewer_seat": SEAT,
+             "seats": {"reviewer": {"profile": "reviewer-profile", "route": "widgets-review"},
+                       "fixer": {"profile": "fixer-profile", "route": "widgets-fix"}},
+             "state_dir": str(STATE_DIR), "clone": str(CLONE), "host": HOST})
+        (LOOPS_DIR / f"{loop_id}.json").write_text(json.dumps(loop_cfg))
+
+    # -- a first review that was requested and is running --------------------------------
+    reset(prs={"7": {**pr(7, requested=SEAT)}})
+    held("reviewer", age_min=4)
+    state_file("inflight.json").write_text(json.dumps({f"review:7:{HEAD_A}": time.time() - 4 * 60}))
+    rc, out = explain()
+    check("first review in flight: exits 0", rc, 0)
+    check("  the next event is the reviewer's verdict", "reviewer's verdict at head aaaaaaa" in out, True)
+    check("  with the round it is", "round 1 of 3" in out, True)
+    check("  the PR is linked", f"https://github.com/{REPO}/pull/7" in out, True)
+    check("  the seat holder and its age are shown", "reviewer holds it (4m of ttl 45m" in out, True)
+    check("  the in-flight mark and its age are shown", "review for head aaaaaaa armed 4m ago" in out, True)
+    check("  the pending request is named", "review requested from rev-seat" in out, True)
+    check("  nothing is called a blocker", "blocked:    nothing — no guard" in out, True)
+    check("  no token reaches the report", "token-reviewer" in out or "token-fixer" in out, False)
+    check("  it labels when it read GitHub", bool(re.search(r"read:\s+\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", out)), True)
+    check("  and says the read wrote nothing", "read once, nothing written" in out, True)
+
+    # -- a review at the head with no verdict -------------------------------------------
+    reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, state="commented", rid=4)]}})
+    rc, out = explain()
+    check("commented review: counted as no verdict", "non-verdict review at head aaaaaaa (COMMENTED)" in out, True)
+    check("  reviewer gate still accepts a fresh request", "does not suppress a fresh reviewer request" in out, True)
+    check("  next is a fresh request", "the fixer asks for review of head aaaaaaa" in out, True)
+    check("  no verdict was counted", "0/3 verdicts spent" in out, True)
+    check("  live gate predicate ignores COMMENTED",
+          gate.reviewed_at_head([review(REVIEWER, state="commented")], config.load_id("widgets"), HEAD_A), False)
+    check("  live gate predicate accepts CHANGES_REQUESTED",
+          gate.reviewed_at_head([review(REVIEWER)], config.load_id("widgets"), HEAD_A), True)
+
+    # -- a verdict at the head with no fix run out --------------------------------------
+    reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, rid=5)]}})
+    rc, out = explain()
+    check("verdict awaiting a fix: next is fixer gate retry",
+          "re-deliver the changes-requested review event for head aaaaaaa" in out, True)
+    check("  no imaginary fixer is told to push", "no fixer is running to push a fix" in out, True)
+    check("  the missing run is named", "has no fix run out" in out, True)
+    check("  budget counts verdicts at the head", "1/3 verdicts spent · 1 at head aaaaaaa" in out, True)
+    check("  and labels the verdict's timestamp",
+          "changes requested 2026-01-01T00:00:00Z by rev-coach" in out, True)
+
+    held("fixer", age_min=2)
+    rc, out = explain()
+    check("fixer mid-turn: next is its push and ask", "frees the fixer's slot" in out, True)
+    check("  and it is not called a stall", "blocked:    nothing" in out, True)
+
+    # -- a new head nobody has asked about ---------------------------------------------
+    reset(prs={"7": {**pr(7, head=HEAD_B), "reviews": [review(REVIEWER, head=HEAD_A, rid=5)]}})
+    rc, out = explain()
+    check("new head: nothing at this head", "nothing at head bbbbbbb" in out, True)
+    check("  the fixer must ask for the review", "the fixer asks for review of head bbbbbbb" in out, True)
+    check("  the missing request is called out", "no review request exists for head bbbbbbb" in out, True)
+    check("  the spent verdict still counts", "1/3 verdicts spent" in out, True)
+
+    # A pending request is not a running reviewer. The same request event must be replayed.
+    reset(prs={"7": pr(7, requested=SEAT)})
+    rc, out = explain()
+    check("pending request without run: retry gate", "re-deliver the review_requested event" in out, True)
+    check("pending request without run: no imaginary verdict", "next:       the reviewer's verdict" in out, False)
+    check("pending request without run: pure kind", gate.explain(config.load_id("widgets"),
+          state_mod.state_for(config.load_id("widgets")), 7,
+          {"pr": pr(7, requested=SEAT), "reviews": [], "armed": True})["next"]["kind"], "retry")
+
+    # Other PRs occupy the same slots the live gate checks, even before this PR is queued.
+    reset(prs={"7": pr(7, requested=SEAT), "9": pr(9)})
+    held("reviewer", number=9)
+    rc, out = explain()
+    check("other reviewer fills seat: capacity blocker", "reviewer seat at capacity 1/1 on other PRs" in out, True)
+    check("other reviewer fills seat: replay queues until release",
+          "reviewer gate will queue it at capacity 1/1" in out, True)
+    check("same capacity predicate as gate", gate.seat_capacity(config.load_id("widgets"),
+          state_mod.state_for(config.load_id("widgets")), "reviewer"), (1, 1))
+    reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER)]}, "9": pr(9)})
+    held("fixer", number=9)
+    rc, out = explain()
+    check("other fixer fills seat: capacity blocker", "fixer seat at capacity 1/1 on other PRs" in out, True)
+    check("other fixer fills seat: replay queues until release",
+          "fixer gate will queue it at capacity 1/1" in out, True)
+
+    # A lock's PR key survives a push, but its recorded SHA is not authorization at the new SHA.
+    reset(prs={"7": pr(7, head=HEAD_B, requested=SEAT)})
+    held("reviewer", head=HEAD_A)
+    rc, out = explain()
+    check("stale reviewer lock: named", "reviewer lock targets an older head" in out, True)
+    check("stale reviewer lock: no new-head verdict", "the reviewer's verdict at head bbbbbbb" in out, False)
+    check("stale reviewer lock: release before replay", "release or wait for the stale reviewer lock" in out, True)
+    reset(prs={"7": {**pr(7, head=HEAD_B), "reviews": [review(REVIEWER, head=HEAD_B)]}})
+    held("fixer", head=HEAD_A)
+    rc, out = explain()
+    check("stale fixer lock: named", "fixer lock targets an older head" in out, True)
+    check("stale fixer lock: no new-head push", "the fixer pushes a fix" in out, False)
+    check("stale fixer lock: release before replay", "release or wait for the stale fixer lock" in out, True)
+
+    # The opposite seat's completed turn is released by the handoff event itself.
+    reset(prs={"7": {**pr(7, head=HEAD_B), "reviews": [review(REVIEWER, head=HEAD_B)]}})
+    held("reviewer", head=HEAD_A)
+    rc, out = explain()
+    check("stale opposite reviewer lock: replay verdict releases it",
+          "re-deliver the changes-requested review event" in out, True)
+    check("stale opposite reviewer lock: no wait for expiry",
+          "release or wait for the stale reviewer lock" in out, False)
+    reset(prs={"7": pr(7, head=HEAD_B, requested=SEAT)})
+    held("fixer", head=HEAD_A)
+    rc, out = explain()
+    check("stale opposite fixer lock: replay request releases it",
+          "re-deliver the review_requested event" in out, True)
+    check("stale opposite fixer lock: no wait for expiry",
+          "release or wait for the stale fixer lock" in out, False)
+
+    # -- queued behind a full seat ------------------------------------------------------
+    reset(prs={"7": pr(7), "9": pr(9, head=HEAD_B)})
+    held("reviewer", head=HEAD_A, age_min=12, number=7)
+    state_file("pending.json").write_text(json.dumps(
+        {"reviewer": {f"{REPO}#9": {"at": time.time() - 9 * 60, "head": HEAD_B, "url": "u",
+                                    "reason": "reviewer at capacity 1/1: acme/widgets#7 (720s)"}}}))
+    rc, out = explain(pr_number=9)
+    check("queued: position and age are shown", "reviewer 1 of 1 (waiting 9m)" in out, True)
+    check("  the gate's own reason is repeated",
+          "reviewer at capacity 1/1: acme/widgets#7 (720s)" in out, True)
+    check("  blocked by no capacity", "no capacity: queued with the reviewer seat" in out, True)
+    check("  next is a freed slot", "a reviewer slot frees" in out, True)
+
+    # A queue entry authorizes only its stored SHA. A slot freeing cannot run an old head.
+    reset(prs={"9": pr(9, head=HEAD_A)})
+    state_file("pending.json").write_text(json.dumps(
+        {"reviewer": {f"{REPO}#9": {"at": time.time() - 9 * 60, "head": HEAD_B,
+                                    "reason": "reviewer at capacity 1/1"}}}))
+    rc, out = explain(pr_number=9)
+    check("stale queue identifies old and live head", "queue targets head bbbbbbb, not current head aaaaaaa" in out, True)
+    check("stale queue never promises release will launch it", "a reviewer slot frees" in out, False)
+    check("stale queue asks for a fresh request", "the fixer asks for review of head aaaaaaa" in out, True)
+
+    # -- the cap is spent ---------------------------------------------------------------
+    spent_reviews = [review(REVIEWER, head="c" * 40, rid=1), review(REVIEWER, head="d" * 40, rid=2),
+                     review(REVIEWER, head="e" * 40, rid=3)]
+    reset(prs={"7": {**pr(7, head=HEAD_B), "reviews": spent_reviews}})
+    state_file("breach.json").write_text(json.dumps(
+        {f"{REPO}#7": {"pr": 7, "head": HEAD_B, "rounds": 3, "cap": 3, "at": PAST,
+                       "status": "awaiting-adjudication", "reason": "review cap reached"}}))
+    rc, out = explain()
+    check("cap spent: the escalation is reported",
+          "escalation: awaiting-adjudication at head bbbbbbb" in out, True)
+    check("  with the marker's own timestamp", PAST in out, True)
+    check("  and a blocker that says why", "parked awaiting adjudication" in out, True)
+    check("  next is the ruling", "the adjudicator rules at head bbbbbbb" in out, True)
+
+    state_file("breach.json").write_text(json.dumps(
+        {f"{REPO}#7": {"pr": 7, "head": HEAD_B, "rounds": 3, "cap": 3, "at": PAST,
+                       "status": "adjudicating", "reason": "review cap reached"}}))
+    rc, out = explain()
+    check("consumed marker: adjudicating is parked", "parked awaiting adjudication" in out, True)
+    check("consumed marker: next is ruling, not redelivery",
+          "the adjudicator rules at head bbbbbbb" in out and "re-deliver" not in out, True)
+
+    # POST failure leaves a pending marker; only an acknowledged delivery promises a ruling.
+    state_file("breach.json").write_text(json.dumps(
+        {f"{REPO}#7": {"pr": 7, "head": HEAD_B, "rounds": 3, "cap": 3, "at": PAST,
+                       "status": "delivery-pending", "reason": "review cap reached"}}))
+    rc, out = explain()
+    check("pending breach: retry delivery", "retry adjudicator delivery for head bbbbbbb" in out, True)
+    check("pending breach: no promised ruling", "the adjudicator rules at head bbbbbbb" in out, False)
+    check("pending breach: blocker is delivery", "adjudicator delivery pending" in out, True)
+    check("pending marker uses live head predicate", gate.breach_delivery_status(
+          {"head": HEAD_B, "status": "delivery-pending"}, HEAD_B), "delivery-pending")
+
+    # A dismissed verdict can bring the live count back below cap. The watchdog
+    # refuses this delivery, so explain must not promise a retry on its next sweep.
+    set_prs({"7": {**pr(7, head=HEAD_B, requested=SEAT), "reviews": spent_reviews[:-1]}})
+    rc, out = explain()
+    check("pending marker below cap: no watchdog retry promised",
+          "retry adjudicator delivery" in out, False)
+    check("pending marker below cap: review request can be replayed",
+          "re-deliver the review_requested event" in out, True)
+    check("pending marker below cap: stale delivery not blocking",
+          "adjudicator delivery pending" in out, False)
+    check("old marker does not park new head", gate.breach_delivery_status(
+          {"head": HEAD_A, "status": "awaiting-adjudication"}, HEAD_B), "")
+
+    # The third verdict was dismissed after escalation. Its historical marker
+    # remains on this head, but the live gate can start round three again.
+    for status in ("awaiting-adjudication", "adjudicating"):
+        reset(prs={"7": {**pr(7, head=HEAD_B, requested=SEAT),
+                         "reviews": [*spent_reviews[:-1],
+                                     review(REVIEWER, state="dismissed", head="e" * 40,
+                                            rid=3)]}})
+        state_file("breach.json").write_text(json.dumps(
+            {f"{REPO}#7": {"pr": 7, "head": HEAD_B, "rounds": 3, "cap": 3,
+                            "at": PAST, "status": status, "reason": "review cap reached"}}))
+        report = gate.explain(config.load_id("widgets"),
+                              state_mod.state_for(config.load_id("widgets")), 7,
+                              {"pr": pr(7, head=HEAD_B, requested=SEAT),
+                               "reviews": DATA["world"]["prs"]["7"]["reviews"],
+                               "armed": True})
+        check(f"dismissed third verdict / {status}: live count", report["spent"], 2)
+        check(f"dismissed third verdict / {status}: no parked blocker",
+              any("parked awaiting adjudication" in b for b in report["blockers"]), False)
+        check(f"dismissed third verdict / {status}: explain asks for gate replay",
+              (report["next"]["kind"],
+               "re-deliver the review_requested event" in report["next"]["action"]),
+              ("retry", True))
+        check(f"dismissed third verdict / {status}: marker stays diagnostic",
+              report["escalation"].startswith(f"{status} at head bbbbbbb"), True)
+        outcome, output, error = run("gate_reviewer.py",
+                                     pr_payload(head=HEAD_B),
+                                     extra_env={"REVIEW_LOOP_TEST": "1"})
+        check(f"dismissed third verdict / {status}: reviewer gate starts round three",
+              (outcome, json.loads(output).get("_loop", {}).get("round")
+               if outcome == "FIRE" else error), ("FIRE", 3))
+
+    reset(prs={"7": {**pr(7, head=HEAD_B), "reviews": spent_reviews}})
+    rc, out = explain()
+    check("cap spent with no marker: the gate never fired", "no escalation marker" in out, True)
+    check("  missing marker retries cap event", "create and deliver the missing breach marker" in out, True)
+
+    without_adjudicator(loop_id="widgets-solo")
+    rc, out = explain(loop="widgets-solo")
+    check("no adjudicator route: said plainly", "has no adjudicator route" in out, True)
+    check("  and it points at a human", "rule by hand" in out, True)
+
+    # -- paused, closed, missing, unreadable --------------------------------------------
+    reset(prs={"7": pr(7)}, hooks_active=False)
+    rc, out = explain()
+    check("paused: both hooks reported off", "PAUSED — seat route(s) without an active repo hook: reviewer, fixer" in out, True)
+    check("  blocked by the pause", "paused loop: seat route(s) without an active repo hook: reviewer, fixer" in out, True)
+    check("  next is re-arming", "hermes review-loop arm --loop widgets" in out, True)
+
+    reset(prs={"7": pr(7)})
+    partial = world({"7": pr(7)})
+    partial["hooks"] = partial["hooks"][:1]
+    WORLD_FILE.write_text(json.dumps(partial))
+    rc, out = explain()
+    check("one active hook diagnoses missing fixer only", "PAUSED — seat route(s) without an active repo hook: fixer" in out, True)
+    check("  next is re-arm", "hermes review-loop arm --loop widgets" in out, True)
+    check("  watchdog shares the both-hook predicate", gate.hooks_armed(config.load_id("widgets")), False)
+    partial["hooks"] = world({"7": pr(7)})["hooks"]
+    WORLD_FILE.write_text(json.dumps(partial))
+    check("both active hooks arm the loop", gate.hooks_armed(config.load_id("widgets")), True)
+    partial["hooks"][0]["active"] = False
+    WORLD_FILE.write_text(json.dumps(partial))
+    check("inactive reviewer hook diagnoses reviewer only", "active repo hook: reviewer" in explain()[1], True)
+
+    reset(prs={"7": pr(7, state="closed", merged="2026-02-02T00:00:00Z")})
+    rc, out = explain()
+    check("closed: the state is named", "state:      merged" in out, True)
+    check("  the loop is over for it", "the loop is over for it" in out, True)
+    check("  next is nothing", "nothing — the PR is merged" in out, True)
+
+    reset(prs={"7": pr(7)})
+    rc, out = explain(pr_number=404)
+    check("missing PR: GitHub having none is said plainly", "no PR #404 in acme/widgets" in out, True)
+    check("  the state is unknown, not closed", "the PR is closed" in out, False)
+    check("  next says there is nothing to drive", "nothing to drive" in out, True)
+
+    # GitHub deliberately reports inaccessible repositories/PRs as HTTP 404.
+    with mock.patch.object(gh, "fetch", side_effect=[(None, 'HTTP 404 {"message":"Not Found"}'),
+                                                       (None, "HTTP 404"), ([], "")]):
+        facts_404 = gate.explain_facts(config.load_id("widgets"), 404)
+    check("HTTP 404 is missing or inaccessible, not transient", facts_404["pr_error"], "")
+    check("  404 diagnosis does not recommend retry", gate.explain(config.load_id("widgets"),
+          state_mod.state_for(config.load_id("widgets")), 404, facts_404)["next"]["kind"], "none")
+
+    reset(prs={"7": {**pr(7), "head": {}}})
+    rc, out = explain()
+    check("PR without a head diagnoses unknown head", "PR head missing or malformed" in out, True)
+    check("  cannot suggest a review request", "the fixer asks for review" in out, False)
+    check("  suggests retrying the malformed PR read", "retry the PR read" in out, True)
+
+    reset(prs={"7": pr(7)})
+    rc, out = explain(extra_env={"REVIEW_LOOP_GH_STUB": "/bin/false"})
+    check("API failure: labelled a stale/failing read", "stale/failing GitHub read" in out, True)
+    check("  the PR is unknown rather than closed",
+          "unknown — the PR itself could not be read" in out, True)
+    check("  the verdict count is not guessed",
+          "unknown — the review list could not be read" in out, True)
+    check("  next is a retry", "retry the GitHub read" in out, True)
+    check("  and it does not claim the loop is paused", "PAUSED" in out, False)
+
+    # -- the two properties the issue is really about -----------------------------------
+    def snapshot() -> dict:
+        files: dict = {}
+        for base in (STATE_DIR, LOOPS_DIR):
+            for path in sorted(pathlib.Path(base).rglob("*")):
+                if path.is_file():
+                    files[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in (WORLD_FILE, SUBS):
+            files[str(path)] = hashlib.sha256(path.read_bytes()).hexdigest()
+        return files
+
+    reset(prs={"7": {**pr(7, requested=SEAT)}})
+    state_file("locks.json").write_text(json.dumps(
+        {"reviewer": {f"{REPO}#7": {"at": time.time() - 120, "head": HEAD_A, "why": "review"},
+                      f"{REPO}#8": {"at": time.time() - 120 * 60, "head": HEAD_B, "why": "died"}}}))
+    state_file("pending.json").write_text(json.dumps(
+        {"fixer": {f"{REPO}#9": {"at": time.time(), "head": HEAD_B, "url": "u",
+                                 "reason": "fixer at capacity 1/1"}}}))
+    state_file("inflight.json").write_text(json.dumps({f"review:7:{HEAD_A}": time.time() - 60}))
+    state_file("breach.json").write_text(json.dumps(
+        {f"{REPO}#7": {"head": "c" * 40, "status": "awaiting-adjudication", "at": PAST,
+                       "reason": "cap"}}))
+    before, fired = snapshot(), len(RECEIVED)
+    explain()
+    explain(pr_number=9)
+    after = snapshot()
+    check("explain twice: fixture paths and SHA-256 hashes unchanged", before == after, True)
+    check("  and it compared both loops' and the state's files", len(before) >= 7, True)
+    check("  and no webhook was fired", len(RECEIVED) - fired, 0)
+    check("  the expired lock was not pruned away",
+          f"{REPO}#8" in load_state("locks.json").get("reviewer", {}), True)
+    check("  the queue was not touched",
+          load_state("pending.json").get("fixer", {}).get(f"{REPO}#9", {}).get("reason"),
+          "fixer at capacity 1/1")
+
+    # -- the pure decision, called as the gates call their predicates -------------------
+    reset(prs={})                      # no leftover locks: these facts say who holds what
+    loop = config.load_id("widgets")
+    st = state_mod.state_for(loop)
+
+    def decide(**over) -> dict:
+        facts = {"pr": pr(7), "pr_error": "", "reviews": [], "reviews_error": "",
+                 "armed": True, "armed_error": "", "read_at": 1_700_000_000.0}
+        facts.update(over)
+        return gate.explain(loop, st, 7, facts)
+
+    check("a failed read → retry", decide(pr=None, pr_error="HTTP 500")["next"]["kind"], "retry")
+    check("no such PR → nothing", decide(pr=None)["next"]["kind"], "none")
+    check("an unreadable review list → retry",
+          decide(reviews=None, reviews_error="HTTP 403")["next"]["kind"], "retry")
+    check("unreadable hooks are not called paused", decide(armed=None)["hooks"].startswith("unknown"),
+          True)
+    check("  and that is named as a blocker",
+          any("hook state unreadable" in text for text in decide(armed=None)["blockers"]), True)
+    check("paused → re-arm", decide(armed=False)["next"]["kind"], "rearm")
+    check("a draft → ready_for_review", decide(pr=pr(7, draft=True))["next"]["kind"], "ready")
+    check("a wrong base → nothing", decide(pr=pr(7, base="release"))["next"]["kind"], "none")
+    check("someone else's PR → nothing", decide(pr=pr(7, author="outsider"))["next"]["kind"], "none")
+    check("approved at the head → nothing",
+          decide(reviews=[review(REVIEWER, state="approved")])["next"]["kind"], "none")
+    check("a request pending with no run out → retry",
+          decide(pr=pr(7, requested=SEAT))["next"]["kind"], "retry")
+    check("nothing pending at all → ask for review", decide()["next"]["kind"], "review-request")
+    check("every conclusion is a declared kind", decide()["next"]["kind"] in gate.EXPLAIN_KINDS, True)
+    check("the same facts decide the same way", decide() == decide(), True)
+
+    # -- asking without --loop ----------------------------------------------------------
+    reset(prs={"7": pr(7)})
+    rc, out = explain(loop=None)
+    check("omitted --loop: the only loop answers", rc, 0)
+    check("  and it is the widgets loop", "[widgets] acme/widgets#7" in out, True)
+
+    (LOOPS_DIR / "second.json").write_text(json.dumps(config.normalize(
+        {"id": "second", "repo": "acme/second", "fixers": [FIXER], "reviewers": [REVIEWER],
+         "reviewer_seat": SEAT,
+         "seats": {"reviewer": {"profile": "reviewer-profile", "route": "second-review"},
+                   "fixer": {"profile": "fixer-profile", "route": "second-fix"}}})))
+    rc, out = explain(loop=None)
+    check("two loops: refuses instead of guessing", rc, 2)
+    check("  and names them", "second, widgets" in out, True)
+    (LOOPS_DIR / "second.json").unlink()
+    rc, out = explain(loop=None)
+    check("back to one loop: answers again", rc, 0)
+
+    rc, out = explain(loop="nope")
+    check("an unknown loop is refused", rc, 2)
+    check("  with the reason", "no such loop" in out, True)
+
+    fake = FakeCtx()
+    cli.register_cli(fake)
+    parser = argparse.ArgumentParser(prog="hermes review-loop")
+    fake.setup(parser)
+    parsed = parser.parse_args(["explain", "--loop", "widgets", "--pr", "7"])
+    check("`explain --loop widgets --pr 7` parses", (parsed.command, parsed.pr), ("explain", 7))
+    check("  and the CLI explains without a loop too",
+          parser.parse_args(["explain", "--pr", "7"]).loop, None)
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):    # argparse legitimately shouts here
+            parser.parse_args(["explain", "--loop", "widgets"])
+    except SystemExit:
+        check("--pr is required", True, True)
+    else:
+        check("--pr is required", False, True)
+
+
 def verify_sig(request: dict, route: str) -> bool:
     subs = json.loads(SUBS.read_text())
     secret = subs[route]["secret"].encode()
@@ -2093,7 +2529,7 @@ GROUPS = {"routes": group_routes, "config": group_config, "reviewer": group_revi
           "exclusive": group_exclusive, "settings": group_settings,
           "webhook_host": group_webhook_host,
           "plugin_settings": group_plugin_settings, "watchdog": group_watchdog,
-          "cleanup": group_cleanup}
+          "explain": group_explain, "cleanup": group_cleanup}
 
 
 def main() -> int:
