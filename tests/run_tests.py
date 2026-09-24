@@ -17,7 +17,9 @@ Runs with a plain interpreter and no network — no ``gh``, no pytest, no GitHub
 from __future__ import annotations
 
 import argparse
+import atexit
 import contextlib
+import importlib.util
 import hashlib
 import hmac
 import io
@@ -28,16 +30,22 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from types import SimpleNamespace
 from typing import Any
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-TMP = ROOT / "tests" / ".tmp"
+# Fixtures must not inherit the source checkout's Git owner: cleanup correctly
+# refuses to delete artifacts under an unrelated repository, even a test repo.
+TMP = pathlib.Path(tempfile.mkdtemp(prefix="review-loop-tests-", dir=os.environ.get(
+    "TMPDIR", str(pathlib.Path.home() / ".hermes" / "cache" / "scratch"))))
+atexit.register(shutil.rmtree, TMP, ignore_errors=True)
 LOOPS_DIR = TMP / "loops"
 STATE_DIR = TMP / "state"
 REVIEWS = TMP / "reviews"
@@ -1288,6 +1296,22 @@ def group_cleanup() -> None:
           "other repo's branch\n")
     check("PR-named directory inside clone survives", (clone_child / "sentinel.txt").exists(), True)
 
+    # A configured root inside another repository is not owned by this clone.
+    reset(prs={"7": pr(7, state="closed")})
+    foreign = TMP / "foreign-checkout"
+    shutil.rmtree(foreign, ignore_errors=True)
+    subprocess.run(["git", "init", "-q", "-b", "main", str(foreign)], check=True)
+    foreign_root = foreign / "build"
+    foreign_root.mkdir()
+    foreign_file = foreign_root / "pr7-source"
+    foreign_file.write_text("foreign source\n")
+    cfg = json.loads((LOOPS_DIR / "widgets.json").read_text())
+    cfg["roots"].append(str(foreign_root))
+    (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
+    run("cleanup.py", None, "--loop", "widgets", "--pr", "7")
+    check("foreign repo root cannot authorize source removal", foreign_file.read_text() if foreign_file.exists() else None,
+          "foreign source\n")
+
     reset(prs={"7": pr(7, state="closed")})
     outside = TMP / "pr7-outside"
     subprocess.run(["git", "-C", str(CLONE), "worktree", "add", "--detach", str(outside), "HEAD"],
@@ -1314,6 +1338,82 @@ def group_cleanup() -> None:
     (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
     run("cleanup.py", None, "--loop", "widgets", "--pr", "7")
     check("symlinked root cannot delete external child", (external / "pr7-sentinel").exists(), True)
+
+    # Swap a validated root at the du seam; string-path unlink would hit the sentinel.
+    reset(prs={"7": pr(7, state="closed")})
+    external = TMP / "outside-swap"
+    shutil.rmtree(external, ignore_errors=True)
+    external.mkdir()
+    outside_file = external / "pr7-build.log"
+    outside_file.write_text("outside must survive\n")
+    outside_tree = external / "pr7-wt"
+    outside_tree.mkdir()
+    (outside_tree / "sentinel.txt").write_text("outside worktree survives\n")
+    saved_root = TMP / "reviews-before-swap"
+    spec = importlib.util.spec_from_file_location("cleanup_under_test", ROOT / "scripts" / "cleanup.py")
+    cleanup = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cleanup)
+    with mock.patch.object(cleanup.gh, "pr", return_value={"number": True, "state": "closed"}):
+        check("boolean true is not PR #1", cleanup.pr_state({}, 1), {})
+    real_du = cleanup.du
+    swapped = False
+
+    def swap_during_du(path):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            REVIEWS.rename(saved_root)
+            REVIEWS.symlink_to(external, target_is_directory=True)
+        return real_du(path)
+
+    try:
+        with mock.patch.object(cleanup, "du", side_effect=swap_during_du):
+            cleanup.clean_pr(json.loads((LOOPS_DIR / "widgets.json").read_text()), 7,
+                             dry=False, quiet=True, force=True)
+        check("swap hook exercised after validation", swapped, True)
+        check("swapped root cannot unlink outside sentinel", outside_file.read_text() if outside_file.exists() else None,
+              "outside must survive\n")
+        check("swapped root cannot remove outside tree", (outside_tree / "sentinel.txt").exists(), True)
+    finally:
+        REVIEWS.unlink(missing_ok=True)
+        saved_root.rename(REVIEWS)
+
+    # A replacement *real directory* (not a symlink) must not bypass the
+    # validation-time parent identity check, even with a matching basename.
+    original = TMP / "original-root"
+    replacement = TMP / "replacement-root"
+    original.mkdir()
+    replacement.mkdir()
+    candidate = original / "pr7-log"
+    candidate.write_text("original\n")
+    (replacement / "pr7-log").write_text("replacement\n")
+    identity = cleanup.candidate_identity(candidate)
+    moved = TMP / "moved-original-root"
+    original.rename(moved)
+    replacement.rename(original)
+    check("real-directory root swap refuses replacement inode",
+          cleanup.remove_path(candidate, quiet=True, expected=identity), 0)
+    check("real-directory root swap preserves replacement", candidate.read_text(), "replacement\n")
+
+    tree = TMP / "pr7-tree-swap"
+    tree.mkdir()
+    child = tree / "build"
+    child.mkdir()
+    (child / "artifact.log").write_text("build\n")
+    outside_tree = TMP / "outside-tree-swap"
+    outside_tree.mkdir()
+    outside_marker = outside_tree / "sentinel.txt"
+    outside_marker.write_text("do not follow\n")
+    real_remove_tree = cleanup.remove_tree_fd
+
+    def swap_nested_before_walk(fd):
+        shutil.rmtree(child)
+        child.symlink_to(outside_tree, target_is_directory=True)
+        return real_remove_tree(fd)
+
+    with mock.patch.object(cleanup, "remove_tree_fd", side_effect=swap_nested_before_walk):
+        cleanup.remove_path(tree, quiet=True, expected=cleanup.candidate_identity(tree))
+    check("nested symlink swap cannot traverse outside", outside_marker.read_text(), "do not follow\n")
 
     reset(prs={"7": pr(7, state="closed")})
     unrelated = TMP / "pr7-unrelated-root"
@@ -1369,7 +1469,9 @@ def group_cleanup() -> None:
                             ("malformed state", {"number": 7, "state": "mystery"}),
                             ("missing identity", {"state": "closed"}),
                             ("error body", {"message": "API unavailable"}),
-                            ("wrong PR", pr(9, state="closed"))):
+                            ("wrong PR", pr(9, state="closed")),
+                            ("boolean PR", {**pr(7, state="closed"), "number": True}),
+                            ("float PR", {**pr(7, state="closed"), "number": 7.0})):
         reset(prs={"7": response} if response is not None else {})
         marker = state_file("breach.json")
         marker.write_text(json.dumps({f"{REPO}#7": {"status": "awaiting-adjudication"}}))

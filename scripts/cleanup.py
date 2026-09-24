@@ -25,6 +25,10 @@ Safety rails, because this deletes real directories:
   explicit operator override for open or unavailable/malformed lookup results;
 * the clone itself, and anything outside the roots, is out of scope by construction.
 
+Cleanup is not a transactional lock on the filesystem: another writer can still
+replace files inside an owned directory during traversal. Do not run it against
+roots concurrently modified by an untrusted process.
+
 The report prints **file bytes removed** (``du``), which is not the same number as disk
 recovered: on a compressed or reflink-sharing volume the filesystem gains less. Quote the
 ``df`` delta when the distinction matters.
@@ -33,11 +37,12 @@ recovered: on a compressed or reflink-sharing volume the filesystem gains less. 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import pathlib
 import re
-import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -142,10 +147,9 @@ def owned_candidate(path: pathlib.Path, roots: list[pathlib.Path],
     if clone and (inside(candidate, clone) or inside(clone, candidate)):
         return False
     owner = git_owner(path)
-    # A root may itself be nested in the repository holding this configuration;
-    # that ancestor alone does not turn its scratch artifacts into checkouts.
-    inherited_repo = owner and any(owner in root.parents for root in roots)
-    if owner and not inherited_repo and (owner != candidate or candidate not in registered):
+    # A configured root is a discovery boundary, not proof that another Git
+    # repository's contents belong to this loop (including inherited owners).
+    if owner and (owner != candidate or candidate not in registered):
         return False
     # A PR-named build directory may enclose an unrelated checkout. Do not recurse
     # through a Git registration we cannot prove belongs to this clone.
@@ -162,26 +166,83 @@ def du(path: pathlib.Path) -> int:
         return 0
 
 
-def remove_path(path: pathlib.Path, quiet: bool) -> int:
-    """Remove one path. Files and directories need different calls.
+@contextlib.contextmanager
+def pinned_parent(path: pathlib.Path):
+    """Resolve each ancestor without symlinks and hold its directory fd for unlink.
 
-    ``shutil.rmtree`` on a plain file raises, and with ``ignore_errors=True`` that failure is
-    silent: the first version of this cleanup "reclaimed" 180 log files it never touched. Ask
-    what the path is, then remove it, then verify it is gone.
+    An attacker renaming a configured root cannot redirect a subsequent unlink
+    outside it. The candidate's inode is checked separately after measuring.
     """
+    absolute = path.absolute()
+    with contextlib.ExitStack() as stack:
+        fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+        stack.callback(os.close, fd)
+        for part in absolute.parent.parts[1:]:
+            fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            stack.callback(os.close, fd)
+        yield fd
+
+
+def candidate_identity(path: pathlib.Path) -> tuple[tuple[int, int], tuple[int, int]]:
+    with pinned_parent(path) as fd:
+        parent = os.fstat(fd)
+        info = os.stat(path.name, dir_fd=fd, follow_symlinks=False)
+        if stat.S_ISLNK(info.st_mode):
+            raise OSError("candidate is a symlink")
+        return (parent.st_dev, parent.st_ino), (info.st_dev, info.st_ino)
+
+
+def remove_tree_fd(fd: int) -> None:
+    """Walk only opened directories; never resolve a child through a symlink."""
+    with os.scandir(fd) as entries:
+        for entry in entries:
+            info = entry.stat(follow_symlinks=False)
+            if stat.S_ISDIR(info.st_mode):
+                child = os.open(entry.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                dir_fd=fd)
+                try:
+                    if not os.path.samestat(info, os.fstat(child)):
+                        raise OSError("child changed during traversal")
+                    remove_tree_fd(child)
+                finally:
+                    os.close(child)
+                os.rmdir(entry.name, dir_fd=fd)
+            else:
+                os.unlink(entry.name, dir_fd=fd)
+
+
+def remove_path(path: pathlib.Path, quiet: bool,
+                expected: tuple[tuple[int, int], tuple[int, int]] | None = None,
+                size: int | None = None) -> int:
+    """Remove by pinned parent fd, rejecting a changed candidate or root."""
     if NEVER_TOUCH.search(str(path)):
         log(f"    SKIP (evidence pattern): {path}", quiet)
         return 0
-    size = du(path)
+    if size is None:
+        size = du(path)
     try:
-        if path.is_dir() and not path.is_symlink():
-            shutil.rmtree(path, ignore_errors=True)
-        else:
-            path.unlink(missing_ok=True)
+        with pinned_parent(path) as fd:
+            parent = os.fstat(fd)
+            info = os.stat(path.name, dir_fd=fd, follow_symlinks=False)
+            if stat.S_ISLNK(info.st_mode) or (expected is not None and
+                    expected != ((parent.st_dev, parent.st_ino), (info.st_dev, info.st_ino))):
+                raise OSError("candidate changed after validation")
+            if stat.S_ISDIR(info.st_mode):
+                child = os.open(path.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                dir_fd=fd)
+                try:
+                    if not os.path.samestat(info, os.fstat(child)):
+                        raise OSError("candidate changed before traversal")
+                    remove_tree_fd(child)
+                finally:
+                    os.close(child)
+                os.rmdir(path.name, dir_fd=fd)
+            else:
+                os.unlink(path.name, dir_fd=fd)
     except Exception as exc:
         log(f"    FAILED {path}: {exc}", quiet)
         return 0
-    if path.exists():
+    if path.exists() and not path.is_symlink():
         log(f"    SKIP (not removable): {path}", quiet)
         return 0
     return size
@@ -190,7 +251,7 @@ def remove_path(path: pathlib.Path, quiet: bool) -> int:
 def pr_state(loop: dict, number: int) -> dict:
     """Return a fresh, matching GitHub PR state; invalid responses remain unknown."""
     data = gh.pr(loop, number)
-    if not isinstance(data, dict) or data.get("number") != number:
+    if not isinstance(data, dict) or type(data.get("number")) is not int or data["number"] != number:
         return {}
     if data.get("state") not in ("open", "closed"):
         return {}
@@ -268,6 +329,13 @@ def clean_pr(loop: dict, number: int, dry: bool, quiet: bool, force: bool = Fals
         cands.append(base)
 
     for cand in cands:
+        # Pin the directory identity BEFORE ownership checks; a real-directory
+        # swap between Git validation and this snapshot must not be accepted.
+        try:
+            identity = candidate_identity(cand)
+        except OSError as exc:
+            log(f"    SKIP (changed candidate): {cand}: {exc}", quiet)
+            continue
         if not owned_candidate(cand, roots, clone.resolve() if clone else None, registered):
             log(f"    SKIP (outside owned cleanup scope): {cand}", quiet)
             continue
@@ -282,16 +350,14 @@ def clean_pr(loop: dict, number: int, dry: bool, quiet: bool, force: bool = Fals
             log(f"    would remove {human(size):>10}  {cand}", quiet)
             freed += size
             continue
-        if clone and str(cand) in {t["path"] for t in trees}:
-            subprocess.run(["git", "-C", str(clone), "worktree", "remove", "--force", str(cand)],
-                           capture_output=True, text=True, timeout=600)
-        if cand.exists():
-            size = remove_path(cand, quiet)
+        # Never give git worktree remove an unpinned string path: it could be
+        # swapped after validation. Remove via directory fd and prune metadata.
+        size = remove_path(cand, quiet, expected=identity, size=size)
         log(f"    removed {human(size):>10}  {cand}", quiet)
         freed += size
 
     if not dry and clone:
-        subprocess.run(["git", "-C", str(clone), "worktree", "prune"],
+        subprocess.run(["git", "-C", str(clone), "worktree", "prune", "--expire", "now"],
                        capture_output=True, text=True, timeout=300)
     return freed
 
