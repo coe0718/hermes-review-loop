@@ -2140,6 +2140,43 @@ def group_watchdog() -> None:
     check("  fixer route received the verdict", RECEIVED[-1]["event"], "pull_request_review")
     check("  fixer queue cleared", load_state("pending.json"), {})
 
+    # A complete fake GitHub listing and individual read agree: a known stacked
+    # child became draft while retargeting main at the SAME head. This is not a
+    # new reviewer/fixer authorization, even when stale tokens survived on disk.
+    parent = {**pr(7, head=HEAD_B), "head": {"ref": "parent", "sha": HEAD_B},
+              "base": {"ref": "main", "sha": HEAD_A}}
+    child = {**pr(9, head=HEAD_A, base="parent"),
+             "base": {"ref": "parent", "sha": HEAD_B},
+             "reviews": [review(REVIEWER, head=HEAD_A, rid=71)]}
+    reset(prs={"7": parent, "9": child})
+    run("watchdog.py", None, "--loop", "widgets", extra_env={"REVIEW_LOOP_TEST": ""})
+    stacked = load_state("watchdog.json").get("stacked_wait", {}).get("9")
+    check("stacked child observed before draft retarget", stacked.get("head") if stacked else None, HEAD_A)
+    key = f"{REPO}#9"
+    state_file("pending.json").write_text(json.dumps({seat: {key: {
+        "at": time.time(), "head": HEAD_A, "url": "u", "reason": "stacked"}}
+        for seat in ("reviewer", "fixer")}))
+    state_file("inflight.json").write_text(json.dumps({
+        f"review:9:{HEAD_A}": time.time(), f"fix:9:{HEAD_A}": time.time()}))
+    state_file("breach.json").write_text(json.dumps({key: {
+        "head": HEAD_A, "status": "delivery-pending"}}))
+    child["draft"] = True
+    child["base"] = {"ref": "main", "sha": HEAD_A}
+    set_prs({"7": parent, "9": child})
+    before = len(RECEIVED)
+    run("watchdog.py", None, "--loop", "widgets", extra_env={"REVIEW_LOOP_TEST": ""})
+    check("draft retarget records same-head hold", load_state("stack-transitions.json").get("9", {}).get("head"), HEAD_A)
+    check("draft retarget clears stacked wait", "9" in load_state("watchdog.json").get("stacked_wait", {}), False)
+    check("draft retarget drops both stale seat requests", load_state("pending.json"), {})
+    check("draft retarget clears in-flight tokens", load_state("inflight.json"), {})
+    check("draft retarget clears escalation marker", load_state("breach.json"), {})
+    check("draft retarget never starts an agent", len(RECEIVED) - before, 0)
+    child["draft"] = False
+    set_prs({"7": parent, "9": child})
+    run("watchdog.py", None, "--loop", "widgets", extra_env={"REVIEW_LOOP_TEST": ""})
+    check("ready transition keeps same-head hold", load_state("stack-transitions.json").get("9", {}).get("head"), HEAD_A)
+    check("ready transition does not wake stale work", len(RECEIVED) - before, 0)
+
     # shape 1: the reviewer never posted a verdict
     reset(prs={"7": pr(7, head=HEAD_A)})
     state_file("watchdog.json").parent.mkdir(parents=True, exist_ok=True)

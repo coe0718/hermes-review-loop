@@ -37,7 +37,7 @@ import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from review_loop import config, gate, gh, observer, routes, situation, state as state_mod  # noqa: E402
+from review_loop import config, gate, gh, observer, routes, situation, transition, state as state_mod  # noqa: E402
 from review_loop.util import age_min, epoch, log, now_iso  # noqa: E402
 
 TEST = bool(os.environ.get("REVIEW_LOOP_TEST"))
@@ -112,8 +112,14 @@ def drain(loop: dict, st: state_mod.LoopState, seat: str, quiet: bool = False) -
         base = (pr.get("base") or {}).get("ref") or ""
         stacked = (st.watch().get("stacked_wait") or {}).get(str(number))
         if isinstance(stacked, dict) and stacked.get("base") != base:
-            st.queue_pop(seat, key)
+            if base == loop["base"]:
+                transition.record(loop, st, number, head, base)
+            st.queue_pop_head(seat, key, stacked.get("head"))
             log(f"drain: PR #{number} retargeted since stacked observation — stale request dropped")
+            continue
+        if transition.hold(st, number, head):
+            st.queue_pop_head(seat, key, head)
+            log(f"drain: PR #{number} same-head retarget is quarantined — dropped")
             continue
         author = ((pr.get("user") or {}).get("login") or "").lower()
         if pr.get("draft") or base != loop["base"] or author not in set(loop["fixers"]):
@@ -184,21 +190,48 @@ def reconcile_stacked(loop: dict, st: state_mod.LoopState, watch: dict,
     pending = dict(previous) if isinstance(previous, dict) else {}
     listed = set()
     for pr in prs:
-        if not isinstance(pr, dict) or pr.get("state") != "open" or pr.get("draft"):
+        if not isinstance(pr, dict) or pr.get("state") != "open":
             continue
         number = pr.get("number")
         if type(number) is not int or number <= 0:
             continue
         key = str(number)
-        listed.add(key)
         base = (pr.get("base") or {}).get("ref")
+        prior_head = (watch.get("heads") or {}).get(key)
+        # A draft-only sweep can have removed the visibility entry while retaining
+        # its stacked head observation. Restore that boundary before reconciling.
+        if (base == loop["base"] and key not in pending and isinstance(prior_head, dict)
+                and prior_head.get("base") not in (None, loop["base"])):
+            pending[key] = {"head": prior_head.get("sha"), "base": prior_head["base"]}
+        # Drafts are not scheduling candidates, but an observed stacked child
+        # can be retargeted while draft. Quarantine before skipping draft work.
+        if pr.get("draft") and not (key in pending and base == loop["base"]):
+            continue
+        listed.add(key)
         if (not base or base == loop["base"] or
                 ((pr.get("user") or {}).get("login") or "").lower() not in loop["fixers"]):
             if key in pending:
+                if base == loop["base"]:
+                    live = gh.pr(loop, number)
+                    if (not isinstance(live, dict) or live.get("number") != number
+                            or live.get("state") != "open" or
+                            (live.get("head") or {}).get("sha") != (pr.get("head") or {}).get("sha") or
+                            (live.get("base") or {}).get("ref") != base or
+                            (live.get("base") or {}).get("sha") != (pr.get("base") or {}).get("sha")):
+                        continue
+                    entry = transition.record(loop, st, number, (pr.get("head") or {}).get("sha"),
+                                              base, watch=watch)
+                    if entry:
+                        lines.append(f"#{number} retargeted to {base} at the same head — old "
+                                     "reviews and queued work quarantined; new head or fresh "
+                                     "explicit human review required; no automatic wake")
+                        observer.notify(loop, st, "stall", number, entry["head"],
+                                        identity=f"retarget:{entry['head']}",
+                                        outcome="old same-head reviews quarantined", next_turn="you")
                 # A retarget is not permission to reinterpret a previous seat request
                 # for the same child SHA as a trunk request.
                 for seat in ("reviewer", "fixer"):
-                    st.queue_pop(seat, f"{loop['repo']}#{number}")
+                    st.queue_pop_head(seat, f"{loop['repo']}#{number}", pending[key].get("head"))
                 pending.pop(key)
             continue
         resolution = situation.resolve(loop, number, listing=prs)
@@ -260,6 +293,8 @@ def retry_pending_breaches(loop: dict, st: state_mod.LoopState, prs: list) -> No
         head = (pr.get("head") or {}).get("sha")
         if type(number) is not int or not head:
             continue
+        if transition.hold(st, number, head):
+            continue  # same-head retarget cannot retry old cap authorization
         marker = markers.get(f"{loop['repo']}#{number}")
         if (not isinstance(marker, dict) or gate.breach_delivery_status(marker, head) != "delivery-pending"
                 or marker.get("head") != head):
@@ -383,6 +418,8 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
         if not number or not head:
             continue
 
+        if transition.hold(st, number, head):
+            continue  # no old verdict may count as a current direct-trunk stall
         reviews = gh.reviews(loop, number)
         if not isinstance(reviews, list):
             continue                              # unknown beats wrong

@@ -22,7 +22,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from review_loop import gate, gh, observer  # noqa: E402
+from review_loop import gate, gh, observer, transition  # noqa: E402
 from review_loop.util import log, silence  # noqa: E402
 
 
@@ -62,6 +62,12 @@ def main() -> None:
     live_base_sha = (live.get("base") or {}).get("sha")
     if snapshot_base_sha and live_base_sha != snapshot_base_sha:
         silence("verdict base generation changed")
+    boundary = transition.record(loop, st, number, (live.get("head") or {}).get("sha"), loop["base"])
+    if boundary:
+        # Review commit_id binds only the head. Even a post-boundary REST review
+        # cannot prove which base it examined or which request dispatched it.
+        # In particular a review on another head must never produce a merge cue.
+        silence("base retarget: no generation-bound review receipt; no automated handoff")
 
     state = str(review.get("state", "")).upper()
     if state == "APPROVED":
@@ -89,12 +95,22 @@ def main() -> None:
         live_approval = (latest is not None and latest.get("id") == review.get("id")
                          and gh.review_state(latest) == "APPROVED"
                          and gate.reviewer_login(latest) == gate.reviewer_login(review))
+        # A review's commit_id binds the head only. The second PR read must still
+        # describe the same direct-trunk generation; a same-head base retarget or
+        # advancement between reads makes the approval an unknown-diff verdict.
+        first_base = live.get("base") or {}
+        final_base = (current.get("base") or {}) if isinstance(current, dict) and live_open else {}
+        same_base = (final_base.get("ref") == loop["base"]
+                     and first_base.get("ref") == final_base.get("ref")
+                     and first_base.get("sha") == final_base.get("sha")
+                     and not transition.hold(st, number, current_head))
         if live_open and current_head and approved_head and approved_head != current_head:
             outcome, next_turn = "on an older head — the PR moved since", "the reviewer, on this head"
-        elif live_open and current_head and approved_head == current_head and snapshot_matches and live_approval:
+        elif (live_open and current_head and approved_head == current_head
+              and snapshot_matches and live_approval and same_base):
             outcome, next_turn = "", "you merge"
         else:
-            outcome, next_turn = "current approval/head unverified — no merge handoff", "check current PR state"
+            outcome, next_turn = "current approval/head/base unverified — no merge handoff", "check current PR state"
         observer.notify(loop, st, "approved", number, approved_head,
                         identity=review.get("id"), actor=gate.reviewer_login(review),
                         outcome=outcome, next_turn=next_turn)

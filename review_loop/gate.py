@@ -32,7 +32,7 @@ import sys
 import time
 import urllib.request
 
-from . import config, gh, isolation, observer, routes, situation, state as state_mod
+from . import config, gh, isolation, observer, routes, situation, transition, state as state_mod
 from .util import iso_at, log, now_iso, silence
 
 
@@ -442,7 +442,11 @@ def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> di
     approved = False
     reviewed = False
     changes: list[dict] = []
+    boundary = transition.hold(st, number, head) if head and not stacked else None
     if reviews is not None:
+        # A post-retarget review list is diagnostic, not an authorization: its
+        # commit_id cannot prove the base generation or a dispatched run.
+        reviews = [] if boundary else reviews
         spent = len(verdicts(reviews, loop))
         if head:
             latest = latest_effective_review_at_head(reviews, loop, head)
@@ -540,6 +544,9 @@ def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> di
             if stacked:
                 blockers.append(f"stacked PR: {chain_reason} — visible only; no reviewer or fixer "
                                 "run is authorized by parent readiness")
+            if boundary:
+                blockers.append("same-head base retarget: pre-retarget reviews, rounds and approvals "
+                                "quarantined; no automatic reviewer or fixer run")
             if author and author not in set(loop["fixers"]):
                 blockers.append(f"the author {author} is not one of this loop's fixers "
                                 f"({', '.join(loop['fixers'])})")
@@ -609,6 +616,11 @@ def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> di
         kind = "wait" if isinstance(chain, situation.Resolution) and chain.status == "waiting" else "retry"
         action = (f"{chain_reason} — wait for a verified parent/base transition; "
                   "no automatic reviewer wake or gate authorization")
+    elif boundary and not approved:
+        kind = "wait"
+        action = ("same-head retarget: push a new child head and explicitly request review, "
+                  "or obtain a fresh explicit human review of the retargeted diff. "
+                  "Old approvals/verdicts cannot authorize a run; no automatic wake")
     elif author and author not in set(loop["fixers"]):
         kind = "none"
         action = (f"nothing — the reviewer gate only serves PRs opened by this loop's fixers "

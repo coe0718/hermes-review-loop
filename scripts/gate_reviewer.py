@@ -25,7 +25,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from review_loop import gate, gh, observer  # noqa: E402
+from review_loop import gate, gh, observer, transition  # noqa: E402
 from review_loop.util import log, silence  # noqa: E402
 
 ACTIONS = {"opened", "ready_for_review", "reopened", "review_requested"}
@@ -52,6 +52,16 @@ def main() -> None:
                         identity=closing, outcome=closing, next_turn="nothing — cleanup attempted")
         silence()
 
+    if action == "edited":
+        # A base edit is an observation signal, never an unattended turn.
+        number = gate.number_of(payload, pr)
+        live = gh.pr(loop, number)
+        if (isinstance(live, dict) and live.get("number") == number and
+                live.get("state") == "open" and
+                (live.get("base") or {}).get("ref") == loop["base"]):
+            transition.record(loop, st, number, (live.get("head") or {}).get("sha"),
+                              loop["base"])
+        silence("base edit observed — no reviewer run")
     if action not in ACTIONS:
         silence(f"action {action!r} is not a review trigger")
 
@@ -90,6 +100,12 @@ def main() -> None:
     snapshot_base_sha = (pr.get("base") or {}).get("sha")
     if snapshot_base_sha and snapshot_base_sha != (current.get("base") or {}).get("sha"):
         silence("review trigger is from an older base generation")
+    if transition.record(loop, st, number, head, loop["base"]):
+        # A review_requested webhook is not a generation-bound receipt. Even if
+        # requested_reviewers currently names the seat, the API gives no request
+        # timestamp or proof of which base the request targeted. Do not consume
+        # this event as a fresh post-retarget handoff.
+        silence("base retarget hold: push a new trunk head; no trusted same-head request receipt")
 
     reviews = gate.fetch_reviews(loop, number)
     if gate.reviewed_at_head(reviews, loop, head):
