@@ -3086,17 +3086,17 @@ def group_doctor() -> None:
     rc, out = run_doctor("--loop", "widgets")
     check("invalid stored schedule fails", "❌ cron:job" in out, True)
 
-    from cron.jobs import parse_schedule
+    # Match Hermes' persisted schedule shape without requiring Hermes as a test dependency.
     install_doctor_fixture()
     jobs = json.loads(job_file.read_text())
-    jobs["jobs"][0]["schedule"] = parse_schedule("15m")
+    jobs["jobs"][0]["schedule"] = {"kind": "interval", "minutes": 15, "display": "every 15m"}
     job_file.write_text(json.dumps(jobs))
     rc, out = run_doctor("--loop", "widgets")
     check("real Hermes 15m interval passes", rc, 0)
 
     install_doctor_fixture()
     jobs = json.loads(job_file.read_text())
-    jobs["jobs"][0]["schedule"] = parse_schedule("0 9 * * *")
+    jobs["jobs"][0]["schedule"] = {"kind": "cron", "expr": "0 9 * * *", "display": "0 9 * * *"}
     job_file.write_text(json.dumps(jobs))
     rc, out = run_doctor("--loop", "widgets")
     check("real Hermes cron schedule passes", rc, 0)
