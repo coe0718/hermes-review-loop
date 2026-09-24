@@ -3099,7 +3099,12 @@ def group_doctor() -> None:
     jobs["jobs"][0]["schedule"] = {"kind": "cron", "expr": "0 9 * * *", "display": "0 9 * * *"}
     job_file.write_text(json.dumps(jobs))
     rc, out = run_doctor("--loop", "widgets")
-    check("real Hermes cron schedule passes", rc, 0)
+    # A standalone checkout deliberately has no croniter; installed Hermes does.
+    import importlib.util
+    if importlib.util.find_spec("croniter") is None:
+        check("cron schedule fails closed without croniter", "❌ cron:job" in out, True)
+    else:
+        check("real Hermes cron schedule passes", rc, 0)
 
     install_doctor_fixture()
     jobs = json.loads(job_file.read_text())
