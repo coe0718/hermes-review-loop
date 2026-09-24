@@ -180,7 +180,10 @@ def profile_exists(name: str) -> bool:
         return True
     profile = profile_dir(name)
     marker = profile / "config.yaml"
-    return profile.is_dir() and marker.is_file() and marker.stat().st_size > 0
+    # A symlink can give two differently named seats the same credentials and budget.
+    # Do not accept an alias as a named profile, even if its target has a config.
+    return (not profile.is_symlink() and profile.is_dir()
+            and marker.is_file() and marker.stat().st_size > 0)
 
 
 def seat_mapping(settings: dict | None) -> dict:
@@ -357,6 +360,24 @@ def verify_credentials(loop: dict, roles: set[str] | None = None) -> None:
                                   "— each seat needs its own credential")
 
 
+def same_profile_home(first: str, second: str) -> bool:
+    """Compare actual directory identity, not just names (also catches bind mounts).
+
+    Legacy loops may mention a missing, untouched profile; their existence is checked only when
+    a role is rebound. A missing home has no identity to compare, but other stat failures must
+    not silently turn a potentially shared home into two independent seats.
+    """
+    if not first or not second:
+        return False
+    try:
+        return profile_dir(first).samefile(profile_dir(second))
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise ConfigError(f"cannot verify profile home identity for {first!r} and {second!r}: "
+                          f"{exc}") from exc
+
+
 def verify_seats(loop: dict, roles: set[str] | None = None) -> None:
     """Refuse a seat mapping that could not drive a run — before any file is written.
 
@@ -397,6 +418,10 @@ def verify_seats(loop: dict, roles: set[str] | None = None) -> None:
     if reviewer_profile and reviewer_profile == fixer_profile:
         raise ConfigError(f"{where}: reviewer and fixer both run as profile {reviewer_profile!r} — "
                           "one seat cannot review its own work")
+    if same_profile_home(reviewer_profile, fixer_profile):
+        raise ConfigError(f"{where}: reviewer and fixer use the same profile home "
+                          f"({reviewer_profile!r}, {fixer_profile!r}) — one seat cannot review "
+                          "its own work")
     if reviewer_login and reviewer_login.lower() == fixer_login.lower():
         raise ConfigError(f"{where}: reviewer and fixer both act as {reviewer_login!r} — the two "
                           "seats must be different accounts")
@@ -416,6 +441,10 @@ def verify_seats(loop: dict, roles: set[str] | None = None) -> None:
         if adj_profile in (reviewer_profile, fixer_profile):
             raise ConfigError(f"{where}: the adjudicator runs as profile {adj_profile!r}, the same "
                               "as a seat it is meant to rule on")
+        for other_profile in (reviewer_profile, fixer_profile):
+            if same_profile_home(adj_profile, other_profile):
+                raise ConfigError(f"{where}: the adjudicator and {other_profile!r} use the same "
+                                  "profile home — a seat cannot rule on its own work")
 
     verify_credentials(loop, roles=roles)
 

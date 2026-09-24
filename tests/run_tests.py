@@ -1546,6 +1546,83 @@ def group_seat_identity() -> None:
         check(f"  {kind}: same file identified", "read the same token file" in out, True)
         check(f"  {kind}: no writes", (loop_bytes("shared"), SUBS.read_text()), fingerprint)
 
+    section("seat identity — profile homes must be distinct real directories")
+    profile_root = HOME / "profiles"
+    alias = profile_root / "alias-fixer"
+    alias.symlink_to(profile_root / "vex", target_is_directory=True)
+    check("a symlink to a profile is not a profile", config.profile_exists("alias-fixer"), False)
+    for action in ("init", "apply"):
+        alias_form = {"reviewer_profile": "vex", "fixer_profile": "alias-fixer",
+                      "reviewer_login": REVIEWER, "fixer_login": FIXER}
+        alias_parser = parser_for(alias_form)
+        if action == "init":
+            args = ["init", "--repo", "acme/profile-alias", "--id", "profile-alias",
+                    "--fixer", FIXER, "--reviewer", REVIEWER, "--host", HOST,
+                    "--token", f"{REVIEWER}={SEAT_PATS[0]}",
+                    "--token", f"{FIXER}={SEAT_PATS[1]}"]
+            fingerprint = SUBS.read_text()
+        else:
+            make_loop("profile-alias", "acme/profile-alias", "vex", "drey")
+            args = ["apply", "--loop", "profile-alias"]
+            fingerprint = (loop_bytes("profile-alias"), SUBS.read_text())
+        rc, out = run_cli(alias_parser.parse_args(args))
+        check(f"{action}: symlinked profile home refused", rc, 2)
+        check(f"  {action}: refusal names the profile", "alias-fixer" in out, True)
+        check(f"  {action}: no writes", (loop_bytes("profile-alias"), SUBS.read_text())
+              if action == "apply" else SUBS.read_text(), fingerprint)
+        if action == "init":
+            check("  init: no loop created", (LOOPS_DIR / "profile-alias.json").exists(), False)
+    alias.unlink()
+    alias.symlink_to(HOME, target_is_directory=True)
+    check("a symlink to the default home is not a profile",
+          config.profile_exists("alias-fixer"), False)
+    alias.unlink()
+
+    # A bind mount can expose one inode under two non-symlink names. Simulate that
+    # same-directory identity without requiring mount privileges, at the path seam.
+    real_profile_dir = config.profile_dir
+    config.profile_dir = lambda name: (profile_root / "vex" if name == "drey"
+                                      else real_profile_dir(name))
+    try:
+        for action in ("init", "apply"):
+            alias_form = {"reviewer_profile": "vex", "fixer_profile": "drey",
+                          "reviewer_login": REVIEWER, "fixer_login": FIXER}
+            if action == "init":
+                args = ["init", "--repo", "acme/inode-alias", "--id", "inode-alias",
+                        "--fixer", FIXER, "--reviewer", REVIEWER, "--host", HOST,
+                        "--token", f"{REVIEWER}={SEAT_PATS[0]}",
+                        "--token", f"{FIXER}={SEAT_PATS[1]}"]
+                fingerprint = SUBS.read_text()
+            else:
+                make_loop("inode-alias", "acme/inode-alias", "reviewer-profile", "fixer-profile")
+                args = ["apply", "--loop", "inode-alias"]
+                fingerprint = (loop_bytes("inode-alias"), SUBS.read_text())
+            rc, out = run_cli(parser_for(alias_form).parse_args(args))
+            check(f"{action}: same-directory profiles refused", rc, 2)
+            check(f"  {action}: identity reason", "same profile home" in out, True)
+            check(f"  {action}: no writes", (loop_bytes("inode-alias"), SUBS.read_text())
+                  if action == "apply" else SUBS.read_text(), fingerprint)
+            if action == "init":
+                check("  init: no alias loop created", (LOOPS_DIR / "inode-alias.json").exists(), False)
+    finally:
+        config.profile_dir = real_profile_dir
+
+    # The adjudicator has no login, but must not share the reviewed seat's home.
+    config.profile_dir = lambda name: (profile_root / "vex" if name == "tuck"
+                                      else real_profile_dir(name))
+    try:
+        make_loop("adj-alias", "acme/adj-alias", "vex", "drey",
+                  adjudicator="fixer-profile")
+        before = (loop_bytes("adj-alias"), SUBS.read_text())
+        rc, out = run_cli(parser_for({"adjudicator_profile": "tuck"})
+                          .parse_args(["apply", "--loop", "adj-alias"]))
+        check("adjudicator sharing reviewer home refused", rc, 2)
+        check("  adjudicator identity reason", "same profile home" in out, True)
+        check("  adjudicator refusal has no writes", (loop_bytes("adj-alias"), SUBS.read_text()),
+              before)
+    finally:
+        config.profile_dir = real_profile_dir
+
     section("seat identity — a route belongs to the loop that already owns it")
     make_loop("overlap2", "acme/overlap2", "reviewer-profile", "fixer-profile")
     raw = json.loads(loop_bytes("overlap2"))
