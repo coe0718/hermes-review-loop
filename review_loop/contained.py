@@ -44,14 +44,18 @@ def command(*, code: Path, venv: Path, runtime: Path, home: Path,
             raise ValueError('broker mount must contain only the capability socket')
     if client_code is not None and not (Path(client_code) / 'review_loop/broker_client.py').is_file():
         raise FileNotFoundError('staged broker client required')
+    # The venv's interpreter symlinks point at the runtime's absolute host path, so the
+    # runtime is mounted at that same path; its ancestors are empty directories.
+    runtime_parents = [arg for parent in reversed(Path(runtime).parents[:-1])
+                       for arg in ("--dir", str(parent))]
     mounts = ["bwrap", "--unshare-all", "--die-with-parent", "--new-session",
             "--ro-bind", "/usr", "/usr", "--ro-bind", "/bin", "/bin",
-            "--ro-bind", "/lib", "/lib", "--ro-bind", "/lib64", "/lib64",
+            "--ro-bind", "/lib", "/lib", "--ro-bind-try", "/lib64", "/lib64",
+            # Debian/Ubuntu resolve cc, c++ and friends through /etc/alternatives;
+            # without it Rust cannot link. It holds only symlinks.
+            "--ro-bind-try", "/etc/alternatives", "/etc/alternatives",
             "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
-            "--dir", "/opt", "--dir", "/home", "--dir", "/home/jeremy",
-            "--dir", "/home/jeremy/.hermes", "--dir", "/home/jeremy/.hermes/hermes-agent",
-            "--dir", "/home/jeremy/.hermes/hermes-agent/.hermes-runtime",
-            "--dir", "/home/jeremy/.hermes/hermes-agent/.hermes-runtime/python",
+            "--dir", "/opt", *runtime_parents,
             "--ro-bind", str(runtime), str(runtime),
             "--ro-bind", str(venv), "/opt/venv",
             "--ro-bind", str(code), "/opt/code",

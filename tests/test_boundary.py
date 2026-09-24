@@ -129,7 +129,7 @@ class BoundaryTests(unittest.TestCase):
         probe.write_text('''import os, subprocess
 assert not os.path.exists(os.environ["HOST_PAT"])
 for candidate in (os.environ["HOST_PAT"], "/work/../../" + os.environ["HOST_PAT"].lstrip("/"),
-                  "/proc/self/root" + os.environ["HOST_PAT"], "/home/jeremy/.hermes/.env"):
+                  "/proc/self/root" + os.environ["HOST_PAT"], os.environ["HOST_ENV"]):
     try:
         open(candidate, "rb").read()
     except (FileNotFoundError, PermissionError):
@@ -145,12 +145,14 @@ subprocess.run(["cargo", "test", "--offline"], cwd="/work", check=True)
 ''')
         cmd = ["bwrap", "--unshare-all", "--die-with-parent", "--ro-bind", "/usr", "/usr",
                "--ro-bind", "/bin", "/bin", "--ro-bind", "/lib", "/lib",
-               "--ro-bind", "/lib64", "/lib64", "--proc", "/proc", "--dev", "/dev",
+               "--ro-bind-try", "/lib64", "/lib64", "--ro-bind-try", "/etc/alternatives", "/etc/alternatives",
+               "--proc", "/proc", "--dev", "/dev",
                "--tmpfs", "/tmp", "--dir", "/home", "--dir", "/opt",
                "--ro-bind", str(stable), "/opt/rust", "--bind", str(workspace), "/work",
                "--ro-bind", str(probe), "/probe.py", "--setenv", "HOME", "/tmp",
                "--setenv", "CARGO_HOME", "/tmp/cargo", "--setenv", "RUSTUP_HOME", "/tmp/rustup",
                "--setenv", "HOST_PAT", str(secret),
+               "--setenv", "HOST_ENV", str(pathlib.Path.home() / ".hermes/.env"),
                "--setenv", "PATH", "/opt/rust/bin:/usr/bin:/bin", "--chdir", "/work",
                "--", "/usr/bin/python3", "/probe.py"]
         result = subprocess.run(cmd, text=True, capture_output=True, timeout=120,
