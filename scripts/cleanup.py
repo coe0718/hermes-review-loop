@@ -15,6 +15,8 @@ Two modes:
 Safety rails, because this deletes real directories:
 
 * only paths inside non-symlink configured roots or the artifacts directory are considered;
+* a plain root child must name this loop's repository as well as the PR (roots are shared
+  between loops, and ``pr7`` alone is PR 7 of any repository);
 * only detached worktrees registered to this clone are removable, and only inside those roots;
   other Git repositories and nested checkouts are protected;
 * a worktree with a **branch** checked out is never touched — that is somebody's working
@@ -69,6 +71,19 @@ NEVER_TOUCH = re.compile(r"(phase3|phase4-evidence|evidence|soak|release-verific
 def pr_from_path(path: str) -> int | None:
     hits = PR_IN_PATH.findall(str(path))
     return int(hits[-1]) if hits else None
+
+
+def names_repo(name: str, loop: dict) -> bool:
+    """Does a root child's name carry this loop's repository name as a whole token?
+
+    Roots are shared (``~/.hermes/cache/scratch`` serves every loop on the machine), and a bare
+    ``pr7`` is PR 7 of *some* repository. A plain root child is only attributable to this loop
+    when it says which repository it belongs to — ``widgets-pr7-target``, ``pr7_widgets.log`` —
+    with the same boundary rule as the PR token, so ``widgets`` never claims ``widgetsplus``.
+    Registered detached worktrees of this loop's clone need no name: the registration is proof.
+    """
+    repo = loop["repo"].split("/")[-1]
+    return bool(re.search(rf"(?:^|[^0-9a-z]){re.escape(repo)}(?![0-9a-z])", name, re.I))
 
 
 def overlaps_branch_worktree(path: pathlib.Path, protected: set[pathlib.Path]) -> bool:
@@ -343,7 +358,8 @@ def clean_pr(loop: dict, number: int, dry: bool, quiet: bool, force: bool = Fals
         for child in root.iterdir():
             if child in cands:
                 continue
-            if pr_from_path(child.name) == number:
+            if pr_from_path(child.name) == number and (child.resolve() in registered
+                                                       or names_repo(child.name, loop)):
                 cands.append(child)
     base = config.artifacts_dir(loop, number)
     if base.exists() and base not in cands:
@@ -399,13 +415,14 @@ def sweep(loop: dict, dry: bool, quiet: bool) -> int:
         number = pr_from_path(pathlib.Path(tree["path"]).name)
         if number:
             by_pr.setdefault(number, []).append(tree)
-    # Roots can hold a PR's logs with no worktree left; those still count.
+    # Roots can hold a PR's logs with no worktree left; those still count — when they name this
+    # loop's repository (a shared root also holds other loops' PR numbers).
     for root in [pathlib.Path(p).expanduser() for p in loop["roots"]]:
         if not root.is_dir() or has_symlink_component(root):
             continue
         for child in root.iterdir():
             number = pr_from_path(child.name)
-            if number:
+            if number and names_repo(child.name, loop):
                 by_pr.setdefault(number, [])
 
     total = 0

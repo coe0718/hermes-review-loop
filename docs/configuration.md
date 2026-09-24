@@ -41,7 +41,7 @@ See [Preflight](architecture.md#preflight-can-this-installation-run).
 | `tokens` | `{}` | `login → path of a file containing that seat's PAT (mode 600)` |
 | `read_token` | first token | login whose token performs reads |
 | `clone` | — | the local clone reviews may use; cleanup prunes its worktrees |
-| `roots` | `[]` | directories the cleanup may ever touch. Anything outside them is out of scope. |
+| `roots` | `[]` | directories the cleanup may ever touch. Anything outside them is out of scope. A root may be shared between loops: a child is only this loop's when its name carries both the PR (`pr7`) and the repository name (`widgets-pr7-target`). `/`, the home directory and its ancestors are refused. |
 | `concurrency` | `1` | default runs at once *per seat*. `1` = serialized; above 1 requires `clone`, because every run then gets its own isolated clone. |
 | `seats.<seat>.concurrency` | loop default | this seat's own limit, overriding the default. Set with `hermes review-loop set --reviewer-concurrency N` / `--fixer-concurrency N`. |
 | `state_dir` | `~/.hermes/state/review-loops/<id>` | locks, queue, in-flight marks, breach markers, artifacts, watchdog memory |

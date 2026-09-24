@@ -569,6 +569,24 @@ def _path(value: str) -> pathlib.Path:
     return pathlib.Path(str(value)).expanduser()
 
 
+def dangerous_root(value: str) -> str:
+    """Why a cleanup root is too broad to accept, or ``""`` when it is fine.
+
+    Cleanup removes PR-named children of every root. ``/``, the home directory and anything
+    above it hold the operator's own projects and dotfiles, which are never a loop's to delete,
+    however they happen to be named.
+    """
+    path = _path(value).resolve()
+    home_dir = pathlib.Path.home().resolve()
+    if path == pathlib.Path(path.anchor):
+        return "the filesystem root"
+    if path == home_dir:
+        return "the home directory"
+    if path in home_dir.parents:
+        return "an ancestor of the home directory"
+    return ""
+
+
 def normalize(raw: dict, source: pathlib.Path | None = None) -> dict:
     """Fill defaults, expand paths, and refuse anything that would make a run ambiguous."""
     if not isinstance(raw, dict):
@@ -628,6 +646,11 @@ def normalize(raw: dict, source: pathlib.Path | None = None) -> dict:
     loop["tokens"] = {k: str(v) for k, v in (loop.get("tokens") or {}).items()}
     loop["read_token"] = str(loop.get("read_token") or (next(iter(loop["tokens"]), "")))
     loop["roots"] = [str(p) for p in (loop.get("roots") or [])]
+    for root in loop["roots"]:
+        reason = dangerous_root(root)
+        if reason:
+            raise ConfigError(f"{where}: root {root!r} is {reason}; cleanup deletes PR-named "
+                              f"children of every root, so a root must be a dedicated directory")
 
     # `or 1` here would swallow a literal 0 into "serialized", which is the worst kind of silent
     # correction: the operator asked for something invalid and got a loop that looks configured.

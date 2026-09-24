@@ -194,17 +194,17 @@ def make_clone() -> None:
     git("worktree", "add", "--detach", str(wt), "HEAD")
     (wt / "target").mkdir()
     (wt / "target" / "big.bin").write_bytes(b"x" * 4096)
-    (REVIEWS / "pr7-build.log").write_text("log\n")
+    (REVIEWS / "widgets-pr7-build.log").write_text("log\n")
     (REVIEWS / "pr7-phase3-evidence").mkdir()
     (REVIEWS / "pr7-phase3-evidence" / "keep.json").write_text("{}\n")
     # a detached review checkout for PR 9 (still open) and a branch worktree for PR 8
     git("worktree", "add", "--detach", str(REVIEWS / "pr9-wt"), "HEAD")
     (REVIEWS / "pr9-wt" / "notes.txt").write_text("keep me\n")
-    (SCRATCH / "pr8-target").mkdir(parents=True)
+    (SCRATCH / "widgets-pr8-target").mkdir(parents=True)
     # A build-output file the cleanup should reclaim. Text, and named like the real artifacts
     # (.log), because a stray .bin here trips the plugin security scan's binary-file caution every
     # time anyone runs `hermes plugins validate` on this repo.
-    (SCRATCH / "pr8-target" / "build.log").write_text("y" * 2048 + "\n")
+    (SCRATCH / "widgets-pr8-target" / "build.log").write_text("y" * 2048 + "\n")
     branch_wt = SCRATCH / "pr8-work-branch"
     git("worktree", "add", "-b", "fix/thing-8", str(branch_wt), "HEAD")
     (branch_wt / "work.txt").write_text("someone's work\n")
@@ -409,6 +409,21 @@ def group_config() -> None:
     check("unknown repo → nothing", config.by_repo("nope/nope"), None)
     check("cap kept", loop["cap"], 3)
     check("artifacts path is per PR", str(config.artifacts_dir(loop, 7)).endswith("artifacts/7"), True)
+
+    # Cleanup deletes PR-named children of every root: a root above the operator's own files
+    # would put their projects in scope.
+    home_dir = pathlib.Path.home()
+    for label, value in (("/", "/"), ("home", "~"), ("home (absolute)", str(home_dir)),
+                         ("ancestor of home", str(home_dir.parent))):
+        try:
+            config.normalize({**json.loads((LOOPS_DIR / "widgets.json").read_text()),
+                              "roots": [value]})
+            check(f"root {label} is refused", "accepted", "ConfigError")
+        except config.ConfigError:
+            check(f"root {label} is refused", "ConfigError", "ConfigError")
+    check("a directory under home is still a valid root", config.normalize(
+        {**json.loads((LOOPS_DIR / "widgets.json").read_text()),
+         "roots": ["~/.hermes/cache/scratch"]})["roots"], ["~/.hermes/cache/scratch"])
 
     bad = {"repo": "no-slash", "fixers": ["x"], "reviewers": ["y"],
            "seats": {"reviewer": {"route": "r", "profile": "p"}, "fixer": {"route": "r", "profile": "p"}}}
@@ -3371,7 +3386,7 @@ def group_cleanup() -> None:
 
     out, _, _ = run("cleanup.py", None, "--loop", "widgets", "--pr", "7")
     check("real run removes the worktree", (REVIEWS / "pr7-wt").exists(), False)
-    check("  removes its build log", (REVIEWS / "pr7-build.log").exists(), False)
+    check("  removes its build log", (REVIEWS / "widgets-pr7-build.log").exists(), False)
     check("  SKIPS the evidence dir", (REVIEWS / "pr7-phase3-evidence").exists(), True)
     check("  another PR's worktree untouched", (REVIEWS / "pr9-wt").exists(), True)
     check("  the branch worktree untouched", (SCRATCH / "pr8-work-branch").exists(), True)
@@ -3383,12 +3398,12 @@ def group_cleanup() -> None:
     # A branch checkout matching the *same* closed PR must survive the configured-root
     # scan, even when a configured root points inside that checkout.
     reset(prs={"7": pr(7, state="closed")})
-    branch = REVIEWS / "pr7-dev"
+    branch = REVIEWS / "widgets-pr7-dev"
     subprocess.run(["git", "-C", str(CLONE), "worktree", "add", "-b", "fix/pr7",
                     str(branch), "HEAD"], check=True, capture_output=True)
     sentinel = branch / "uncommitted.txt"
     sentinel.write_text("do not lose local work\n")
-    nested = branch / "pr7-logs"
+    nested = branch / "widgets-pr7-logs"
     nested.mkdir()
     (nested / "build.log").write_text("preserve\n")
     cfg = json.loads((LOOPS_DIR / "widgets.json").read_text())
@@ -3404,7 +3419,7 @@ def group_cleanup() -> None:
 
     # A root child enclosing a branch checkout is just as destructive to remove.
     reset(prs={"7": pr(7, state="closed")})
-    parent = REVIEWS / "pr7-container"
+    parent = REVIEWS / "widgets-pr7-container"
     parent.mkdir()
     inside = parent / "developer"
     subprocess.run(["git", "-C", str(CLONE), "worktree", "add", "-b", "fix/inside7",
@@ -3451,9 +3466,26 @@ def group_cleanup() -> None:
     check("symlinked artifacts dir is not followed",
           (elsewhere / "reviewer" / "repo" / "README.md").exists(), True)
 
+    # Roots are shared between loops: pr7 alone is PR 7 of *some* repository.
+    reset(prs={"7": pr(7, state="closed")})
+    for name in ("gadgets-pr7-target", "pr7-build", "widgetsplus-pr7.log", "widgets-pr7-target"):
+        (SCRATCH / name).mkdir()
+        (SCRATCH / name / "sentinel.txt").write_text(name + "\n")
+    run("cleanup.py", None, "--loop", "widgets", "--pr", "7")
+    check("another repo's pr7 dir in a shared root survives",
+          (SCRATCH / "gadgets-pr7-target" / "sentinel.txt").exists(), True)
+    check("  an unscoped pr7 dir survives", (SCRATCH / "pr7-build" / "sentinel.txt").exists(), True)
+    check("  a prefix-sharing repo name survives",
+          (SCRATCH / "widgetsplus-pr7.log" / "sentinel.txt").exists(), True)
+    check("  this repo's pr7 dir is reclaimed", (SCRATCH / "widgets-pr7-target").exists(), False)
+    reset(prs={"7": pr(7, state="closed")})
+    (SCRATCH / "gadgets-pr7-target").mkdir()
+    out, _, _ = run("cleanup.py", None, "--loop", "widgets", "--sweep", "--dry-run")
+    check("  sweep does not list another repo's PR", "gadgets-pr7-target" in out, False)
+
     # Configured roots are discovery boundaries, not permission to remove another repo.
     reset(prs={"7": pr(7, state="closed")})
-    other = REVIEWS / "pr7-other-repo"
+    other = REVIEWS / "widgets-pr7-other-repo"
     subprocess.run(["git", "init", "-q", "-b", "main", str(other)], check=True)
     other_sentinel = other / "uncommitted.txt"
     other_sentinel.write_text("other repo's branch\n")
@@ -3475,7 +3507,7 @@ def group_cleanup() -> None:
     subprocess.run(["git", "init", "-q", "-b", "main", str(foreign)], check=True)
     foreign_root = foreign / "build"
     foreign_root.mkdir()
-    foreign_file = foreign_root / "pr7-source"
+    foreign_file = foreign_root / "widgets-pr7-source"
     foreign_file.write_text("foreign source\n")
     cfg = json.loads((LOOPS_DIR / "widgets.json").read_text())
     cfg["roots"].append(str(foreign_root))
@@ -3501,7 +3533,7 @@ def group_cleanup() -> None:
     external = TMP / "external-cleanup"
     shutil.rmtree(external, ignore_errors=True)
     external.mkdir()
-    (external / "pr7-sentinel").write_text("external root\n")
+    (external / "widgets-pr7-sentinel").write_text("external root\n")
     linked = TMP / "linked-root"
     linked.unlink(missing_ok=True)
     linked.symlink_to(external, target_is_directory=True)
@@ -3509,14 +3541,14 @@ def group_cleanup() -> None:
     cfg["roots"].append(str(linked))
     (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
     run("cleanup.py", None, "--loop", "widgets", "--pr", "7")
-    check("symlinked root cannot delete external child", (external / "pr7-sentinel").exists(), True)
+    check("symlinked root cannot delete external child", (external / "widgets-pr7-sentinel").exists(), True)
 
     # Swap a validated root at the du seam; string-path unlink would hit the sentinel.
     reset(prs={"7": pr(7, state="closed")})
     external = TMP / "outside-swap"
     shutil.rmtree(external, ignore_errors=True)
     external.mkdir()
-    outside_file = external / "pr7-build.log"
+    outside_file = external / "widgets-pr7-build.log"
     outside_file.write_text("outside must survive\n")
     outside_tree = external / "pr7-wt"
     outside_tree.mkdir()
@@ -3608,10 +3640,10 @@ def group_cleanup() -> None:
           (unrelated / "neutral-wt" / "sentinel.txt").exists(), True)
 
     reset(prs={"7": pr(7, state="closed")})
-    nested_repo = REVIEWS / "pr7-bundle" / "developer"
+    nested_repo = REVIEWS / "widgets-pr7-bundle" / "developer"
     subprocess.run(["git", "init", "-q", "-b", "main", str(nested_repo)], check=True)
     (nested_repo / "uncommitted.txt").write_text("nested repo\n")
-    link = REVIEWS / "pr7-external-link"
+    link = REVIEWS / "widgets-pr7-external-link"
     external = TMP / "external-cleanup"
     external.mkdir(exist_ok=True)
     (external / "sentinel.txt").write_text("external link\n")
@@ -3704,7 +3736,7 @@ def group_cleanup() -> None:
     out, _, _ = run("cleanup.py", None, "--loop", "widgets", "--sweep")
     check("sweep reclaims the closed PR", (REVIEWS / "pr7-wt").exists(), False)
     check("sweep keeps the open one", (REVIEWS / "pr9-wt").exists(), True)
-    check("sweep keeps the unknown one", (SCRATCH / "pr8-target").exists(), True)
+    check("sweep keeps the unknown one", (SCRATCH / "widgets-pr8-target").exists(), True)
     check("sweep reports a total", "reclaimed" in out, True)
 
 
