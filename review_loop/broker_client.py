@@ -8,10 +8,14 @@ import socket
 
 SOCKET = '/run/review-loop/broker/broker.sock'
 MAX_FRAME = 196 * 1024
+# A push or review is several GitHub calls plus git fetch/push (each up to 90s), all
+# host-side. Wait for the answer instead of timing out mid-write; the turn deadline is
+# the real bound.
+WRITE_TIMEOUT = 900
 
 
 def call(operation: str, *, verdict: str = '', body: str = '', manifest=None,
-         socket_path: str = SOCKET) -> dict:
+         socket_path: str | None = None) -> dict:
     if operation == 'push':
         payload = {'operation': 'push', 'manifest': manifest}
     elif operation in ('review', 'request_review'):
@@ -22,8 +26,8 @@ def call(operation: str, *, verdict: str = '', body: str = '', manifest=None,
     if len(frame) > MAX_FRAME:
         raise ValueError('request too large')
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
-        conn.settimeout(10)
-        conn.connect(socket_path)
+        conn.settimeout(WRITE_TIMEOUT)
+        conn.connect(socket_path or SOCKET)
         conn.sendall(frame)
         response = bytearray()
         while b'\n' not in response and len(response) < 16384:
@@ -53,14 +57,18 @@ def main() -> None:
         path = Path(args.manifest_file)
         if path.stat().st_size > MAX_FRAME:
             parser.error('manifest too large')
-        result = call('push', manifest=json.loads(path.read_text()))
+        operation = lambda: call('push', manifest=json.loads(path.read_text()))
     else:
         if args.manifest_file or (args.operation == 'review' and not args.body_file):
             parser.error('invalid review arguments')
         body = Path(args.body_file).read_text() if args.body_file else ''
         if len(body.encode()) > 12 * 1024:
             parser.error('review body too large')
-        result = call(args.operation, verdict=args.verdict, body=body)
+        operation = lambda: call(args.operation, verdict=args.verdict, body=body)
+    try:
+        result = operation()
+    except TimeoutError:
+        result = {'ok': False, 'error': 'broker response timed out: write outcome unknown; do not retry or report success'}
     print(json.dumps(result))
     if not result['ok']:
         raise SystemExit(1)

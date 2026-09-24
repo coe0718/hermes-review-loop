@@ -261,6 +261,12 @@ def serve_in_thread(server: RunBroker) -> threading.Thread:
     return thread
 
 
+# A push or review is several GitHub calls plus git fetch/push (each up to 90s), all
+# host-side. Wait for the answer instead of timing out mid-write; the turn deadline is
+# the real bound.
+WRITE_TIMEOUT = 900
+
+
 def request(operation: str, *, verdict: str = "", body: str = "",
             manifest: object = None,
             socket_path: str = "/run/review-loop/broker/broker.sock") -> dict:
@@ -275,7 +281,7 @@ def request(operation: str, *, verdict: str = "", body: str = "",
     if len(raw) > MAX_PUSH_REQUEST:
         raise ProtocolError("request too large")
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
-        conn.settimeout(10)
+        conn.settimeout(WRITE_TIMEOUT)
         conn.connect(socket_path)
         conn.sendall(raw + b"\n")
         answer = _read_line(conn, MAX_REQUEST)

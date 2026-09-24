@@ -12,13 +12,17 @@ import sys
 
 SOCKET = "/run/review-loop/broker.sock"
 MAX_RESPONSE = 16 * 1024
+# A push or review is several GitHub calls plus git fetch/push (each up to 90s), all
+# host-side. Wait for the answer instead of timing out mid-write; the turn deadline is
+# the real bound.
+WRITE_TIMEOUT = 900
 
 
 def request(operation: str, verdict: str = "", body: str = "") -> dict:
     payload = json.dumps({"operation": operation, "verdict": verdict, "body": body},
                          separators=(",", ":")).encode() + b"\n"
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
-        conn.settimeout(10)
+        conn.settimeout(WRITE_TIMEOUT)
         conn.connect(SOCKET)
         conn.sendall(payload)
         chunks = bytearray()
@@ -49,6 +53,9 @@ def main() -> int:
         parser.error("request_review takes no extra fields")
     try:
         response = request(args.operation, args.verdict, args.body)
+    except TimeoutError:
+        print("broker response timed out: write outcome unknown; do not retry or report success", file=sys.stderr)
+        return 1
     except (OSError, ValueError) as exc:
         print(f"broker unavailable: {type(exc).__name__}", file=sys.stderr)
         return 1

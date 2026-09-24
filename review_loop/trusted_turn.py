@@ -176,7 +176,8 @@ def run_turn(loop: dict, scope: broker_ipc.RunScope, *, source: Path, venv: Path
             '--manifest-file /work/manifest.json`, then `python -m review_loop.broker_client '
             'request_review`. A reviewer gets one write; a fixer gets one push '
             'followed by one review request. Never claim a write succeeded without '
-            'an ok response.\n')
+            'an ok response. A write can take minutes; if it times out, its outcome is '
+            'unknown: do not retry it, say so.\n')
         checkout = trusted_fetch.stage(loop, repo=scope.repo, number=scope.number,
                                        head=scope.head, ref=scope.branch, role=scope.role,
                                        sandbox_root=root / 'export')

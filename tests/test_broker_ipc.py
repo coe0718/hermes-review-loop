@@ -147,6 +147,27 @@ class BrokerIPCTests(unittest.TestCase):
         self.assertFalse(server.completed)
         self.assertFalse(any(call[0].endswith("/requested_reviewers") for call in self.calls))
 
+    def test_client_waits_for_slow_writes_and_reports_unknown_outcome(self):
+        from review_loop import broker_client as sandbox_client, safe_push
+        import contextlib, io
+        # A real push spends up to 90s in each of fetch and push before GitHub calls.
+        for timeout in (broker_client.WRITE_TIMEOUT, sandbox_client.WRITE_TIMEOUT,
+                        broker_ipc.WRITE_TIMEOUT):
+            self.assertGreater(timeout, 4 * 90)
+        path = self.root / "silent.sock"
+        with socket.socket(socket.AF_UNIX) as listener:
+            listener.bind(str(path))
+            listener.listen(1)
+            out = io.StringIO()
+            with mock.patch.object(sandbox_client, "WRITE_TIMEOUT", 0.2), \
+                 mock.patch.object(sandbox_client, "SOCKET", str(path)), \
+                 mock.patch.object(sys, "argv", ["broker_client", "request_review"]), \
+                 contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+                sandbox_client.main()
+        result = json.loads(out.getvalue())
+        self.assertFalse(result["ok"])
+        self.assertIn("outcome unknown", result["error"])
+
     def test_new_approval_cancels_fixer_write_at_unchanged_head(self):
         self.reviews.append({'id': 42, 'state': 'APPROVED', 'commit_id': HEAD,
                              'submitted_at': '2026-01-01T00:01:00Z',
