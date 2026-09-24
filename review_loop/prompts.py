@@ -13,6 +13,9 @@ renders them at fire time against the payload the gate emits, using dot-notation
   the payload instead. That is also why the workspace description arrives as
   ``{_loop.isolation.brief}``: the gate decided where this run may work, and the prompt repeats
   the decision rather than making one.
+
+``OBSERVER`` is the odd one out: it is not an instruction to anybody, it is a message that has
+already been written. See the note next to it, and ``review_loop.observer``.
 """
 
 from __future__ import annotations
@@ -97,3 +100,10 @@ What to do:
    argument into a decision they can act on in one read.
 5. Hand over the receipts: verdict counts, the head you judged, and the one-line reason. The
    operator should be able to override you in one message without re-reading the whole thread."""
+
+# The observer feed's route prompt is a single placeholder, and that is the whole point: the
+# *loop* writes the notice (``review_loop.observer``), because it is the thing that knows what
+# actually happened. The gateway's job is only to render this and deliver it — with
+# ``deliver_only`` set, the rendered template *is* the message, so no model is woken to paraphrase
+# a transition it did not observe.
+OBSERVER = """{_observer.message}"""

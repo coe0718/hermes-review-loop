@@ -1,4 +1,5 @@
-"""Per-loop state on disk: seat locks, the queue, in-flight marks, breach markers.
+"""Per-loop state on disk: seat locks, the queue, in-flight marks, breach markers, and the
+observer's delivery ledger.
 
 All of it lives under the loop's own ``state_dir`` (default
 ``~/.hermes/state/review-loops/<id>/``), so two loops never share a file and a loop can
@@ -22,6 +23,7 @@ import os
 import pathlib
 import tempfile
 import time
+import uuid
 from collections.abc import Callable
 
 from . import config
@@ -36,6 +38,7 @@ class LoopState:
         self.pending = self.dir / "pending.json"
         self.inflight_file = self.dir / "inflight.json"
         self.breach = self.dir / "breach.json"
+        self.observations = self.dir / "observations.json"
         self.watch_file = self.dir / "watchdog.json"
         self.log = self.dir / "watchdog.log"
 
@@ -234,12 +237,13 @@ class LoopState:
             return prior
 
     def breach_deliver(self, number: int, entry: dict, current: Callable[[], bool],
-                       send: Callable[[dict], bool]) -> str:
-        """Persist pending before POST; serialize validation and delivery per loop.
+                       send: Callable[[dict], bool], reserved: Callable[[dict], None] | None = None) -> str:
+        """Reserve a pending delivery under lock, then POST without holding it.
 
-        A 2xx promotes pending to awaiting, while a failed POST stays retryable.
-        The lock covers the network call: cooperating gateways cannot deliver
-        twice or let an older event replace a newer marker between checks.
+        A synchronous gateway must be able to claim the marker before answering
+        the POST. The attempt token prevents concurrent deliveries; its lease lets
+        a watchdog retry if the sender dies. Finalization is compare-and-swap so
+        a late response cannot overwrite a newer head or a claimed wake.
         """
         key = f"{self.loop['repo']}#{number}"
         head = entry["head"]
@@ -248,24 +252,39 @@ class LoopState:
                 return "stale"
             data = self._load(self.breach, {}) or {}
             prior = data.get(key) or {}
-            if prior.get("head") == head and prior.get("status") != "delivery-pending":
-                return "already"
             new = prior.get("head") != head
-            if new:
-                data[key] = {**entry, "status": "delivery-pending"}
-                self._breach_save(data)
-            # Pending may be left by an earlier crashed process. Keep its
-            # original reason/rounds for the signed wake and audit marker.
-            marker = data[key]
+            if not new and (prior.get("status") != "delivery-pending"
+                            or (prior.get("delivery_token")
+                                and time.time() - prior.get("delivery_at", 0) < 60)):
+                return "already"
+            # Keep the original reason/rounds when retrying a pending marker.
+            marker = {**(entry if new else prior), "status": "delivery-pending",
+                      "delivery_token": uuid.uuid4().hex, "delivery_at": time.time()}
+            data[key] = marker
+            self._breach_save(data)
+        if reserved:
             try:
-                delivered = send(marker)
+                reserved(marker)
             except Exception as exc:
-                log(f"adjudicator delivery failed: {exc}")
-                delivered = False
-            if delivered:
-                data[key] = {**marker, "status": "awaiting-adjudication"}
+                log(f"breach observer notification failed: {exc}")
+        try:
+            delivered = send(marker)
+        except Exception as exc:
+            log(f"adjudicator delivery failed: {exc}")
+            delivered = False
+        with self._breach_lock():
+            data = self._load(self.breach, {}) or {}
+            latest = data.get(key) or {}
+            if (latest.get("head") == head
+                    and latest.get("delivery_token") == marker["delivery_token"]):
+                latest = {k: v for k, v in latest.items()
+                          if k not in {"delivery_token", "delivery_at"}}
+                if latest.get("status") == "delivery-pending" and delivered:
+                    latest["status"] = "awaiting-adjudication"
+                # A gateway may already have moved this marker to adjudicating.
+                data[key] = latest
                 self._breach_save(data)
-            return "new" if new else "retry"
+        return "new" if new else "retry"
 
 
     def breach_claim(self, number: int, head: str) -> dict | None:
@@ -276,7 +295,9 @@ class LoopState:
             marker = data.get(key)
             if (not isinstance(marker, dict) or marker.get("pr") != number
                     or marker.get("head") != head
-                    or marker.get("status") != "awaiting-adjudication"):
+                    or not (marker.get("status") == "awaiting-adjudication"
+                            or (marker.get("status") == "delivery-pending"
+                                and marker.get("delivery_token")))):
                 return None
             data[key] = {**marker, "status": "adjudicating"}
             self._breach_save(data)

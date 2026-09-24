@@ -51,6 +51,63 @@ See [Preflight](architecture.md#preflight-can-this-installation-run).
 | `cooldown_h` | `6` | repeat suppression per stall |
 | `ttl_min` | `45` | seat-lock lifetime; past this a crashed run has lost its seat |
 | `inflight_ttl_min` | `10` | how long a same-head burst is considered already handled |
+| `observer` | `{}` | the read-only observer feed. `{}` means no feed, and the loop is untouched by its absence — see [The observer feed](#the-observer-feed) |
+
+## The observer feed
+
+An **observer** is a destination that hears about transitions without being part of them: a short
+notice per event, delivered to a chat, with no agent on the route and no seat to hold. It is opt-in
+per loop — no `observer` block, no feed — and it is the one block in this file the loader is
+*lenient* about, because a feed that cannot deliver must never refuse a loop that can run.
+
+| key | default | meaning |
+|---|---|---|
+| `observer.route` | `<id>-observe` | the gateway route each notice is POSTed to. Without it there is nowhere to deliver, and `status` says so |
+| `observer.profile` | `default` | the Hermes profile whose chat the route delivers into |
+| `observer.deliver` | `telegram` | the route's delivery target. `log` is refused by `init` / `set`, since it would deliver to nobody |
+| `observer.events` | all seven | any subset of `opened`, `handoff`, `verdict`, `approved`, `escalation`, `stall`, `closed`. An event left out is never sent, and never recorded as owed |
+| `observer.digest_min` | `0` | `0` sends one message per transition; above `0` batches them into one compact message at the next watchdog sweep |
+| `observer.mute` | `false` | stop delivering and keep the configuration (`--observer-mute` / `--observer-unmute`) |
+
+```bash
+hermes review-loop set --loop <id> --observer-profile tuck        # turn it on, or move it
+hermes review-loop set --loop <id> --observer-route widgets-observe
+hermes review-loop set --loop <id> --observer-events verdict,escalation,closed
+hermes review-loop set --loop <id> --observer-digest-min 30
+hermes review-loop set --loop <id> --observer-mute                # --observer-unmute, --observer-disable
+```
+
+`init --observer-profile <name>` writes the block and installs `<id>-observe` alongside the seats'
+routes, with the same signed POST at the same gateway origin — but `deliver_only: true` and a prompt
+that is just the notice, because by the time a route fires the message has already been written by
+the loop. The transitions it can send:
+
+| event | when it is sent |
+|---|---|
+| `opened` | a new PR needs its first look (also `ready_for_review` / `reopened`) |
+| `handoff` | the fixer pushed and requested review — the fixer's turn ended |
+| `verdict` | a changes-requested verdict landed and a fix run started |
+| `approved` | the reviewer approved (nothing else would free that seat) |
+| `escalation` | the cap is spent — sent after the durable marker, before adjudicator delivery; receipt remains pending |
+| `stall` | the watchdog decided a quiet head is worth reporting |
+| `closed` | the PR was merged or abandoned, and its disk was reclaimed |
+
+Consequences worth knowing:
+
+* **One notice per transition.** Each notice is keyed by loop + PR + head + event + verdict/round
+  identity in `observations.json`, so a redelivered webhook, a re-run gate or a retried sweep cannot
+  produce a second ping.
+* **A failed delivery is recorded, not fatal.** A route that 500s, has no secret, or was never
+  installed leaves an entry with its reason (visible in `status` as *owed*) and is retried by the
+  next watchdog sweep, up to three attempts. The queue, the seats and the locks are never involved.
+* **No secrets in a ping.** A notice carries the loop id, PR number and URL, head, event, outcome,
+  next turn and a one-line summary — no PAT, no HMAC secret, no diff, no review body. The PR link is
+  private to whatever chat the operator configured for `observer.profile`.
+* **Disabling is safe at any time.** `--observer-mute` stops delivery; `--observer-disable` removes
+  the active block and route even with owed notices. The ledger and original destination binding
+  remain: queued notices stay owed but do not send while disabled, and re-enabling at a different
+  host, route, profile or delivery target is refused until they are settled. `status` shows the
+  outstanding count. A loop whose feed is broken logs the problem and runs its seats normally.
 
 ## Plugin settings (the desktop form)
 
@@ -163,6 +220,7 @@ did not. Token values are never printed: only which login reads which file.
 | `breach.json` | `{"repo#PR": {head, rounds, cap, reason, at, status}}` — `delivery-pending` retries on a current-head watchdog sweep; `awaiting-adjudication` means POST accepted; `adjudicating` means the ruling run was claimed |
 | `watchdog.json` | `armed_since`, `{heads: {PR: {sha, observed_at, last_seen_at}}}` (null observation for baseline/invalid clocks; absent PR clocks retained 30 days since last seen). A missing, malformed, boolean, non-finite, or future `armed_since` re-arms at the first successful PR listing and baselines all current heads rather than trusting old observations; a failed listing leaves state and queue unchanged. Alert history and last run are also stored here. |
 | `watchdog.log` | one line per sweep, and per breach |
+| `observations.json` | the observer feed's delivery ledger: `{"entries": {"<loop>:<PR>:<head>:<event>:<identity>": {status, message, url, attempts, error, retryable, batch}}}`. `failed` is retried only with explicit `retryable: true` evidence of a pre-POST failure; legacy failures without that evidence and ambiguous/stale claims become `uncertain` for manual reconciliation. `queued` waits for a digest; `pending` is claimed mid-delivery; `delivered` has a receipt. |
 | `artifacts/<PR>/<seat>/` | where a run must keep its worktrees, build dirs and logs — per PR *and* per seat, so the two never share a checkout |
 
 `hermes review-loop status` prints the shape of these files, and `hermes review-loop explain --pr N`
@@ -192,5 +250,9 @@ exactly as it was.
   `apply --loop <id>` (same validation, same staged route rebind), and a dashboard editor for a
   single loop would have to be built on top of that path, not beside it.
 - **No auto-update, no telemetry, no network beyond GitHub, Discord and your own gateway.**
+- **No agent on the observer route, and no observer seat.** The feed's route is `deliver_only` with a
+  pre-written prompt — a notice is not an instruction to anybody, it is a message the loop already
+  wrote — so it never consumes a seat, holds a lock, or takes a queue slot. The route's job is to
+  republish that message; what it cannot do is decide anything.
 - **No deploy/hosting integration and no model provider assumptions.** The seats are Hermes profiles;
   what model each profile runs is the operator's business.

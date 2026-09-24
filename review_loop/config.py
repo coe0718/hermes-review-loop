@@ -22,6 +22,10 @@ File shape (all keys except ``repo`` have defaults)::
                      "login": "drey-coe", "agent": "Drey"}
       },
       "adjudicator": {"route": "attest-loop-breach", "profile": "default"},
+      "observer": {"route": "attest-observe", "profile": "tuck", "deliver": "telegram",
+                   "events": ["opened", "handoff", "verdict", "approved", "escalation",
+                              "stall", "closed"],
+                   "digest_min": 0, "mute": false},
       "skill": "attest-pr-review",
       "read_token": "tuck-coe",
       "tokens": {"tuck-coe": "~/.hermes/keys/tuck-coe-pat"},
@@ -34,6 +38,11 @@ File shape (all keys except ``repo`` have defaults)::
 
 ``config.py`` is deliberately strict: a loop that cannot be resolved to a repository,
 a base branch and two seats is a configuration error, not a run that guesses.
+
+The one key that is *not* strict is ``observer`` — the optional read-only feed (see
+``review_loop.observer``). A seat that cannot be resolved is a loop that cannot turn; an
+observer that cannot be resolved is a loop that turns without telling anyone, so a broken feed
+is dropped with its reason kept under ``misconfigured`` for ``status`` to report.
 """
 
 from __future__ import annotations
@@ -265,6 +274,7 @@ DEFAULTS: dict = {
     "reviewer_seat": "",
     "seats": {},
     "adjudicator": {},
+    "observer": {},
     "skill": "",
     "read_token": "",
     "tokens": {},
@@ -297,6 +307,46 @@ def seat_concurrency(loop: dict, seat: str) -> int:
     if value is None or value == "":
         value = 1
     return int(value)
+
+
+def normalize_observer(raw) -> dict:
+    """The observer feed's destination, or ``{}`` when this loop has no feed.
+
+    Deliberately lenient where the seats are strict, and for one reason: an observer is
+    read-only by construction, so a broken feed must never refuse a loop that can still turn.
+    Anything unusable is dropped here and the *reason* is kept under ``misconfigured`` so
+    ``hermes review-loop status`` says it out loud — silence is the failure mode this whole
+    plugin exists to kill, and a feed that quietly delivers nothing would be a new one.
+
+    ``events`` narrows the feed; absent or empty means every transition (``observer.EVENTS``).
+    ``digest_min`` above zero batches transitions into one compact message flushed by the
+    watchdog sweep instead of one notice per transition.
+    """
+    if raw is None or raw == "" or raw == {}:
+        return {}
+    if not isinstance(raw, dict):
+        return {"route": "", "misconfigured": "observer must be a JSON object"}
+    route = str(raw.get("route") or "").strip()
+    if not route:
+        return {"route": "", "misconfigured": "observer.route is required to deliver anything"}
+    observer = {"route": route,
+                "profile": str(raw.get("profile") or "default").strip() or "default",
+                "deliver": str(raw.get("deliver") or "telegram").strip() or "telegram",
+                "mute": bool(raw.get("mute"))}
+    events = raw.get("events")
+    if isinstance(events, str):
+        events = re.split(r"[,\s]+", events)
+    if isinstance(events, (list, tuple)):
+        wanted = sorted({str(e).strip().lower() for e in events if str(e).strip()})
+        if wanted:
+            observer["events"] = wanted
+    try:
+        digest = int(raw.get("digest_min") or 0)
+    except (TypeError, ValueError):
+        digest = 0
+    if digest > 0:
+        observer["digest_min"] = digest
+    return observer
 
 
 class ConfigError(Exception):
@@ -568,6 +618,8 @@ def normalize(raw: dict, source: pathlib.Path | None = None) -> dict:
     if adj:
         adj.setdefault("profile", "default")
     loop["adjudicator"] = adj
+
+    loop["observer"] = normalize_observer(loop.get("observer"))
 
     loop["cap"] = int(loop["cap"])
     if loop["cap"] < 2:

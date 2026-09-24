@@ -22,7 +22,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from review_loop import gate  # noqa: E402
+from review_loop import gate, gh, observer  # noqa: E402
 from review_loop.util import log, silence  # noqa: E402
 
 
@@ -55,6 +55,33 @@ def main() -> None:
         if st.release_if("reviewer", key):
             log(f"released reviewer seat for {key}")
         gate.drain_seat(loop, "reviewer")
+        # The webhook PR is a snapshot: an approval can arrive after a push, close or failed
+        # lookup. Only a matching, currently open live head authorizes a merge handoff.
+        approved_head = review.get("commit_id") or ""
+        current = gh.pr(loop, number)
+        live_open = (isinstance(current, dict) and current.get("number") == number
+                     and current.get("state") == "open")
+        current_head = ""
+        if live_open and isinstance(current, dict):
+            current_head = ((current.get("head") or {}).get("sha") or "")
+        snapshot_matches = approved_head == ((pr.get("head") or {}).get("sha") or "")
+        # The webhook is not evidence of the review's *current* verdict: GitHub can dismiss
+        # the same review id after submitting it. A failed/partial live read is not approval.
+        reviews = gh.reviews(loop, number) if live_open and current_head == approved_head else None
+        latest = (gate.latest_effective_review_at_head(reviews, loop, approved_head)
+                  if isinstance(reviews, list) else None)
+        live_approval = (latest is not None and latest.get("id") == review.get("id")
+                         and gh.review_state(latest) == "APPROVED"
+                         and gate.reviewer_login(latest) == gate.reviewer_login(review))
+        if live_open and current_head and approved_head and approved_head != current_head:
+            outcome, next_turn = "on an older head — the PR moved since", "the reviewer, on this head"
+        elif live_open and current_head and approved_head == current_head and snapshot_matches and live_approval:
+            outcome, next_turn = "", "you merge"
+        else:
+            outcome, next_turn = "current approval/head unverified — no merge handoff", "check current PR state"
+        observer.notify(loop, st, "approved", number, approved_head,
+                        identity=review.get("id"), actor=gate.reviewer_login(review),
+                        outcome=outcome, next_turn=next_turn)
         silence(f"#{number} approved — reviewer's slot freed, nothing for the fixer to do")
     if state != "CHANGES_REQUESTED":
         silence(f"verdict state {review.get('state')!r} needs no fix")
@@ -89,6 +116,13 @@ def main() -> None:
     gate.ping_start(loop, seat, gate.start_text(
         loop, seat, number, pr_head, prior + 1,
         note=f"on a changes-requested verdict from {gate.reviewer_login(review)}"))
+    # The feed is told last, after the seat is claimed and the run recorded: a destination that
+    # hangs costs seconds at the end of this gate and never the fixer's slot or the queue behind
+    # it. Keyed by the review's own id, so a redelivered `pull_request_review` — which happens,
+    # and is why the in-flight marks exist — cannot ping twice for one verdict.
+    observer.notify(loop, st, "verdict", number, pr_head, identity=review.get("id"),
+                    outcome="changes requested", actor=gate.reviewer_login(review),
+                    next_turn="fixer", round_no=prior + 1)
     print(json.dumps(payload))
 
 

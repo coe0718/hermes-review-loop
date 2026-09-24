@@ -36,7 +36,7 @@ import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from review_loop import config, gate, gh, routes, state as state_mod  # noqa: E402
+from review_loop import config, gate, gh, observer, routes, state as state_mod  # noqa: E402
 from review_loop.util import age_min, epoch, log, now_iso  # noqa: E402
 
 TEST = bool(os.environ.get("REVIEW_LOOP_TEST"))
@@ -351,6 +351,19 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
                      "need investigation. Check the gateway log before re-driving a route.")
 
     drain_queued(loop, st, lines)
+
+    # The observer feed, last and best effort. Only the alerts this sweep actually decided to
+    # raise become notices (each stamped with the sweep's own clock, so re-raising a stall after
+    # the cooldown is a new notice while a second sweep in the same breath is not), and a
+    # destination that cannot be reached costs a retry, never this sweep's job.
+    for number, kind, _title in alerts:
+        head = next(((pr.get("head") or {}).get("sha", "") for pr in prs
+                     if isinstance(pr, dict) and pr.get("number") == number), "")
+        observer.notify(loop, st, "stall", number, head, identity=f"{kind[:40]}#{int(now)}",
+                        outcome=kind, next_turn="you")
+    if observer.retry(loop, st):
+        log("observer: retried an undelivered notice")
+    observer.flush(loop, st, wait_s=0 if TEST else observer.digest_wait(loop))
 
     history = {**watch.get("alerts", {}), **seen}
     watch["alerts"] = {k: v for k, v in history.items() if now - v < 30 * 86400}

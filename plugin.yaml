@@ -4,8 +4,9 @@ description: >-
   Review loop — unattended PR review between two agents: a fixer pushes, a different reviewer
   returns a verdict, the budget is counted in verdicts, a watchdog finds silent stalls, and a
   finished PR gives its local disk back. Disclosure — creates webhook routes and (optionally) a
-  cron job, calls the GitHub API with repo-scope tokens you provide, and deletes local review
-  artifacts for merged or closed PRs.
+  cron job, calls the GitHub API with repo-scope tokens you provide, deletes local review
+  artifacts for merged or closed PRs, and — only when a loop is given an observer feed — posts
+  short read-only notices about that loop's transitions to the chat the feed names.
 author: Jeremy Coe
 homepage: https://github.com/coe0718/hermes-review-loop
 license: MIT

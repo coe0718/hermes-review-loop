@@ -267,6 +267,49 @@ with an expired lock, a queue entry and a breach marker on disk, and asserts eve
 configs, every state file, the route registry and the stub world) has the same SHA-256 hash and that
 no webhook was fired.
 
+## The observer feed (read-only, never a seat)
+
+The loop is unattended, which is the point — but "nobody is watching" and "nothing is visible" are
+different things. A loop may carry one **observer**: a chat destination that receives a short notice
+each time the loop changes state, without joining the loop.
+
+A notice is emitted *at* the transition, by whoever made it — the reviewer gate on a handoff, the
+fixer gate on a verdict, `breach()` when the cap is spent, the reviewer gate on a close, and the
+watchdog when it decides a stall is worth reporting. Nothing is inferred from an agent's summary,
+and none of it can influence a seat: the observer path runs after the state change, never in front
+of it; escalation is announced after the durable pending marker but before the adjudicator
+POST, with delivery explicitly pending rather than reported as complete.
+
+Delivery rides the same rails as a seat wake — a signed POST (`X-Hub-Signature-256`) at a route
+bound to the observer's profile. The difference is that the route is `deliver_only` and its prompt
+is the notice itself: the loop wrote the message before the route fired, so no agent is woken and no
+turn is taken.
+
+The delivery ledger (`observations.json`) is what makes the feed idempotent and honest:
+
+```
+entry key = loop : PR : head : event : verdict-or-round identity
+status    = delivered | queued | pending | failed | uncertain
+```
+
+- A second webhook about the same transition finds the entry and stops, however many times GitHub
+  redelivers or the sweep runs — the key is the fact, not the delivery attempt.
+- A definite pre-POST failure is retried by the watchdog, up to `MAX_ATTEMPTS`.
+  A timeout, 5xx, or stale pending claim may already have reached the receiver: it becomes
+  `uncertain` and is never automatically replayed. Older `failed` receipts without explicit
+  pre-POST evidence are also quarantined. Reconcile them manually before changing routes.
+- With `digest_min` above zero, new entries park as `queued` and the sweep sends one message listing
+  them. The batch is itself an entry carrying its members, so a digest and a single notice can never
+  both claim the same transition.
+- Muting, filtering by event, or having no feed short-circuits before the ledger is touched: a
+  disabled observer is indistinguishable from no observer.
+
+The feed holds no lock and carries no secret: the payload is the loop id, PR number and URL, head,
+event, outcome, next turn and a one-line summary. A private PR URL reaches only the profile the
+operator configured — that is the one boundary the observer is allowed to cross. A loop without
+an explicitly configured webhook host cannot send a private link by inheriting the mutable route
+registry's host.
+
 ## Cleanup
 
 A finished PR gives its disk back: worktrees, build directories, probe logs, plus the loop's own

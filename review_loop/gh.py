@@ -139,6 +139,16 @@ def pr(loop: dict, number: int):
     return api(loop, pr_path(loop, number))
 
 
+def pr_url(loop: dict, number: int) -> str:
+    """The pull request's canonical web URL — the one link a human needs.
+
+    Lives here rather than in the gate because two very different things need it: the prompts
+    that wake a seat, and the observer's notices. It is GitHub's address space, not either
+    caller's.
+    """
+    return f"https://github.com/{loop['repo']}/pull/{number}"
+
+
 def reviews(loop: dict, number: int):
     return api(loop, reviews_path(loop, number))
 

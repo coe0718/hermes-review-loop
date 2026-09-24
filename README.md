@@ -126,7 +126,9 @@ hermes review-loop uninstall --loop name
 `--concurrency` (the default for both seats), `--cap`, `--clone`, `--base`, `--grace-min`,
 `--ttl-min` — through the same validation `init` uses, so a capacity above 1 without a clone is
 refused here exactly as it is at init. Prompts are rendered from the payload at fire time, so a
-change takes effect on the next event with nothing to re-install.
+change takes effect on the next event with nothing to re-install. The observer feed is changed the
+same way: `--observer-profile`, `--observer-route`, `--observer-deliver`, `--observer-events`,
+`--observer-digest-min`, and `--observer-mute` / `--observer-unmute` / `--observer-disable`.
 
 ### Preflight: `doctor`
 
@@ -415,6 +417,79 @@ holds defaults, the loop file is per repository and holds the truth. Point a sea
 own skill by its qualified name — `--skill hermes-review-loop:review-loop` — since plugin skills are
 never copied into `~/.hermes/skills/`.
 
+### Watching from your phone (the observer feed)
+
+The seats drive each other; a person watching from a phone should not have to be a third agent in
+between. Give a loop an **observer** and it sends one short notice per transition to a chat you
+choose — Telegram, Discord, wherever that Hermes profile already talks:
+
+```
+🔧 [widgets] #7 `aaaaaaa` fix pushed · review requested (dev-fixer) · round 1/3 · next: reviewer
+https://github.com/acme/widgets/pull/7
+```
+
+That is the whole payload: the loop, the PR, the head at the recorded transition, the seat and
+event, the outcome, an optional next-turn hint, and a direct link to the PR. Delayed retries and
+digests omit next-turn hints because the PR or review may have changed since the transition.
+Never a token, an HMAC secret, a private diff, or a review body. Escalation reaches the observer
+after the cap marker is durable and before the adjudicator POST; it explicitly says delivery is
+pending, not that the adjudicator received it.
+
+Turn it on at init, or add it to a loop that is already running:
+
+```bash
+hermes review-loop init --repo owner/name ... --observer-profile tuck   # one flag turns it on
+hermes review-loop set --loop widgets --observer-profile tuck           # or add it later
+hermes review-loop set --loop widgets --observer-events verdict,escalation,closed
+hermes review-loop set --loop widgets --observer-digest-min 30          # batch instead of pinging
+hermes review-loop set --loop widgets --observer-mute                   # quiet, config kept
+hermes review-loop set --loop widgets --observer-disable                # stop/remove route; retain owed ledger and old destination binding
+```
+
+The flags write this block into the loop file, the only place the feed is configured:
+
+```json
+"observer": {
+  "route": "widgets-observe",
+  "profile": "tuck",
+  "deliver": "telegram",
+  "events": ["opened", "handoff", "verdict", "approved", "escalation", "stall", "closed"],
+  "digest_min": 30
+}
+```
+
+`init` and `set` write the keys you asked for and nothing else: `mute: true` for a muted feed,
+`digest_min` above zero to batch, `events` to narrow the feed (leave it out for all of them).
+
+`init` also installs the route (`<id>-observe`) through the seats' own mechanism — the same signed
+POST at the same gateway — but with `deliver_only: true` and a two-line prompt, because the notice
+is *already written*: nothing wakes an agent, and there is no third seat to hold a lock or take a
+turn. The seven transitions are `opened` (a new PR needs its first look), `handoff` (a fix was
+pushed and review requested), `verdict` (a changes-requested verdict started a fix), `approved`
+(the reviewer approved), `escalation` (the cap is spent and adjudicator delivery is pending),
+`stall` (the watchdog decided a quiet PR is worth reporting) and `closed` (merged or abandoned;
+cleanup was attempted, but disk reclamation is not confirmed by this notice).
+
+Four rules keep the feed from becoming a gate:
+
+* **Emitted from state, not from prose.** A notice is written by the gate, by the seat scripts and
+  by the watchdog, at the transition they just made — never parsed out of an agent's summary, and
+  never on the strength of an agent's claim.
+* **One transition, one notice.** The ledger key is loop + PR + head + event + verdict/round
+  identity, so a redelivered webhook, a re-run gate or a retried sweep cannot produce a duplicate.
+* **Ambiguous delivery is not replayed.** A missing route or secret is a definite pre-POST failure
+  and the watchdog retries it (up to three attempts). A timeout or 5xx after posting may have sent
+  the notice; it remains `uncertain` in `status` for manual reconciliation, never automatically
+  retried. Legacy `failed` receipts without proof of a pre-POST failure are quarantined the same
+  way. Neither outcome consumes a seat or blocks the queue.
+* **Off means off.** No observer, a muted feed, an event filtered out: the loop behaves exactly as
+  it would with no observer at all. A misconfigured feed (a route that was never installed, or a
+  bare profile with no route) never refuses a loop — the seats keep running and `status` says what
+  is wrong with the feed.
+
+Private PRs are safe to watch this way: the link goes to the chat the operator configured for that
+profile, and nowhere else.
+
 ## What the loop guarantees
 
 - **One PR, one seat.** A PR is held by the reviewer *or* the fixer, never both: a review never
@@ -447,12 +522,16 @@ never copied into `~/.hermes/skills/`.
   login it acts as and the route that wakes it are validated together before a config, a route or a
   hook is written, and `status` prints the installed route next to the configured seat so a
   half-applied identity change is visible instead of silent.
+- **The observer is not a seat.** An opt-in feed of short notices, emitted from the transitions the
+  loop already made, delivered by a `deliver_only` route with no agent behind it. A refused
+  delivery costs a retry — never a queue entry, a lock, or a turn; and with the feed off the loop
+  is byte-for-byte the loop without one.
 
 ## Status and honesty
 
 Exercised and passing:
 
-- `python3 tests/run_tests.py` — offline checks: every gate branch, the cap, the one-PR-one-
+- `python3 tests/run_tests.py` — full offline suite: every gate branch, the cap, the one-PR-one-
   seat rule (including the handoff that must *not* deadlock the gates), per-seat capacity and
   queueing, an approval freeing its slot and starting the next queued PR, **real isolation** (real
   clones — one per PR *and* per seat — checked out at the head, with no token in them), the `set` /
@@ -465,7 +544,9 @@ Exercised and passing:
   an API-denied hooks read is `unknown`, never "absent"), all four watchdog stall shapes, `explain`'s
   golden cases (in-flight/no-verdict/no-fix reviews, unrequested head, queued/full seat, spent
   budget, paused loop, closed/missing PR, failed GitHub read) and its read-only proof, the route/hook
-  reconciliation rollback cases, and the cleanup rails against a real git clone.
+  reconciliation rollback cases,, the cleanup rails against a real git clone, and the observer feed (one notice per
+  verdict and handoff, no duplicate on redelivery, a 5xx destination never blocking queue
+  drain, escalation delivered before adjudication, and mute/digest/misconfiguration inert).
 - Live use on a private repository: two seats, dozens of PRs, review → verdict → fix → cleanup.
 
 Not proven, and worth knowing before you trust it:
@@ -494,12 +575,13 @@ Not proven, and worth knowing before you trust it:
 ```
 plugin.yaml                manifest (no hidden capabilities: no hooks, no tools, no middleware)
 __init__.py                registers the CLI and the skill
-review_loop/               the library: config, state, gh, routes, prompts, gate runtime, CLI,
-                           and the read-only `doctor` preflight
+review_loop/               the library: config, state, gh, routes, prompts, gate runtime,
+                           observer, CLI, and the read-only `doctor` preflight
 scripts/gate_reviewer.py   between a pull_request event and a review run
 scripts/gate_fixer.py      between a pull_request_review event and a fix run
 scripts/watchdog.py        cron: stall detection, stuck state, queue draining
 scripts/cleanup.py         merge/close: reclaim the PR's local disk
+scripts/observe.py         the observer route's adapter: republish the loop's notice, wake nobody
 skill/SKILL.md             the protocol the seats load
 tests/run_tests.py         the proof (stubbed GitHub, real HTTP sink, real git)
 docs/                      architecture and configuration reference
