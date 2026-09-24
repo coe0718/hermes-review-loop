@@ -216,8 +216,9 @@ def breach(loop: dict, st: state_mod.LoopState, number: int, head: str, rounds: 
     st.note(f"breach {loop['repo']}#{number} at {head[:7]}: {reason}")
     # One wake per head: a PR already parked at this sha stays parked, so repeated events
     # cannot spawn an adjudication run each time. A new head is a new escalation.
-    if prior.get("status") == "awaiting-adjudication" and prior.get("head") == head:
-        log(f"#{number} already awaiting adjudication at {head[:7]} — not re-waking")
+    # A claimed head remains claimed even when another cap event arrives.
+    if prior.get("head") == head:
+        log(f"#{number} already escalated at {head[:7]} — not re-waking")
         return
     if not loop.get("adjudicator", {}).get("route"):
         log("no adjudicator configured — marker written, nothing woken")

@@ -392,6 +392,27 @@ def group_reviewer_gate() -> None:
     check("an unknown action is silent", run("gate_reviewer.py", pr_payload(action="labeled"))[0],
           "SILENT")
 
+    # A delayed request must not resurrect a closed, deleted, or advanced PR,
+    # even if its webhook snapshot still describes a valid open head.
+    for label, current in (("closed", pr(7, state="closed")),
+                           ("missing", None), ("superseded", pr(7, head=HEAD_B)),
+                           ("draft", pr(7, draft=True)),
+                           ("retargeted", pr(7, base="release")),
+                           ("transferred", pr(7, author="outsider"))):
+        reset(prs={"7": current} if current else {})
+        state_file("locks.json").write_text(json.dumps({"fixer": {
+            f"{REPO}#7": {"at": time.time(), "head": HEAD_A}}}))
+        check(f"delayed request for {label} PR is silent",
+              run("gate_reviewer.py", pr_payload())[0], "SILENT")
+        check(f"  {label} PR did not release fixer",
+              f"{REPO}#7" in load_state("locks.json").get("fixer", {}), True)
+        check(f"  {label} PR did not claim reviewer",
+              load_state("locks.json").get("reviewer", {}), {})
+    reset(prs={"7": pr(7)})
+    check("failed fresh PR lookup is silent",
+          run("gate_reviewer.py", pr_payload(),
+              extra_env={"REVIEW_LOOP_GH_STUB": "/bin/false"})[0], "SILENT")
+
     # a head that already has a verdict from a reviewer
     reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER)]}})
     check("head already reviewed → silent", run("gate_reviewer.py", pr_payload())[0], "SILENT")
@@ -415,7 +436,7 @@ def group_reviewer_gate() -> None:
           run("gate_reviewer.py", pr_payload())[0], "FIRE")
 
     # an approved head
-    reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, state="approved")]}})
+    reset(prs={"7": {**pr(7, head=HEAD_B), "reviews": [review(REVIEWER, state="approved")]}})
     check("new commit after a verdict fires",
           run("gate_reviewer.py", pr_payload(head=HEAD_B))[0], "FIRE")
 
@@ -423,7 +444,7 @@ def group_reviewer_gate() -> None:
     reset(prs={"7": pr(7)})
     kind, _, err = run("gate_reviewer.py", pr_payload(), extra_env={"REVIEW_LOOP_GH_STUB": "/bin/false"})
     check("unreadable review list → silent (never guess)", kind, "SILENT")
-    check("  and it says why", "not guessing" in err, True)
+    check("  and it says why", "unavailable" in err or "not guessing" in err, True)
 
 
 def group_settings() -> None:
@@ -589,8 +610,21 @@ def group_adjudicator() -> None:
     check("gateway authenticates signed POST", hmac.compare_digest(wake.get("sig", ""), sig), True)
     check("gateway event matches subscription", wake.get("event") in route["events"], True)
     payload = json.loads(body) if body else {}
-    outcome, out, _ = run(route["script"], payload)
-    check("gateway script starts adjudication", outcome, "FIRE")
+    forged = {**payload, "_loop": {**payload["_loop"], "reason": "forged ruling", "round": 100}}
+    outcome, out, _ = run(route["script"], forged)
+    check("gateway script starts adjudication despite untrusted descriptions", outcome, "FIRE")
+    if outcome == "FIRE":
+        check("reason comes from marker, not POST", "forged ruling" in json.loads(out)["_loop"]["reason"], False)
+        check("round comes from marker, not POST", json.loads(out)["_loop"]["round"], 3)
+    check("signed wake replay does not start a second ruling run",
+          run(route["script"], payload)[0], "SILENT")
+    check("marker records consumed head",
+          load_state("breach.json")[f"{REPO}#7"].get("status"), "adjudicating")
+    before = len(RECEIVED)
+    run("gate_reviewer.py", pr_payload(head=HEAD_B))
+    check("another cap event cannot re-arm consumed head", len(RECEIVED) - before, 0)
+    check("consumed marker survives duplicate cap event",
+          load_state("breach.json")[f"{REPO}#7"].get("status"), "adjudicating")
     if outcome == "FIRE":
         accepted = json.loads(out)
         check("gate confirms adjudicator role", accepted["_loop"]["role"], "adjudicator")
@@ -610,14 +644,6 @@ def group_adjudicator() -> None:
           run(route["script"], {**payload, "_loop": {**payload.get("_loop", {}), "head": HEAD_A}})[0], "SILENT")
     check("adjudicator refuses forged PR number",
           run(route["script"], {**payload, "number": 9})[0], "SILENT")
-    forged = {**payload, "_loop": {**payload["_loop"], "reason": "forged ruling", "round": 100}}
-    kind, out, _ = run(route["script"], forged)
-    check("adjudicator still fires with untrusted descriptive fields", kind, "FIRE")
-    if kind == "FIRE":
-        check("adjudicator renders reason from marker, not POST",
-              "forged ruling" in json.loads(out)["_loop"]["reason"], False)
-        check("adjudicator renders round from marker, not POST",
-              json.loads(out)["_loop"]["round"], 3)
     check("adjudicator refuses unreadable GitHub state",
           run(route["script"], payload, extra_env={"REVIEW_LOOP_GH_STUB": "/bin/false"})[0], "SILENT")
     set_prs({"7": {**pr(7, head=HEAD_A), "reviews": DATA["world"]["prs"]["7"]["reviews"]}})
@@ -626,6 +652,33 @@ def group_adjudicator() -> None:
     check("adjudicator refuses a cap no longer spent", run(route["script"], payload)[0], "SILENT")
     state_file("breach.json").write_text("{}")
     check("adjudicator refuses absent marker", run(route["script"], payload)[0], "SILENT")
+
+    # Invalid delivery cannot consume the claim; after facts recover a real
+    # signed wake fires once. Simultaneous redeliveries must have one winner.
+    from concurrent.futures import ThreadPoolExecutor
+    reset(prs={"7": {**pr(7, head=HEAD_B), "reviews": [
+        review(REVIEWER, head=ch, rid=i) for i, ch in enumerate("cde", 1)]}})
+    cli._install_routes(config.load_id("widgets"))
+    run("gate_reviewer.py", pr_payload(head=HEAD_B))
+    pending = json.loads(RECEIVED[-1]["body"])
+    set_prs({"7": {**pr(7, head=HEAD_A), "reviews": DATA["world"]["prs"]["7"]["reviews"]}})
+    check("stale wake leaves claim pending", run(route["script"], pending)[0], "SILENT")
+    check("stale wake does not consume marker",
+          load_state("breach.json")[f"{REPO}#7"]["status"], "awaiting-adjudication")
+    set_prs({"7": {**pr(7, head=HEAD_B), "reviews": DATA["world"]["prs"]["7"]["reviews"]}})
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        outcomes = list(pool.map(lambda _: run(route["script"], pending)[0], range(4)))
+    check("concurrent signed wakes start exactly one run", outcomes.count("FIRE"), 1)
+    check("concurrent wake claim remains consumed", run(route["script"], pending)[0], "SILENT")
+
+    # A new head after the ruling is a separate escalation, not suppressed by
+    # the old consumed marker.
+    new_head = "f" * 40
+    set_prs({"7": {**pr(7, head=new_head), "reviews": DATA["world"]["prs"]["7"]["reviews"]}})
+    before = len(RECEIVED)
+    run("gate_reviewer.py", pr_payload(head=new_head))
+    check("new head creates new adjudicator wake", len(RECEIVED) - before, 1)
+    check("new head is claimable", run(route["script"], json.loads(RECEIVED[-1]["body"]))[0], "FIRE")
 
     # The review-verdict trigger must take the same authenticated route to the
     # ruling run; the old suite checked only that its HTTP POST succeeded.
@@ -759,6 +812,7 @@ def group_parallel() -> None:
 
     # the same PR never gets two runs, even with a free slot
     state_file("inflight.json").write_text("{}")
+    set_prs({"7": pr(7, head=HEAD_B), "9": pr(9, head=head), "11": pr(11, head=head)})
     kind, _, err = run("gate_reviewer.py", pr_payload(7, head=HEAD_B))
     check("same PR twice → refused", kind, "SILENT")
     check("  and it says why", "already running" in err, True)
@@ -786,7 +840,7 @@ def group_parallel() -> None:
     check("  nothing fired", len(RECEIVED) - before, 0)
 
     # an unisolatable run is queued, never started beside another
-    reset(prs={"7": pr(7), "9": pr(9)})
+    reset(prs={"7": pr(7), "9": pr(9, head=HEAD_B)})
     set_concurrency(2)
     state_file("locks.json").write_text(json.dumps({"reviewer": {}}))
     kind, _, err = run("gate_reviewer.py", pr_payload(9, head=HEAD_B))

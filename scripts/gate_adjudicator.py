@@ -51,6 +51,10 @@ def main() -> None:
     reviews = gate.fetch_reviews(loop, number)
     if len(gate.verdicts(reviews, loop)) < loop["cap"]:
         silence("review cap is no longer spent")
+    # The signed route may redeliver the same POST. Claim only after all fresh
+    # facts pass, atomically with other gateway processes, before emitting a run.
+    if st.breach_claim(number, head) is None:
+        silence("breach wake was already claimed or replaced")
 
     payload["_loop"] = {**gate.loop_block(loop, number, head, seat="reviewer",
                                           round=rounds, reason=marker.get("reason") or ""),
