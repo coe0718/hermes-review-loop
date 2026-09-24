@@ -44,8 +44,7 @@ sys.path.insert(0, str(ROOT))
 
 # Fixtures must not inherit the source checkout's Git owner: cleanup correctly
 # refuses to delete artifacts under an unrelated repository, even a test repo.
-TMP = pathlib.Path(tempfile.mkdtemp(prefix="review-loop-tests-", dir=os.environ.get(
-    "TMPDIR", str(pathlib.Path.home() / ".hermes" / "cache" / "scratch"))))
+TMP = pathlib.Path(tempfile.mkdtemp(prefix="review-loop-tests-", dir=os.environ.get("TMPDIR")))
 atexit.register(shutil.rmtree, TMP, ignore_errors=True)
 LOOPS_DIR = TMP / "loops"
 STATE_DIR = TMP / "state"
