@@ -75,7 +75,41 @@ SETTINGS_SCHEMA: dict = {
                                         "same head"},
     "host": {"label": "Webhook host", "type": "str", "default": "",
              "description": "Your gateway's public webhook origin (required to create GitHub hooks)"},
+    "reviewer_profile": {"label": "Reviewer's Hermes profile", "type": "str", "default": "",
+                         "description": "Profile the reviewer seat runs as. Blank = not set here: "
+                                        "a new loop still needs one, and it must differ from the "
+                                        "fixer's"},
+    "fixer_profile": {"label": "Fixer's Hermes profile", "type": "str", "default": "",
+                      "description": "Profile the fixer seat runs as. Blank = not set here: a new "
+                                     "loop still needs one, and it must differ from the reviewer's"},
+    "reviewer_login": {"label": "Reviewer's GitHub login", "type": "str", "default": "",
+                       "description": "GitHub login the reviewer seat acts as — the login the "
+                                      "review route serves. Must be in the loop's reviewers "
+                                      "allowlist. Blank = not set here"},
+    "fixer_login": {"label": "Fixer's GitHub login", "type": "str", "default": "",
+                    "description": "GitHub login the fixer seat acts as. Must be in the loop's "
+                                   "fixers allowlist. Blank = not set here"},
+    "adjudicator_profile": {"label": "Adjudicator's Hermes profile (optional)", "type": "str",
+                            "default": "",
+                            "description": "Profile that rules when the verdict budget is spent. "
+                                           "Blank = not set here: a loop with no adjudicator route "
+                                           "is left exactly as it is"},
 }
+
+# Seat identity: *who* a seat is. A profile decides the model, the budget and the credentials the
+# run happens with; a login decides the GitHub attribution. Both are per loop — two repositories can
+# legitimately be served by different profiles — so the plugin settings only ever supply defaults a
+# new loop starts from, and `apply --loop` pushes them onto one loop at a time.
+PROFILE_SETTINGS: dict = {"reviewer": "reviewer_profile", "fixer": "fixer_profile",
+                          "adjudicator": "adjudicator_profile"}
+LOGIN_SETTINGS: dict = {"reviewer": "reviewer_login", "fixer": "fixer_login"}
+# Every role that can own a webhook route. The adjudicator is here but not in ``SEAT_KEYS``: it has
+# a route and a profile, and no login or allowlist of its own.
+ROUTE_ROLES = ("reviewer", "fixer", "adjudicator")
+
+# A Hermes profile name is a directory name under ``profiles/``. Refusing separators and dots-only
+# names here is what keeps a typo from resolving to somewhere outside the profiles root.
+_PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 
 
 def settings_defaults(settings: dict | None) -> dict:
@@ -115,9 +149,109 @@ def apply_settings(loop_raw: dict, settings: dict | None) -> dict:
     # guessed at: whatever `concurrency` says, the seats carry their own answered value.
     # An unset form value cannot erase an existing loop's explicitly configured gateway.
     host = d["host"] or loop_raw.get("host") or ""
-    return {**loop_raw, "cap": d["cap"], "clone": clone, "base": d["base"],
-            "host": host, "grace_min": d["grace_min"], "ttl_min": d["ttl_min"],
-            "inflight_ttl_min": d["inflight_ttl_min"], "seats": seats}
+    overlaid = {**loop_raw, "cap": d["cap"], "clone": clone, "base": d["base"],
+                "host": host, "grace_min": d["grace_min"], "ttl_min": d["ttl_min"],
+                "inflight_ttl_min": d["inflight_ttl_min"], "seats": seats}
+    # Seat identity rides the same push: the form names who serves each seat, and a blank field
+    # stays blank rather than unsetting what the loop already answered for itself.
+    return apply_seats(overlaid, settings)
+
+
+def profiles_root() -> pathlib.Path:
+    return home() / "profiles"
+
+
+def profile_dir(name: str) -> pathlib.Path:
+    """Where a Hermes profile lives, whether or not it exists.
+
+    The launch profile *is* the Hermes home; every other profile is a directory under
+    ``profiles/``. Nothing is created here on purpose — a validation that mkdir'd would turn a
+    typo into what looks like a working install.
+    """
+    name = str(name or "").strip()
+    return home() if name in ("", "default") else profiles_root() / name
+
+
+def profile_exists(name: str) -> bool:
+    name = str(name or "").strip()
+    if not name or not _PROFILE_NAME.fullmatch(name):
+        return False
+    if name == "default":
+        return True
+    profile = profile_dir(name)
+    marker = profile / "config.yaml"
+    return profile.is_dir() and marker.is_file() and marker.stat().st_size > 0
+
+
+def seat_mapping(settings: dict | None) -> dict:
+    """The seat identities the settings form names — only the keys the operator actually filled in.
+
+    A blank profile/login is *not set here*, never "forget what this loop uses": that is what lets
+    one per-profile form hold defaults for a new loop without quietly rewriting seats a loop
+    already answered for itself.
+    """
+    d = settings_defaults(settings)
+    mapping: dict = {}
+    for seat, key in PROFILE_SETTINGS.items():
+        entry: dict = {}
+        if str(d.get(key) or "").strip():
+            entry["profile"] = str(d[key]).strip()
+        login_key = LOGIN_SETTINGS.get(seat)
+        if login_key and str(d.get(login_key) or "").strip():
+            entry["login"] = str(d[login_key]).strip()
+        if entry:
+            mapping[seat] = entry
+    return mapping
+
+
+def seat_profile(loop: dict, role: str) -> str:
+    """What a seat (or the adjudicator) runs as, from the config it is actually driving with."""
+    if role == "adjudicator":
+        return str((loop.get("adjudicator") or {}).get("profile") or "default")
+    return str(((loop.get("seats") or {}).get(role) or {}).get("profile") or "")
+
+
+def seat_login(loop: dict, role: str) -> str:
+    if role == "adjudicator":
+        return ""
+    return str(((loop.get("seats") or {}).get(role) or {}).get("login") or "")
+
+
+def apply_seats(loop_raw: dict, settings: dict | None) -> dict:
+    """Overlay the form's seat identities onto a raw loop, touching nothing it does not name.
+
+    The reviewer's login and ``reviewer_seat`` move together: the reviewer route serves the login
+    named there, and a form that changed one without the other would leave the route waking a
+    login whose verdicts this loop does not count. An adjudicator profile only lands on a loop that
+    already has an adjudicator *route* — a profile alone cannot wake anyone, and route names belong
+    to the repository, not to the form.
+    """
+    mapping = seat_mapping(settings)
+    if not mapping:
+        return dict(loop_raw)
+    raw = {**loop_raw}
+    seats = {k: dict(v or {}) for k, v in (loop_raw.get("seats") or {}).items()}
+    for seat in SEAT_KEYS:
+        entry = mapping.get(seat) or {}
+        profile = str(entry.get("profile") or "")
+        if profile:
+            seats.setdefault(seat, {})["profile"] = profile
+            # The display name follows the profile unless the loop set its own: an agent name that
+            # disagrees with the profile is a prompt telling the wrong agent it is speaking.
+            if not str(seats[seat].get("agent") or "").strip():
+                seats[seat]["agent"] = profile.capitalize()
+        if str(entry.get("login") or ""):
+            seats.setdefault(seat, {})["login"] = entry["login"]
+    raw["seats"] = seats
+    reviewer_login = str((mapping.get("reviewer") or {}).get("login") or "")
+    if reviewer_login:
+        raw["reviewer_seat"] = reviewer_login
+    adj_profile = str((mapping.get("adjudicator") or {}).get("profile") or "")
+    adjudicator = dict(loop_raw.get("adjudicator") or {})
+    if adj_profile and adjudicator.get("route"):
+        adjudicator["profile"] = adj_profile
+        raw["adjudicator"] = adjudicator
+    return raw
 
 
 DEFAULTS: dict = {
@@ -164,6 +298,127 @@ def seat_concurrency(loop: dict, seat: str) -> int:
 
 class ConfigError(Exception):
     """A loop file that cannot be trusted to drive a run."""
+
+
+def verify_credentials(loop: dict, roles: set[str] | None = None) -> None:
+    """Check the loop's token *references* — never their values.
+
+    Two rules, both learned the hard way. A mapping that names a file which is not there fails at
+    the first API call, hours later, in a log nobody is reading; and a loop that maps tokens but
+    leaves a seat's login unmapped quietly pushes as whatever ``read_token`` is, which is the wrong
+    identity holding write access. Values are only ever read by ``gh.token()`` at use time, from a
+    file the operator owns and this CLI does not print.
+    """
+    where = loop.get("id") or loop.get("repo") or "<inline>"
+    tokens = {str(k).lower(): str(v or "") for k, v in (loop.get("tokens") or {}).items()}
+    for login, raw_path in sorted(tokens.items()):
+        if not raw_path:
+            raise ConfigError(f"{where}: tokens.{login} names no file")
+        path = _path(raw_path)
+        if path.is_dir():
+            raise ConfigError(f"{where}: token for {login!r} points at a directory ({path}), "
+                              "not the file holding the PAT")
+        if not path.is_file():
+            raise ConfigError(f"{where}: token file for {login!r} is missing ({path}) — the seats "
+                              "read that file at use time")
+        try:
+            empty = not path.read_text().strip()
+        except OSError as exc:
+            raise ConfigError(f"{where}: token file for {login!r} is unreadable ({path}): {exc}") from exc
+        if empty:
+            raise ConfigError(f"{where}: token file for {login!r} is empty ({path}) — an empty PAT "
+                              "reads as an unauthenticated call, not as a loud failure")
+
+    roles = set(roles or ())
+    read_token = str(loop.get("read_token") or "").lower()
+    if roles and read_token and read_token not in tokens:
+        raise ConfigError(f"{where}: read_token {read_token!r} has no entry in 'tokens' — the gates "
+                          "read GitHub as that login")
+
+    for seat in SEAT_KEYS:
+        if seat not in roles:
+            continue                       # a loop that predates this check keeps loading
+        login = seat_login(loop, seat).lower()
+        if login and login not in tokens:
+            raise ConfigError(f"{where}: no token mapped for the {seat} login {login!r} — add "
+                              f"--token {login}=/path/to/pat, or the {seat} acts as {read_token!r}")
+    if roles & set(SEAT_KEYS):
+        # Distinct role credentials: two seats sharing one PAT is one account wearing two hats, and
+        # the loop's whole point is that a different account reviews the fixer's work.
+        reviewer, fixer = seat_login(loop, "reviewer").lower(), seat_login(loop, "fixer").lower()
+        if reviewer in tokens and fixer in tokens and reviewer != fixer:
+            try:
+                same_file = _path(tokens[reviewer]).samefile(_path(tokens[fixer]))
+            except OSError as exc:
+                raise ConfigError(f"{where}: cannot verify reviewer/fixer token file identity: "
+                                  f"{exc}") from exc
+            if same_file:
+                raise ConfigError(f"{where}: the reviewer and the fixer read the same token file "
+                                  "— each seat needs its own credential")
+
+
+def verify_seats(loop: dict, roles: set[str] | None = None) -> None:
+    """Refuse a seat mapping that could not drive a run — before any file is written.
+
+    Existence and allowlist membership are checked only for the roles this operation *writes*: a
+    loop created before this validation existed may name a profile this machine never had, and
+    rewriting its ``cap`` must not be the moment that surfaces. The combination checks (two seats
+    on one profile, two seats on one login) always run against the *effective* loop, because the
+    unsafe shape is the combination, not either half.
+
+    Order matters for the error message, not for the outcome: profiles first, because a wrong
+    profile name is the mistake an operator makes in a form.
+    """
+    roles = set(roles or ())
+    where = loop.get("id") or loop.get("repo") or "<inline>"
+    for seat in SEAT_KEYS:
+        if seat not in roles:
+            continue
+        profile = seat_profile(loop, seat).strip()
+        login = seat_login(loop, seat).strip().lower()
+        if not profile:
+            raise ConfigError(f"{where}: seats.{seat}.profile is required — the seat cannot run as "
+                              "nobody")
+        if not profile_exists(profile):
+            raise ConfigError(
+                f"{where}: no Hermes profile named {profile!r} for the {seat} seat (looked in "
+                f"{profiles_root()}) — create the profile, or name one that exists")
+        allowlist = [str(x).lower() for x in (loop.get("reviewers") if seat == "reviewer"
+                                              else loop.get("fixers")) or []]
+        if login and login not in set(allowlist):
+            raise ConfigError(
+                f"{where}: the {seat} login {login!r} is not in this loop's "
+                f"{'reviewers' if seat == 'reviewer' else 'fixers'} allowlist "
+                f"({', '.join(allowlist) or 'empty'}) — a seat may only act as a login the "
+                "repository already trusts")
+
+    reviewer_profile, fixer_profile = seat_profile(loop, "reviewer"), seat_profile(loop, "fixer")
+    reviewer_login, fixer_login = seat_login(loop, "reviewer"), seat_login(loop, "fixer")
+    if reviewer_profile and reviewer_profile == fixer_profile:
+        raise ConfigError(f"{where}: reviewer and fixer both run as profile {reviewer_profile!r} — "
+                          "one seat cannot review its own work")
+    if reviewer_login and reviewer_login.lower() == fixer_login.lower():
+        raise ConfigError(f"{where}: reviewer and fixer both act as {reviewer_login!r} — the two "
+                          "seats must be different accounts")
+
+    adjudicator = loop.get("adjudicator") or {}
+    # The adjudicator is judged against the seats whenever a seat *moves* too: pushing the reviewer
+    # onto the profile that rules on it is the same mistake from the other direction, and the
+    # effective loop is what runs.
+    if adjudicator and roles & {"reviewer", "fixer", "adjudicator"}:
+        adj_profile = str(adjudicator.get("profile") or "").strip() or "default"
+        if "adjudicator" in roles and not adjudicator.get("route"):
+            raise ConfigError(f"{where}: adjudicator.profile is set but adjudicator.route is not — "
+                              "a profile alone cannot wake anyone")
+        if "adjudicator" in roles and not profile_exists(adj_profile):
+            raise ConfigError(f"{where}: no Hermes profile named {adj_profile!r} for the "
+                              f"adjudicator seat (looked in {profiles_root()})")
+        if adj_profile in (reviewer_profile, fixer_profile):
+            raise ConfigError(f"{where}: the adjudicator runs as profile {adj_profile!r}, the same "
+                              "as a seat it is meant to rule on")
+
+    verify_credentials(loop, roles=roles)
+
 
 _DNS_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
 

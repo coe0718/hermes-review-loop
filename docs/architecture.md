@@ -44,6 +44,38 @@ The ledger is keyed by **PR**, so the same PR never runs twice even with a free 
 *head* never runs twice at all (in-flight marks). A slot expires (`ttl_min`), so a crashed run
 cannot wedge a loop.
 
+### Who serves a seat, and why the route is part of it
+
+The profile and the login are the seat's **identity**, and they are per loop like everything else:
+the same install can run Vex/Drey on one repository and a different pair on another. The plugin
+settings carry a per-profile *default* for them (`reviewer_profile`, `fixer_profile`,
+`reviewer_login`, `fixer_login`, `adjudicator_profile`); a new loop starts from it, and an existing
+loop only moves when `apply --loop <id>` pushes it. Blank means *not set here* — never "forget what
+this loop uses".
+
+A route is bound to a profile by its URL: `/webhooks/<name>` is the launch profile, and
+`/p/<profile>/webhooks/<name>` is every other one. So an identity change is **also a route change**,
+and `apply` treats it as one staged operation: validate (the profile exists, the login is in the
+allowlist, the two seats share no profile/login/token file, every token reference resolves, the route
+is not another loop's and still runs this role's gate script) → write the loop config → rebind
+exactly the routes whose profile moved → read the registry back and report. Only the routes this loop
+owns are touched, and a rebind keeps the route's own secret, so unrelated routes and their secrets
+survive.
+
+Two consequences worth stating plainly:
+
+* **A seat in flight is not rewritten underneath itself.** `apply` refuses an identity change while
+  the seat it would move has a live run, and `--while-busy` is the explicit override — the run that
+  is already out finishes under the identity it started with, and `status` is where that shows.
+* **The config and the route can disagree, so `status` prints both.** `reviewer widgets-review → vex
+  (ok)` is the check; `MISMATCH — hermes review-loop apply --loop widgets` is the loop that would
+  run as the old agent while every config file claims otherwise.
+
+Existence, allowlist and credential checks run for the roles an operation *writes*, not for every
+role in the file: a loop created before the checks existed must not start failing because someone
+tuned its `cap`. The combination checks (distinctness, credentials, route ownership) always run,
+because the unsafe shape is the combination.
+
 ### One PR, one seat — and who frees it
 
 Per-seat capacity answers *how many PRs a seat may hold*. A second, stricter rule sits under it:

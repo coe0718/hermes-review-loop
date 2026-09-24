@@ -46,6 +46,7 @@ sys.path.insert(0, str(ROOT))
 # refuses to delete artifacts under an unrelated repository, even a test repo.
 TMP = pathlib.Path(tempfile.mkdtemp(prefix="review-loop-tests-", dir=os.environ.get("TMPDIR")))
 atexit.register(shutil.rmtree, TMP, ignore_errors=True)
+HOME = TMP / "hermes-home"
 LOOPS_DIR = TMP / "loops"
 STATE_DIR = TMP / "state"
 REVIEWS = TMP / "reviews"
@@ -248,13 +249,25 @@ def write_subs() -> dict:
     return subs
 
 
+def write_profiles(*names: str) -> None:
+    """Place the Hermes profiles the seat tests name.
+
+    A named profile needs its own config.yaml, not merely an empty directory.
+    """
+    for name in names:
+        profile = HOME / "profiles" / name
+        profile.mkdir(parents=True, exist_ok=True)
+        (profile / "config.yaml").write_text("model:\n  default: test-model\n")
+
+
 def reset(hooks_active: bool = True, prs: dict | None = None) -> dict:
-    for path in (STATE_DIR, REVIEWS, SCRATCH, CLONE, LOOPS_DIR):
+    for path in (STATE_DIR, REVIEWS, SCRATCH, CLONE, LOOPS_DIR, HOME / "state"):
         shutil.rmtree(path, ignore_errors=True)
     RECEIVED.clear()
     for path in (SUBS, WORLD_FILE):
         if path.exists():
             path.unlink()
+    write_profiles("reviewer-profile", "fixer-profile", "drey", "vex", "tuck")
     make_clone()
     cfg = write_loop()
     subs = write_subs()
@@ -1224,6 +1237,438 @@ def group_plugin_settings() -> None:
     check("settings lists every knob", "reviewer_concurrency" in buf.getvalue(), True)
     check("  and where it came from", "[set]" in buf.getvalue(), True)
 
+def parser_for(settings: dict | None = None):
+    """A ``hermes review-loop`` parser wired to a settings form, for in-process commands."""
+    from review_loop import cli
+
+    fake = FakeCtx()
+    cli.register_cli(fake, settings=settings)
+    parser = argparse.ArgumentParser(prog="hermes review-loop")
+    fake.setup(parser)
+    return parser
+
+
+def run_cli(parsed) -> tuple[int, str]:
+    """Run a parsed command in-process and hand back its exit code plus what it printed."""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = parsed.func(parsed)
+    return rc, buf.getvalue()
+
+
+SEAT_PATS = (TMP / "rev.pat", TMP / "fix.pat")     # written by ``write_loop`` for both seats
+
+
+def make_loop(loop_id: str, repo: str, reviewer_profile: str, fixer_profile: str,
+              adjudicator: str = "") -> dict:
+    """Write one loop the way ``init`` would — config and routes — without a CLI or a network.
+
+    The seat-identity tests need several loops side by side (that is the whole point: one form,
+    many repositories), and driving each one through ``init`` would only test ``init`` again.
+    """
+    from review_loop import cli as cli_mod, config
+
+    raw = {
+        "id": loop_id, "repo": repo, "base": "main", "cap": 3,
+        "fixers": [FIXER], "reviewers": [REVIEWER], "reviewer_seat": REVIEWER,
+        "seats": {"reviewer": {"profile": reviewer_profile, "route": f"{loop_id}-review",
+                               "login": REVIEWER},
+                  "fixer": {"profile": fixer_profile, "route": f"{loop_id}-fix", "login": FIXER}},
+        "state_dir": str(STATE_DIR / loop_id),
+        "tokens": {REVIEWER: str(SEAT_PATS[0]), FIXER: str(SEAT_PATS[1])},
+        "read_token": REVIEWER, "host": HOST,
+    }
+    if adjudicator:
+        raw["adjudicator"] = {"route": f"{loop_id}-breach", "profile": adjudicator}
+    LOOPS_DIR.mkdir(parents=True, exist_ok=True)
+    loop = config.normalize(raw)
+    (LOOPS_DIR / f"{loop_id}.json").write_text(json.dumps(loop, indent=2))
+    cli_mod._install_routes(loop)
+    return loop
+
+
+def group_seat_identity() -> None:
+    """Who serves each seat: the form names a profile and a login per role, and the loop, its
+    routes and the guard rails all have to agree — per loop, never globally."""
+    from review_loop import cli, config, gh
+
+    section("seat identity — the settings form says who serves each seat")
+
+    def subs() -> dict:
+        return json.loads(SUBS.read_text())
+
+    def loop_bytes(loop_id: str) -> str:
+        return (LOOPS_DIR / f"{loop_id}.json").read_text()
+
+    reset(prs={})
+    original_api = gh.api
+    gh.api = lambda loop, path, **kw: [] if path.endswith("/hooks?per_page=100") else original_api(loop, path, **kw)
+    form = {"reviewer_profile": "vex", "fixer_profile": "drey", "adjudicator_profile": "tuck",
+            "reviewer_login": REVIEWER, "fixer_login": FIXER}
+    parser = parser_for(form)
+    init_args = ["init", "--repo", "acme/seats", "--fixer", FIXER, "--reviewer", REVIEWER,
+                 "--host", HOST, "--read-token", REVIEWER,
+                 "--token", f"{REVIEWER}={SEAT_PATS[0]}", "--token", f"{FIXER}={SEAT_PATS[1]}",
+                 "--adjudicator-route", "seats-breach"]
+
+    rc, out = run_cli(parser.parse_args([*init_args, "--dry-run"]))
+    check("init --dry-run previews the loop", rc, 0)
+    check("  reviewer: the profile the form names", "profile vex" in out, True)
+    check("  fixer: the profile the form names", "profile drey" in out, True)
+    check("  adjudicator: the profile the form names", "profile tuck" in out, True)
+    check("  and it says nothing was written", "nothing written" in out, True)
+    check("  no loop config was written", (LOOPS_DIR / "seats.json").exists(), False)
+    check("  no route was written", "seats-review" in SUBS.read_text(), False)
+
+    untouched = {name: subs()[name] for name in ("widgets-review", "widgets-fix", "widgets-breach")}
+    rc, out = run_cli(parser.parse_args(init_args))
+    check("install succeeds", rc, 0)
+    installed = subs()
+    check("  the reviewer route runs under vex", installed["seats-review"]["profile"], "vex")
+    check("  the fixer route runs under drey", installed["seats-fix"]["profile"], "drey")
+    check("  the adjudicator route runs under tuck", installed["seats-breach"]["profile"], "tuck")
+    check("  and the other loops' routes are untouched",
+          [{"description": subs()[n]["description"], "profile": subs()[n]["profile"],
+            "secret": subs()[n]["secret"]} for n in untouched],
+          [{"description": e["description"], "profile": e["profile"], "secret": e["secret"]}
+           for e in untouched.values()])
+
+    seats_loop = config.load_id("seats")
+    check("the loop records the same mapping",
+          tuple(config.seat_profile(seats_loop, role) for role in config.ROUTE_ROLES),
+          ("vex", "drey", "tuck"))
+    check("  with the logins the form named",
+          (config.seat_login(seats_loop, "reviewer"), config.seat_login(seats_loop, "fixer")),
+          (REVIEWER, FIXER))
+    check("  and the reviewer login the route serves",
+          seats_loop["reviewer_seat"], REVIEWER)
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        cli.cmd_status(ns(loop="seats"))
+    status = buf.getvalue()
+    check("status shows who serves each seat", f"reviewer={REVIEWER} (vex)" in status, True)
+    check("  and the adjudicator", "adjudicator: tuck" in status, True)
+    check("  and that the review route agrees", "seats-review → vex (ok)" in status, True)
+    check("  and that the fix route agrees", "seats-fix → drey (ok)" in status, True)
+    check("  and that the adjudicator route agrees", "seats-breach → tuck (ok)" in status, True)
+    check("  and where each seat's token is referenced",
+          f"reviewer {REVIEWER} → {SEAT_PATS[0]}" in status, True)
+
+    # End to end: the route the gateway serves is the profile the form chose, so a review woken for
+    # this loop is woken *as Vex* — the URL itself carries it, and the drain is the path that fires
+    # at a route rather than letting the gateway be the one to do it.
+    set_prs({"7": pr(7)})
+    payload = {**pr_payload(7, requested=REVIEWER), "repository": {"full_name": "acme/seats"}}
+    kind, out, err = run("gate_reviewer.py", payload)
+    check("the gate fires for the new loop", kind, "FIRE")
+    check("  and the payload names the seat it woke", json.loads(out)["_loop"]["role"], "reviewer")
+
+    loop_state = HOME / "state" / "review-loops" / "seats"
+    loop_state.mkdir(parents=True, exist_ok=True)
+    (loop_state / "locks.json").write_text("{}")
+    (loop_state / "pending.json").write_text(json.dumps(
+        {"reviewer": {f"acme/seats#7": {"at": time.time(), "head": HEAD_A, "url": "u",
+                                        "reason": "capacity"}}}))
+    before = len(RECEIVED)
+    out, _, _ = run("watchdog.py", None, "--loop", "seats", "--drain", "--seat", "reviewer")
+    check("the drain starts the queued review", "started the queued run" in out, True)
+    check("  and it wakes the reviewer at the profile the form chose",
+          RECEIVED[-1]["path"] if len(RECEIVED) > before else None,
+          "/p/vex/webhooks/seats-review")
+    check("  with that route's secret", verify_sig(RECEIVED[-1], "seats-review"), True)
+
+    section("seat identity — every surface shows the effective mapping")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        cli.cmd_settings(ns())
+    shown = buf.getvalue()
+    check("settings shows the form's seat mapping", "seat mapping" in shown, True)
+    check("  reviewer profile", "profile vex" in shown, True)
+    check("  fixer profile", "profile drey" in shown, True)
+    check("  adjudicator profile", "profile tuck" in shown, True)
+    check("  and resolves each loop against it", "reviewer rev-coach (vex)" in shown, True)
+    check("  including the adjudicator it would push", "adjudicator tuck" in shown, True)
+
+    section("seat identity — a form that holds nothing rewrites nothing")
+    reset(prs={})
+    north = make_loop("north", "acme/north", "vex", "drey")
+    south = make_loop("south", "acme/south", "reviewer-profile", "fixer-profile")
+    east = make_loop("east", "acme/east", "vex", "drey", adjudicator="tuck")
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        cli.cmd_settings(ns())
+    shown = buf.getvalue()
+    check("settings says which loops have no adjudicator",
+          "adjudicator (none)" in shown, True)
+    check("  and shows the ones that do", "adjudicator tuck" in shown, True)
+
+    rc, out = run_cli(parser_for({}).parse_args(["apply", "--loop", "east", "--dry-run"]))
+    check("an empty form changes nothing", "already matches the plugin settings" in out, True)
+    check("  and the seat keeps its own profile",
+          config.seat_profile(config.load_id("east"), "reviewer"), "vex")
+    check("  and its own adjudicator",
+          config.seat_profile(config.load_id("east"), "adjudicator"), "tuck")
+
+    # A form with numbers only must not touch seats either: that is what "defaults, not a
+    # subscription" means for identity, and it is the difference between a form and a takeover.
+    south_before, north_before = loop_bytes("south"), loop_bytes("north")
+    rc, out = run_cli(parser_for({"cap": 4}).parse_args(["apply", "--loop", "south"]))
+    check("a numbers-only form leaves the seats alone", rc, 0)
+    check("  no seat appeared in the diff", "profile" in out, False)
+    check("  the loop's own profiles survive",
+          (config.seat_profile(config.load_id("south"), "reviewer"),
+           config.seat_profile(config.load_id("south"), "fixer")),
+          ("reviewer-profile", "fixer-profile"))
+    check("  and its routes still run them",
+          (subs()["south-review"]["profile"], subs()["south-fix"]["profile"]),
+          ("reviewer-profile", "fixer-profile"))
+    check("  while the other loops' configs are byte-identical",
+          (loop_bytes("north") == north_before, loop_bytes("south") != south_before),
+          (True, True))
+
+    section("seat identity — one loop moves, the other two do not (A / B / A)")
+    # push the form onto 'south' only, in two steps: a refusal-free preview first
+    rc, out = run_cli(parser_for(form).parse_args(["apply", "--loop", "south", "--dry-run"]))
+    check("apply --dry-run explains the change", rc, 0)
+    check("  reviewer profile in the diff", "reviewer profile: reviewer-profile → vex" in out, True)
+    check("  fixer profile in the diff", "fixer profile: fixer-profile → drey" in out, True)
+    check("  the route rebind it needs",
+          "route south-review: profile reviewer-profile → vex" in out, True)
+    check("  and it says nothing was written", "nothing written" in out, True)
+    check("  nothing was written", config.seat_profile(config.load_id("south"), "reviewer"),
+          "reviewer-profile")
+    check("  the route still runs the old profile",
+          subs()["south-review"]["profile"], "reviewer-profile")
+
+    secret_before = subs()["south-review"]["secret"]
+    north_snapshot, east_snapshot = loop_bytes("north"), loop_bytes("east")
+    rc, out = run_cli(parser_for(form).parse_args(["apply", "--loop", "south"]))
+    check("apply stages the change", rc, 0)
+    check("  seat moved", config.seat_profile(config.load_id("south"), "reviewer"), "vex")
+    check("  route rebound in the same operation", subs()["south-review"]["profile"], "vex")
+    check("  and it reports the rebind", "route south-review rebound → profile vex" in out, True)
+    check("  the route keeps its secret", subs()["south-review"]["secret"], secret_before)
+    check("  a second apply is a no-op",
+          "already matches the plugin settings"
+          in run_cli(parser_for(form).parse_args(["apply", "--loop", "south"]))[1], True)
+    check("  loop A is untouched (byte-identical)", loop_bytes("north"), north_snapshot)
+    check("  loop C is untouched (byte-identical)", loop_bytes("east"), east_snapshot)
+    check("  and their routes still run their own profiles",
+          (subs()["north-review"]["profile"], subs()["east-review"]["profile"]), ("vex", "vex"))
+    check("  (A and C agree because they were configured that way, not because B leaked)",
+          (config.seat_profile(config.load_id("north"), "reviewer"),
+           config.seat_profile(config.load_id("east"), "reviewer")), ("vex", "vex"))
+    check("  and B is the one that moved",
+          config.seat_profile(config.load_id("south"), "fixer"), "drey")
+
+    section("seat identity — a seat mid-run is not rewritten underneath itself")
+    busy = make_loop("busy", "acme/busy", "reviewer-profile", "fixer-profile")
+    busy_state = STATE_DIR / "busy"
+    busy_state.mkdir(parents=True, exist_ok=True)
+    (busy_state / "locks.json").write_text(json.dumps(
+        {"reviewer": {f"acme/busy#7": {"at": time.time(), "head": HEAD_A, "why": "review"}}}))
+    before_bytes = loop_bytes("busy")
+    rc, out = run_cli(parser_for(form).parse_args(["apply", "--loop", "busy"]))
+    check("a seat in flight → apply refused", rc, 2)
+    check("  it names the running seat", "reviewer is in flight" in out, True)
+    check("  and offers the explicit override", "--while-busy" in out, True)
+    check("  nothing was written", loop_bytes("busy"), before_bytes)
+    check("  the route still runs the old profile",
+          subs()["busy-review"]["profile"], "reviewer-profile")
+    rc, out = run_cli(parser_for(form).parse_args(["apply", "--loop", "busy", "--dry-run"]))
+    check("  (a dry run is still allowed while a seat is busy)", rc, 0)
+    rc, out = run_cli(parser_for(form).parse_args(["apply", "--loop", "busy", "--while-busy"]))
+    check("--while-busy applies it anyway", rc, 0)
+    check("  seat moved", config.seat_profile(config.load_id("busy"), "reviewer"), "vex")
+    check("  route rebound", subs()["busy-review"]["profile"], "vex")
+    check("  and it says the live run keeps its identity",
+          "keeps the identity it started with" in out, True)
+
+    section("seat identity — an invalid mapping fails before any side effect")
+    # the loop the refusals below push onto, written the same way `init` writes one
+    make_loop("seats", "acme/seats", "vex", "drey", adjudicator="tuck")
+    for label, bad, expect in (
+            ("a profile that does not exist", {"reviewer_profile": "ghost"},
+             "no Hermes profile named 'ghost'"),
+            ("a login outside the allowlist", {"reviewer_login": "stranger"},
+             "is not in this loop's reviewers allowlist"),
+            ("one profile for both seats", {"reviewer_profile": "drey", "fixer_profile": "drey"},
+             "both run as profile 'drey'"),
+            ("an adjudicator that is one of the seats", {"adjudicator_profile": "vex"},
+             "the same as a seat it is meant to rule on"),
+            ("a seat moving onto the adjudicator's profile", {"reviewer_profile": "tuck"},
+             "the same as a seat it is meant to rule on"),
+            ("an adjudicator profile that does not exist", {"adjudicator_profile": "ghost"},
+             "no Hermes profile named 'ghost'")):
+        fingerprint = (loop_bytes("seats"), SUBS.read_text())
+        rc, out = run_cli(parser_for({**form, **bad}).parse_args(["apply", "--loop", "seats"]))
+        check(f"{label} → refused", rc, 2)
+        check(f"  {label}: the reason is named", expect in out, True)
+        check(f"  {label}: nothing was written", (loop_bytes("seats"), SUBS.read_text()),
+              fingerprint)
+
+    # A loop that trusts both logins on both sides leaves only the two-seats-one-account rule.
+    overlap = make_loop("overlap", "acme/overlap", "reviewer-profile", "fixer-profile")
+    raw = json.loads(loop_bytes("overlap"))
+    raw["reviewers"] = [REVIEWER, FIXER]
+    (LOOPS_DIR / "overlap.json").write_text(json.dumps(raw))
+    fingerprint = (loop_bytes("overlap"), SUBS.read_text())
+    rc, out = run_cli(parser_for({**form, "reviewer_login": FIXER, "fixer_login": FIXER})
+                      .parse_args(["apply", "--loop", "overlap"]))
+    check("two seats on one login → refused", rc, 2)
+    check("  and it says why", "both act as" in out, True)
+    check("  nothing was written", (loop_bytes("overlap"), SUBS.read_text()), fingerprint)
+
+    shared = make_loop("shared", "acme/shared", "reviewer-profile", "fixer-profile")
+    raw = json.loads(loop_bytes("shared"))
+    raw["tokens"] = {REVIEWER: str(SEAT_PATS[0]), FIXER: str(SEAT_PATS[0])}
+    (LOOPS_DIR / "shared.json").write_text(json.dumps(raw))
+    fingerprint = (loop_bytes("shared"), SUBS.read_text())
+    rc, out = run_cli(parser_for(form).parse_args(["apply", "--loop", "shared"]))
+    check("two seats on one token file → refused", rc, 2)
+    check("  and it says why", "read the same token file" in out, True)
+    check("  nothing was written", (loop_bytes("shared"), SUBS.read_text()), fingerprint)
+
+    for kind in ("symlink", "hardlink"):
+        alias = TMP / f"{kind}-fixer.pat"
+        alias.unlink(missing_ok=True)
+        if kind == "symlink":
+            alias.symlink_to(SEAT_PATS[0])
+        else:
+            os.link(SEAT_PATS[0], alias)
+        raw["tokens"] = {REVIEWER: str(SEAT_PATS[0]), FIXER: str(alias)}
+        (LOOPS_DIR / "shared.json").write_text(json.dumps(raw))
+        fingerprint = (loop_bytes("shared"), SUBS.read_text())
+        rc, out = run_cli(parser_for(form).parse_args(["apply", "--loop", "shared"]))
+        check(f"{kind} alias to one credential → refused", rc, 2)
+        check(f"  {kind}: same file identified", "read the same token file" in out, True)
+        check(f"  {kind}: no writes", (loop_bytes("shared"), SUBS.read_text()), fingerprint)
+
+    section("seat identity — a route belongs to the loop that already owns it")
+    make_loop("overlap2", "acme/overlap2", "reviewer-profile", "fixer-profile")
+    raw = json.loads(loop_bytes("overlap2"))
+    raw["seats"]["reviewer"]["route"] = "overlap-review"      # loop `overlap` owns that name
+    (LOOPS_DIR / "overlap2.json").write_text(json.dumps(raw))
+    fingerprint = (loop_bytes("overlap2"), SUBS.read_text())
+    rc, out = run_cli(parser_for(form).parse_args(["apply", "--loop", "overlap2"]))
+    check("a route another loop owns → refused", rc, 2)
+    check("  and it names the owner", "already belongs to loop overlap" in out, True)
+    check("  nothing was written", (loop_bytes("overlap2"), SUBS.read_text()), fingerprint)
+
+    make_loop("foreign", "acme/foreign", "reviewer-profile", "fixer-profile")
+    data = subs()
+    data["stranger-inbox"] = {"description": "someone else's route", "events": ["push"],
+                              "secret": "not-ours", "prompt": "", "skills": [], "deliver": "local",
+                              "profile": "other-plugin", "script": "not_our_gate.py", "host": HOST}
+    SUBS.write_text(json.dumps(data))
+    raw = json.loads(loop_bytes("foreign"))
+    raw["seats"]["reviewer"]["route"] = "stranger-inbox"
+    (LOOPS_DIR / "foreign.json").write_text(json.dumps(raw))
+    fingerprint = (loop_bytes("foreign"), SUBS.read_text())
+    rc, out = run_cli(parser_for(form).parse_args(["apply", "--loop", "foreign"]))
+    check("a route running someone else's gate → refused", rc, 2)
+    check("  and it says which script", "not_our_gate.py" in out, True)
+    check("  nothing was written", (loop_bytes("foreign"), SUBS.read_text()), fingerprint)
+
+    # A script-less route and a route with our script but another prompt are not ours.
+    # Neither may have its secret retained while its handler is rewritten by apply.
+    for label, script, prompt in (("missing gate", None, "someone else's prompt"),
+                                  ("foreign prompt", "gate_reviewer.py", "someone else's prompt")):
+        data = subs()
+        data["stranger-inbox"].update(script=script, prompt=prompt)
+        SUBS.write_text(json.dumps(data))
+        fingerprint = (loop_bytes("foreign"), SUBS.read_text())
+        rc, out = run_cli(parser_for(form).parse_args(["apply", "--loop", "foreign"]))
+        check(f"{label} route → refused", rc, 2)
+        check(f"  {label}: nothing was written", (loop_bytes("foreign"), SUBS.read_text()), fingerprint)
+
+    two_seats = make_loop("two-seats", "acme/two-seats", "reviewer-profile", "fixer-profile")
+    raw = json.loads(loop_bytes("two-seats"))
+    raw["seats"]["fixer"]["route"] = raw["seats"]["reviewer"]["route"]   # one route, two seats
+    (LOOPS_DIR / "two-seats.json").write_text(json.dumps(raw))
+    fingerprint = (loop_bytes("two-seats"), SUBS.read_text())
+    rc, out = run_cli(parser_for(form).parse_args(["apply", "--loop", "two-seats"]))
+    check("two seats on one route → refused", rc, 2)
+    check("  and it says why", "routed to more than one seat" in out, True)
+    check("  nothing was written", (loop_bytes("two-seats"), SUBS.read_text()), fingerprint)
+
+    # `init` writes routes from scratch, so it must refuse a name another loop already owns too.
+    fingerprint = (SUBS.read_text(), loop_bytes("north"))
+    rc, out = run_cli(parser.parse_args(["init", "--repo", "acme/elsewhere", "--id", "north",
+                                         "--fixer", FIXER, "--reviewer", REVIEWER, "--host", HOST,
+                                         "--token", f"{REVIEWER}={SEAT_PATS[0]}",
+                                         "--token", f"{FIXER}={SEAT_PATS[1]}"]))
+    check("init refuses a route another loop owns", rc, 2)
+    check("  and it names the owner", "already belongs to loop north" in out, True)
+    check("  nothing was written", (SUBS.read_text(), loop_bytes("north")), fingerprint)
+
+    section("seat identity — a rebind that cannot be written leaves the loop where it was")
+    # A registry write is the one thing here that can fail on someone else's account (a full disk, a
+    # lock, a read-only mount), so the staged move has to be all-or-nothing: the loop config and the
+    # routes are read back after the refusal and must be byte-identical.
+    make_loop("frozen", "acme/frozen", "reviewer-profile", "fixer-profile")
+    fingerprint = (loop_bytes("frozen"), SUBS.read_text())
+    real_new_route = cli.routes.new_route
+
+    def refuse_route(*_args, **_kwargs):
+        raise OSError("registry is on a read-only mount")
+
+    cli.routes.new_route = refuse_route
+    try:
+        rc, out = run_cli(parser_for(form).parse_args(["apply", "--loop", "frozen"]))
+    finally:
+        cli.routes.new_route = real_new_route
+    check("a rebind the registry refuses → refused", rc, 2)
+    check("  and it says config was unchanged", "config unchanged" in out, True)
+    check("  loop and routes unchanged", (loop_bytes("frozen"), SUBS.read_text()), fingerprint)
+
+    # `init` is the other half of the same promise: a loop whose routes cannot be written is not
+    # left behind as a config with no route to wake it.
+    cli.routes.new_route = refuse_route
+    try:
+        rc, out = run_cli(parser.parse_args(["init", "--repo", "acme/halfway", "--id", "halfway",
+                                             "--fixer", FIXER, "--reviewer", REVIEWER,
+                                             "--host", HOST,
+                                             "--token", f"{REVIEWER}={SEAT_PATS[0]}",
+                                             "--token", f"{FIXER}={SEAT_PATS[1]}"]))
+    finally:
+        cli.routes.new_route = real_new_route
+    check("a route install that fails → refused", rc, 2)
+    check("  and it says previous state was restored", "previous config and routes restored" in out, True)
+    check("  no loop config left behind", (LOOPS_DIR / "halfway.json").exists(), False)
+    check("  no route left behind", [n for n in subs() if n.startswith("halfway")], [])
+
+    section("seat identity — credentials are checked before anything is written")
+    parser = parser_for(form)          # the credentials below are named by this form
+    empty_pat = TMP / "empty.pat"
+    empty_pat.write_text("")
+    for label, extra, expect in (
+            ("no token mappings", [], "has no entry in 'tokens'"),
+            ("a seat login with no token mapped", ["--read-token", FIXER,
+                                                   "--token", f"{FIXER}={SEAT_PATS[1]}"],
+             "no token mapped for the reviewer login"),
+            ("a token file that is not there", ["--read-token", REVIEWER,
+                                                "--token", f"{REVIEWER}={SEAT_PATS[0]}",
+                                                "--token", f"{FIXER}={TMP / 'missing.pat'}"],
+             "token file for 'dev-fixer' is missing"),
+            ("a token file that is empty", ["--read-token", REVIEWER,
+                                            "--token", f"{REVIEWER}={SEAT_PATS[0]}",
+                                            "--token", f"{FIXER}={empty_pat}"],
+             "is empty")):
+        (LOOPS_DIR / "probe.json").unlink(missing_ok=True)
+        fingerprint = SUBS.read_text()
+        args = ["init", "--repo", "acme/probe", "--fixer", FIXER, "--reviewer", REVIEWER,
+                "--host", HOST, *extra]
+        rc, out = run_cli(parser.parse_args(args))
+        check(f"{label} → refused", rc, 2)
+        check(f"  {label}: the reason is named", expect in out, True)
+        check(f"  {label}: no loop config", (LOOPS_DIR / "probe.json").exists(), False)
+        check(f"  {label}: no routes touched", SUBS.read_text(), fingerprint)
+    gh.api = original_api
+
+
 def group_webhook_host() -> None:
     section("webhook host — never borrow another operator's gateway")
     from review_loop import cli, config, gh
@@ -1231,12 +1676,24 @@ def group_webhook_host() -> None:
     reset(prs={})
     init_args = ["init", "--repo", "acme/host-probe", "--fixer", FIXER,
                  "--reviewer", REVIEWER, "--reviewer-profile", "reviewer-profile",
-                 "--fixer-profile", "fixer-profile", "--hooks"]
+                 "--fixer-profile", "fixer-profile", "--hooks",
+                 "--token", f"{REVIEWER}={SEAT_PATS[0]}",
+                 "--token", f"{FIXER}={SEAT_PATS[1]}"]
     calls = []
+    installed_hooks = {}
     original_api = gh.api
     def fake_api(loop, path, **kwargs):
-        calls.append((path, kwargs))
-        return {"id": len(calls)}
+        if path.endswith('/hooks?per_page=100'):
+            return [{'id': key, 'config': {'url': url}} for key, url in installed_hooks.items()]
+        if kwargs.get('method') == 'POST':
+            calls.append((path, kwargs))
+            hook_id = len(calls)
+            installed_hooks[hook_id] = kwargs['body']['config']['url']
+            return {'id': hook_id}
+        if kwargs.get('method') == 'DELETE':
+            installed_hooks.pop(int(path.rsplit('/', 1)[-1]), None)
+            return None
+        return None
     gh.api = fake_api
     try:
         def parser_for(settings=None):
@@ -1288,7 +1745,7 @@ def group_webhook_host() -> None:
             check(f"  {label}: no new loop config", (LOOPS_DIR / "host-probe.json").exists(), False)
             check(f"  {label}: no API calls", calls, [])
 
-        parsed = parser.parse_args(init_args[:-1])
+        parsed = parser.parse_args([arg for arg in init_args if arg != "--hooks"])
         with contextlib.redirect_stdout(io.StringIO()):
             rc = parsed.func(parsed)
         check("without --hooks still refuses missing host before writes", rc, 2)
@@ -1316,6 +1773,7 @@ def group_webhook_host() -> None:
                 ("own plugin setting", {"host": "https://settings.example"}, [], "https://settings.example")):
             reset(prs={})
             calls.clear()
+            installed_hooks.clear()
             parser = parser_for(settings)
             args = parser.parse_args([*init_args, *extra])
             with contextlib.redirect_stdout(io.StringIO()):
@@ -3278,6 +3736,14 @@ def group_doctor() -> None:
     check("an unknown loop is refused", rc, 2)
     check("  with the reason", "cannot preflight loop" in out, True)
 
+def group_reconciliation() -> None:
+    section("seat reconciliation — route, hook and config rollback")
+    test = subprocess.run([sys.executable, str(ROOT / "tests" / "test_reconciliation.py")],
+                          capture_output=True, text=True)
+    if test.returncode:
+        print(test.stdout + test.stderr)
+    check("route and hook reconciliation regression suite", test.returncode, 0)
+
 
 GROUPS = {"routes": group_routes, "config": group_config, "reviewer": group_reviewer_gate, "budget": group_budget,
           "adjudicator": group_adjudicator,
@@ -3286,6 +3752,10 @@ GROUPS = {"routes": group_routes, "config": group_config, "reviewer": group_revi
           "webhook_host": group_webhook_host,
           "plugin_settings": group_plugin_settings, "watchdog": group_watchdog,
           "explain": group_explain, "cleanup": group_cleanup, "doctor": group_doctor}
+
+          "plugin_settings": group_plugin_settings, "seat_identity": group_seat_identity,
+          "watchdog": group_watchdog, "explain": group_explain,
+          "cleanup": group_cleanup, "reconciliation": group_reconciliation}
 
 
 def main() -> int:
