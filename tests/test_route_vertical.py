@@ -136,6 +136,25 @@ class RouteSubprocess(unittest.TestCase):
         self.assertIn("review generation unavailable", rows[0][2])
         self.assertFalse((Path(self.loop["state_dir"]) / "pending.json").exists())
 
+    def test_dismissed_same_head_reopens_one_distinct_reviewer_turn(self):
+        runtime = Path(self.env['HERMES_HOME']) / 'review-loop-runtime.json'
+        runtime.write_text('{}')
+        runtime.chmod(0o600)
+        payload = {'repository': {'full_name': 'acme/widgets'}, 'action': 'opened',
+                   'number': 7, 'pull_request': self.pr, 'sender': {'login': 'dev'}}
+        self.assertEqual(self.route('gate_reviewer.py', payload).returncode, 0)
+        dismissed = {'id': 42, 'state': 'DISMISSED', 'commit_id': HEAD,
+                     'user': {'login': 'reviewer'}}
+        self.world.write_text(json.dumps({'pr': self.pr, 'reviews': [dismissed]}))
+        db = Path(self.env['HERMES_HOME']) / 'state' / 'review-loop-runs.sqlite'
+        for _ in range(2):
+            result = self.route('gate_reviewer.py', payload)
+            self.assertEqual((result.returncode, result.stdout.strip()),
+                             (0, '[SILENT]'), result.stderr)
+        with sqlite3.connect(db) as conn:
+            keys = [row[0] for row in conn.execute('SELECT turn_key FROM runs ORDER BY turn_key')]
+        self.assertEqual(keys, ['', 'dismissed:42'])
+
 
 if __name__ == "__main__":
     unittest.main()

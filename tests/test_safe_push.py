@@ -70,13 +70,18 @@ class SafePushTests(unittest.TestCase):
             path.write_text("DUMMY_SECRET_" + login)
             tokens[login] = str(path)
         self.loop = {"repo": REPO, "base": "main", "state_dir": str(self.root),
-                     "fixers": ["fix"],
+                     "fixers": ["fix"], "reviewers": ["review"],
                      "tokens": tokens, "read_token": "read", "reviewer_seat": "review",
                      "seats": {"reviewer": {"login": "review"}, "fixer": {"login": "fix"}}}
         self.fake = FakeGitHub()
         p = mock.patch.object(gh, "api", side_effect=self.fake.api)
         p.start()
         self.addCleanup(p.stop)
+        reviews = [{'id': 41, 'state': 'CHANGES_REQUESTED', 'commit_id': HEAD,
+                    'submitted_at': '2026-01-01T00:00:00Z', 'user': {'login': 'review'}}]
+        review_patch = mock.patch.object(gh, 'reviews', return_value=reviews)
+        review_patch.start()
+        self.addCleanup(review_patch.stop)
         cas = mock.patch.object(safe_push, "_git_cas", side_effect=self.cas)
         cas.start()
         self.addCleanup(cas.stop)

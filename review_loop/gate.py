@@ -84,11 +84,11 @@ def artifacts_for(loop: dict, number: int) -> str:
 
 
 def block_pr_agent(loop: dict, st: state_mod.LoopState, seat: str,
-                   number: int, head: str, on_queued=None) -> None:
+                   number: int, head: str, on_queued=None, *, turn_key: str = '') -> None:
     """Durably enqueue an isolated turn; NEVER return a gateway-dispatch payload.
 
     An absent/invalid private runtime configuration is a visible fail-closed hold.
-    The ledger's unique repo/PR/head/seat index deduplicates webhook redelivery
+    The ledger's unique repo/PR/head/seat/turn index deduplicates webhook redelivery
     before launching a detached worker. No checkout or agent runs in this script.
     """
     from .run_supervisor import Supervisor
@@ -101,8 +101,9 @@ def block_pr_agent(loop: dict, st: state_mod.LoopState, seat: str,
             capacity={s: config.seat_concurrency(loop, s) for s in ("reviewer", "fixer")},
         )
         supervisor.recover()
-        supervisor.enqueue(f"{loop['repo']}:{number}:{head}:{seat}",
-                           loop["repo"], number, head, seat)
+        delivery = f"{loop['repo']}:{number}:{head}:{seat}"
+        supervisor.enqueue(delivery + (f':{turn_key}' if turn_key else ''),
+                           loop["repo"], number, head, seat, turn_key=turn_key)
         log(f"#{number} @ {head[:7]} {seat} enqueued for isolated worker")
     except Exception as exc:
         reason = f"isolated worker unavailable: {type(exc).__name__}: {exc}"

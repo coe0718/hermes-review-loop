@@ -34,7 +34,7 @@ class BoundaryTests(unittest.TestCase):
                    "ref": "fix-7", "repo": {"full_name": "acme/widgets"}},
                    "base": {"ref": "main", "repo": {"full_name": "acme/widgets"}}}
         self.loop = {"repo": "acme/widgets", "base": "main", "state_dir": str(self.root),
-                     "fixers": ["fix"],
+                     "fixers": ["fix"], "reviewers": ["review"],
                      "tokens": self.tokens, "read_token": "read", "reviewer_seat": "review",
                      "seats": {"reviewer": {"login": "review"}, "fixer": {"login": "fix"}}}
         self.kw = dict(repo="acme/widgets", number=7, head=self.head, role="reviewer",
@@ -47,7 +47,10 @@ class BoundaryTests(unittest.TestCase):
             if path == "/user":
                 return {"login": login, "id": {"read": 1, "review": 2, "fix": 3}[login]}
             return self.pr if method == "GET" else {"id": 8}
-        with mock.patch.object(gh, "api", side_effect=api):
+        reviews = [{'id': 41, 'state': 'CHANGES_REQUESTED', 'commit_id': self.head,
+                    'submitted_at': '2026-01-01T00:00:00Z', 'user': {'login': 'review'}}]
+        with mock.patch.object(gh, "api", side_effect=api), \
+             mock.patch.object(gh, 'reviews', return_value=reviews):
             self.assertEqual(broker.perform(self.loop, **self.kw), {"id": 8})
             self.assertEqual(calls[-1][2]["commit_id"], self.head)
             self.assertEqual(calls[-1][3], "review")

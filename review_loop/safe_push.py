@@ -276,7 +276,8 @@ def push(loop: dict, *, repo: str, number: int, head: str, role: str,
             # receive-pack without changing that ref; never acknowledge it as
             # a successful authorized push in that case.
             broker.authorize(loop, repo=repo, number=number, head=new_head,
-                             role=role, branch=branch, operation="push")
+                             role=role, branch=branch, operation="push",
+                             require_verdict=False)
         except Exception:
             outcome = "published_pr_unverified"
     _audit(loop, {**receipt, "new_head": new_head, "phase": "reconciled",

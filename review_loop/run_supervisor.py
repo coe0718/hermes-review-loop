@@ -29,7 +29,7 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS runs_seat ON runs(seat,state);
 CREATE INDEX IF NOT EXISTS runs_pr ON runs(repo,pr,state);
-CREATE UNIQUE INDEX IF NOT EXISTS runs_turn ON runs(repo,pr,head,seat);
+
 CREATE TABLE IF NOT EXISTS operator_notices (
  run_id TEXT PRIMARY KEY REFERENCES runs(id), state TEXT NOT NULL,
  created REAL NOT NULL, delivered REAL
@@ -75,8 +75,14 @@ class Supervisor:
         self.db.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as con:
             con.executescript(SCHEMA)
+            con.execute('BEGIN IMMEDIATE')
             if 'generation' not in {r[1] for r in con.execute('PRAGMA table_info(runs)')}:
                 con.execute('ALTER TABLE runs ADD COLUMN generation TEXT')
+            if 'turn_key' not in {r[1] for r in con.execute('PRAGMA table_info(runs)')}:
+                con.execute("ALTER TABLE runs ADD COLUMN turn_key TEXT NOT NULL DEFAULT ''")
+                con.execute('DROP INDEX IF EXISTS runs_turn')
+                con.execute('CREATE UNIQUE INDEX runs_turn ON runs(repo,pr,head,seat,turn_key)')
+            con.execute('COMMIT')
 
     def _connect(self):
         con = sqlite3.connect(self.db, timeout=10, isolation_level=None)
@@ -118,7 +124,7 @@ class Supervisor:
                                "WHERE n.state='pending' ORDER BY n.created,n.run_id LIMIT 20").fetchall()
         count = 0
         for row in rows:
-            # Serialize concurrent sweepers across delivery and acknowledgement.
+            message = None
             with self._connect() as con:
                 con.execute('BEGIN IMMEDIATE')
                 pending = con.execute("SELECT 1 FROM operator_notices WHERE run_id=? "
@@ -141,17 +147,32 @@ class Supervisor:
                                "--reason REASON --acknowledge-no-live-worker` only after "
                                "establishing no worker remains. Failed writes require "
                                "manual inspection before any new turn.")
-                    deliver(message)
-                    con.execute("UPDATE operator_notices SET state='delivered', delivered=? "
-                                "WHERE run_id=?", (time.time(), row['id']))
-                    count += 1
+                    # Claim durably before calling a potentially slow transport.
+                    # A crash while sending is ambiguous: leave it for an operator,
+                    # rather than replaying a possibly acknowledged notification.
+                    con.execute("UPDATE operator_notices SET state='sending' "
+                                "WHERE run_id=? AND state='pending'", (row['id'],))
                 con.execute('COMMIT')
+            if not pending:
+                continue
+            try:
+                deliver(message)
+            except Exception:
+                with self._connect() as con:
+                    con.execute("UPDATE operator_notices SET state='pending' "
+                                "WHERE run_id=? AND state='sending'", (row['id'],))
+                raise
+            with self._connect() as con:
+                con.execute("UPDATE operator_notices SET state='delivered', delivered=? "
+                            "WHERE run_id=? AND state='sending'", (time.time(), row['id']))
+            count += 1
         return count
 
-    def enqueue(self, delivery: str, repo: str, pr: int, head: str, seat: str) -> str:
+    def enqueue(self, delivery: str, repo: str, pr: int, head: str, seat: str,
+                *, turn_key: str = '') -> str:
         """Commit identity before any spawn. A repeated delivery cannot change terms."""
         if not all(isinstance(v, str) and v and len(v) <= 256 for v in
-                   (delivery, repo, head, seat)) or type(pr) is not int or pr <= 0:
+                   (delivery, repo, head, seat)) or not isinstance(turn_key, str) or len(turn_key) > 256 or type(pr) is not int or pr <= 0:
             raise ValueError("invalid run identity")
         if seat not in self.capacity:
             raise ValueError("unconfigured seat")
@@ -160,19 +181,20 @@ class Supervisor:
             con.execute("BEGIN IMMEDIATE")
             prior = con.execute("SELECT * FROM runs WHERE delivery=?", (delivery,)).fetchone()
             if prior:
-                if (prior["repo"], prior["pr"], prior["head"], prior["seat"]) != (repo, pr, head, seat):
+                if (prior["repo"], prior["pr"], prior["head"], prior["seat"], prior['turn_key']) != (repo, pr, head, seat, turn_key):
                     raise ValueError("delivery identity collision")
             else:
-                prior = con.execute("SELECT * FROM runs WHERE repo=? AND pr=? AND head=? AND seat=?",
-                                    (repo, pr, head, seat)).fetchone()
+                prior = con.execute("SELECT * FROM runs WHERE repo=? AND pr=? AND head=? AND seat=? AND turn_key=?",
+                                    (repo, pr, head, seat, turn_key)).fetchone()
                 if not prior:
-                    con.execute("INSERT INTO runs(id,delivery,repo,pr,head,seat,state,created,updated) "
-                                "VALUES(?,?,?,?,?,?,?,?,?)",
-                                (uuid.uuid4().hex, delivery, repo, pr, head, seat,
+                    con.execute("INSERT INTO runs(id,delivery,repo,pr,head,seat,turn_key,state,created,updated) "
+                                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                                (uuid.uuid4().hex, delivery, repo, pr, head, seat, turn_key,
                                  "pending" if self.fixture_mode or self.production_config else "blocked", now, now))
             con.execute("COMMIT")
-        # Spawn only after the durable commit; failure leaves a recoverable pending job.
-        if (self.fixture_mode or self.production_config) and not prior:
+        # A redelivery of an unclaimed run must rearm the worker after a
+        # transient generation/read outage; active or completed runs stay deduped.
+        if (self.fixture_mode or self.production_config) and (not prior or prior['state'] == 'pending'):
             self._spawn()
         return SILENT
 
@@ -227,9 +249,11 @@ class Supervisor:
         for row in candidates:
             generation = None
             unavailable = False
+            retry_read = False
+            superseded = False
             if self.production_config and row['seat'] == 'reviewer':
                 from . import config, gh
-                from .review_receipt import generation_for
+                from .review_receipt import ReceiptDenied, generation_for
                 try:
                     loop = config.by_repo(row['repo'])
                     if loop is None:
@@ -238,9 +262,37 @@ class Supervisor:
                         pr = gh.api(loop, f"/repos/{row['repo']}/pulls/{row['pr']}",
                                     login=loop['read_token'])
                         generation = generation_for(pr, loop, row['pr'], row['head'])
-                except Exception:
-                    # No durable claim without a complete trusted generation.
+                except ReceiptDenied:
                     unavailable = True
+                except Exception:
+                    retry_read = True
+            if self.production_config and row['seat'] == 'fixer':
+                from . import config, gh, gate
+                try:
+                    loop = config.by_repo(row['repo'])
+                    if loop is None:
+                        retry_read = True
+                    else:
+                        pr = gh.api(loop, f"/repos/{row['repo']}/pulls/{row['pr']}",
+                                    login=loop['read_token'])
+                        if not isinstance(pr, dict) or not isinstance(pr.get('head'), dict):
+                            retry_read = True
+                        elif pr['head'].get('sha') != row['head'] or pr.get('state') == 'closed':
+                            superseded = True
+                        elif pr.get('state') != 'open' or pr.get('draft') is not False:
+                            retry_read = True
+                        else:
+                            reviews = gh.reviews(loop, row['pr'])
+                            if not isinstance(reviews, list):
+                                retry_read = True
+                            else:
+                                latest = gate.latest_effective_review_at_head(reviews, loop, row['head'])
+                                if latest is None:
+                                    retry_read = True
+                                elif gh.review_state(latest) != 'CHANGES_REQUESTED':
+                                    superseded = True
+                except Exception:
+                    retry_read = True
             with self._connect() as con:
                 con.execute("BEGIN IMMEDIATE")
                 current = con.execute("SELECT * FROM runs WHERE id=?", (row['id'],)).fetchone()
@@ -260,6 +312,14 @@ class Supervisor:
                     con.execute("COMMIT")
                     continue
                 now = time.time()
+                if superseded:
+                    con.execute("UPDATE runs SET state='cancelled', error='fixer verdict superseded',updated=? WHERE id=?",
+                                (now, row['id']))
+                    con.execute('COMMIT')
+                    continue
+                if retry_read:
+                    con.execute('COMMIT')
+                    continue
                 if unavailable:
                     con.execute("UPDATE runs SET state='failed', attempts=attempts+1, "
                                 "error='review generation unavailable',updated=? WHERE id=?",
@@ -436,6 +496,13 @@ class Supervisor:
                 raise ValueError("PR head moved")
             if row['seat'] == 'reviewer' and not row['generation']:
                 raise ValueError('review generation not durably pinned')
+            if row['seat'] == 'fixer':
+                from . import gate
+                reviews = gh.reviews(loop, row['pr'])
+                latest = (gate.latest_effective_review_at_head(reviews, loop, row['head'])
+                          if isinstance(reviews, list) else None)
+                if latest is None or gh.review_state(latest) != 'CHANGES_REQUESTED':
+                    raise ValueError('fixer verdict no longer current')
             scope = broker_ipc.RunScope(row["repo"], row["pr"], row["head"],
                                         row["seat"], head["ref"], row['id'],
                                         str(self.db), row['generation'])

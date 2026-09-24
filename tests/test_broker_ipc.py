@@ -31,7 +31,7 @@ class BrokerIPCTests(unittest.TestCase):
             path.write_text("DUMMY_SECRET_" + login)
             tokens[login] = str(path)
         self.loop = {"repo": REPO, "base": "main", "state_dir": str(self.root),
-                     "fixers": ["fix"],
+                     "fixers": ["fix"], "reviewers": ["review"],
                      "tokens": tokens, "read_token": "read", "reviewer_seat": "review",
                      "seats": {"reviewer": {"login": "review"}, "fixer": {"login": "fix"}}}
         self.pr = {"number": 7, "state": "open", "draft": False, "user": {"login": "fix"}, "head": {"sha": HEAD, "ref": "fix-7",
@@ -45,6 +45,12 @@ class BrokerIPCTests(unittest.TestCase):
         patch = mock.patch.object(gh, "api", side_effect=api)
         patch.start()
         self.addCleanup(patch.stop)
+        self.reviews = [{'id': 41, 'state': 'CHANGES_REQUESTED', 'commit_id': HEAD,
+                         'submitted_at': '2026-01-01T00:00:00Z',
+                         'user': {'login': 'review'}}]
+        review_patch = mock.patch.object(gh, 'reviews', side_effect=lambda *args: self.reviews)
+        review_patch.start()
+        self.addCleanup(review_patch.stop)
 
     def start(self, role="reviewer", head=HEAD, branch="fix-7", repo=REPO, number=7):
         scope = broker_ipc.RunScope(repo, number, head, role, branch)
@@ -105,6 +111,15 @@ class BrokerIPCTests(unittest.TestCase):
         self.assertTrue(self.send(server, {"operation": "request_review", "verdict": "", "body": ""})["ok"])
         self.assertEqual(self.calls[-1], (f"/repos/{REPO}/pulls/7/requested_reviewers", "POST",
                                           {"reviewers": ["review"]}, "fix"))
+
+    def test_new_approval_cancels_fixer_write_at_unchanged_head(self):
+        self.reviews.append({'id': 42, 'state': 'APPROVED', 'commit_id': HEAD,
+                             'submitted_at': '2026-01-01T00:01:00Z',
+                             'user': {'login': 'review'}})
+        server = self.start(role='fixer')
+        result = self.send(server, {'operation': 'request_review', 'verdict': '', 'body': ''})
+        self.assertFalse(result['ok'])
+        self.assertFalse(any(call[1] == 'POST' for call in self.calls))
 
     def test_fixer_write_rechecks_live_author_and_fails_closed(self):
         for author in (None, {}, {"login": "outsider"}, {"login": 7}):

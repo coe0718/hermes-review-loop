@@ -91,6 +91,9 @@ def main() -> None:
     reviews = gate.fetch_reviews(loop, number)
     if gate.reviewed_at_head(reviews, loop, head):
         silence(f"head {head[:7]} already has a reviewer's verdict")
+    dismissed = [int(r['id']) for r in gate.reviews_at_head(reviews, loop, head)
+                 if gh.review_state(r) == 'DISMISSED' and type(r.get('id')) is int and r['id'] > 0]
+    turn_key = f'dismissed:{max(dismissed)}' if dismissed else ''
     if st.inflight(f"review:{number}:{head}"):
         silence(f"a review for head {head[:7]} is already out")
 
@@ -110,7 +113,7 @@ def main() -> None:
     gate.drain_seat(loop, "fixer")
 
     gate.block_pr_agent(
-        loop, st, seat, number, head,
+        loop, st, seat, number, head, turn_key=turn_key,
         on_queued=lambda: observer.notify(
             loop, st, "handoff" if action == "review_requested" else "opened", number, head,
             identity=action, actor=sender if action == "review_requested" else author,

@@ -13,6 +13,7 @@ from unittest.mock import patch
 from review_loop.run_supervisor import MAX_ATTEMPTS, SILENT, Supervisor
 
 
+
 class Lifecycle(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -264,6 +265,71 @@ class ReviewerClaimConcurrency(unittest.TestCase):
             self.assertIsNone(self.sup._claim())
         self.assertEqual(self.sup.get('review')['state'], 'failed')
         self.assertEqual(self.sup.get('review')['generation'], None)
+
+    def test_transient_generation_read_remains_pending_then_claims(self):
+        with patch('review_loop.config.by_repo', return_value=self.loop), \
+             patch('review_loop.gh.api', side_effect=[TimeoutError('temporary'), self.pull()]):
+            self.assertIsNone(self.sup._claim())
+            self.assertEqual(self.sup.get('review')['state'], 'pending')
+            self.assertEqual(self.sup.get('review')['attempts'], 0)
+            self.assertIsNotNone(self.sup._claim())
+        self.assertEqual(self.sup.get('review')['state'], 'claimed')
+
+    def test_same_delivery_rearms_pending_after_transient_read(self):
+        with patch('review_loop.config.by_repo', return_value=self.loop), \
+             patch('review_loop.gh.api', side_effect=TimeoutError('temporary')):
+            self.assertIsNone(self.sup._claim())
+        with patch.object(self.sup, '_spawn') as spawn:
+            self.sup.enqueue('review', 'o/r', 1, 'a' * 40, 'reviewer')
+            spawn.assert_called_once_with()
+
+    def test_dismissed_same_head_uses_new_turn_but_redelivery_deduplicates(self):
+        head = 'a' * 40
+        self.sup.enqueue('first-delivery', 'o/r', 2, head, 'reviewer')
+        with sqlite3.connect(self.db) as con:
+            con.execute("UPDATE runs SET state='succeeded' WHERE delivery='first-delivery'")
+        self.sup.enqueue('dismissed-42', 'o/r', 2, head, 'reviewer', turn_key='dismissed:42')
+        self.sup.enqueue('dismissed-42-replay', 'o/r', 2, head, 'reviewer', turn_key='dismissed:42')
+        with sqlite3.connect(self.db) as con:
+            rows = con.execute('SELECT delivery,turn_key FROM runs WHERE pr=2 ORDER BY created,id').fetchall()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({key for _, key in rows}, {'', 'dismissed:42'})
+
+    def test_new_turn_never_bypasses_active_same_pr_run(self):
+        self.sup.enqueue('first-delivery', 'o/r', 2, 'a' * 40, 'reviewer')
+        with sqlite3.connect(self.db) as con:
+            con.execute("UPDATE runs SET state='running' WHERE delivery='first-delivery'")
+        self.sup.enqueue('dismissed-42', 'o/r', 2, 'a' * 40, 'reviewer', turn_key='dismissed:42')
+        self.assertIsNone(self.sup._claim())
+        self.assertEqual(self.sup.get('dismissed-42')['state'], 'pending')
+
+    def test_legacy_unique_index_migrates_without_losing_existing_run(self):
+        self.sup.enqueue('initial', 'o/r', 4, 'a' * 40, 'reviewer')
+        with sqlite3.connect(self.db) as con:
+            con.execute('DROP INDEX runs_turn')
+            con.execute('CREATE UNIQUE INDEX runs_turn ON runs(repo,pr,head,seat)')
+            con.execute('ALTER TABLE runs DROP COLUMN turn_key')
+        migrated = Supervisor(self.db)
+        migrated.enqueue('dismissed', 'o/r', 4, 'a' * 40, 'reviewer', turn_key='dismissed:42')
+        with sqlite3.connect(self.db) as con:
+            rows = con.execute('SELECT delivery,turn_key FROM runs WHERE pr=4 ORDER BY delivery').fetchall()
+        self.assertEqual(rows, [('dismissed', 'dismissed:42'), ('initial', '')])
+
+    def test_queued_fixer_checks_latest_live_verdict_before_claim(self):
+        self.sup.enqueue('fix', 'o/r', 3, 'a' * 40, 'fixer')
+        with sqlite3.connect(self.db) as con:
+            con.execute("UPDATE runs SET state='pending' WHERE delivery='fix'")
+            con.execute("UPDATE runs SET state='blocked' WHERE delivery='review'")
+        reviews = [{'id': 41, 'state': 'CHANGES_REQUESTED', 'commit_id': 'a' * 40,
+                    'submitted_at': '2026-01-01T00:00:00Z', 'user': {'login': 'review'}},
+                   {'id': 42, 'state': 'APPROVED', 'commit_id': 'a' * 40,
+                    'submitted_at': '2026-01-01T00:01:00Z', 'user': {'login': 'review'}}]
+        loop = {**self.loop, 'reviewers': ['review']}
+        with patch('review_loop.config.by_repo', return_value=loop), \
+             patch('review_loop.gh.api', return_value=self.pull()), \
+             patch('review_loop.gh.reviews', return_value=reviews):
+            self.assertIsNone(self.sup._claim())
+        self.assertEqual(self.sup.get('fix')['state'], 'cancelled')
 
 
 if __name__ == "__main__":

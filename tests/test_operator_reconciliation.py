@@ -6,6 +6,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 
 from review_loop.run_supervisor import Supervisor
@@ -91,6 +92,31 @@ class OperatorReconciliation(unittest.TestCase):
             state = con.execute('SELECT state FROM operator_notices WHERE run_id=?',
                                 (self.row['id'],)).fetchone()[0]
         self.assertEqual(state, 'resolved')
+
+    def test_slow_notice_does_not_hold_sqlite_writer_or_duplicate_delivery(self):
+        with sqlite3.connect(self.db) as con:
+            con.execute("UPDATE runs SET state='failed' WHERE id=?", (self.row['id'],))
+        entered, release = threading.Event(), threading.Event()
+        messages, errors = [], []
+        def deliver(message):
+            messages.append(message)
+            entered.set()
+            if not release.wait(4):
+                errors.append('callback timeout')
+        thread = threading.Thread(target=lambda: self.sup.notify(deliver))
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(2))
+            with sqlite3.connect(self.db, timeout=0.3) as con:
+                con.execute("INSERT INTO runs(id,delivery,repo,pr,head,seat,state,created,updated) "
+                            "VALUES('other','other','o/r',2,'head','reviewer','pending',1,1)")
+            self.assertEqual(self.sup.notify(messages.append), 0)
+        finally:
+            release.set()
+            thread.join(5)
+        self.assertFalse(errors)
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(self.sup.status()[0]['notice'], 'delivered')
 
 
 if __name__ == '__main__':

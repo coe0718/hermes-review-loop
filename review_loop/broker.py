@@ -25,7 +25,7 @@ class BrokerDenied(Exception):
 
 
 def authorize(loop: dict, *, repo: str, number: int, head: str, role: str,
-              branch: str, operation: str) -> str:
+              branch: str, operation: str, require_verdict: bool = True) -> str:
     """Return the seat login only after checking exact live PR identity and credentials.
 
     No caller-supplied path, URL, token, reviewer or destination enters an API request.
@@ -95,6 +95,14 @@ def authorize(loop: dict, *, repo: str, number: int, head: str, role: str,
                 or author.casefold() not in {login.casefold() for login in allowed
                                              if isinstance(login, str) and login}):
             raise BrokerDenied("PR author is not an authorized fixer")
+        if require_verdict:
+            from . import gate
+            reviews = gh.reviews(loop, number)
+            if not isinstance(reviews, list):
+                raise BrokerDenied("cannot verify latest fixer verdict")
+            latest = gate.latest_effective_review_at_head(reviews, loop, head)
+            if latest is None or gh.review_state(latest) != "CHANGES_REQUESTED":
+                raise BrokerDenied("fixer verdict no longer current")
     return login
 
 
