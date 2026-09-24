@@ -406,20 +406,38 @@ def _set_hooks(loop: dict, active: bool, token_login: str | None) -> list[str]:
     return out or ["no loop hooks found — run init --hooks first"]
 
 
-def _hook_moves(before: dict, after: dict) -> list[tuple[int, str, str]]:
-    """Resolve installed hook IDs and old/new URLs before changing any route."""
+def _hook_moves(before: dict, after: dict, binds: dict) -> list[tuple[int, str, str]]:
+    """Preflight exact hook URLs against configured and installed owned route profiles."""
     names = _routes_of(after)
-    expected = {}
+    expected: dict[str, tuple[str, str]] = {}
+    targets: dict[str, str] = {}
+    unchanged: dict[str, str] = {}
     for role in ("reviewer", "fixer"):
         name = names.get(role)
-        if name and name == _routes_of(before).get(role):
-            old = routes.url_for_profile(name, config.seat_profile(before, role), before.get("host"))
-            new = routes.url_for_profile(name, config.seat_profile(after, role), after.get("host"))
-            if old != new:
-                expected[old] = (role, new)
-    if not expected:
+        if not name or name != _routes_of(before).get(role):
+            continue
+        new = routes.url_for_profile(name, config.seat_profile(after, role), after.get("host"))
+        old = routes.url_for_profile(name, config.seat_profile(before, role), before.get("host"))
+        if not old or not new:
+            raise config.ConfigError(f"cannot resolve {role} hook URL; no changes made")
+        if old != new:
+            expected[old] = (role, new)
+        if role in binds:
+            # The registry can drift while loop config and form still agree. Its owned route's
+            # installed profile is another known old URL, not an arbitrary hook destination.
+            installed = routes.url_for_profile(name, binds[role][1], before.get("host"))
+            if not installed:
+                raise config.ConfigError(f"cannot resolve installed {role} hook URL; no changes made")
+            if installed != new:
+                expected[installed] = (role, new)
+            targets[role] = new
+        elif old != new:
+            targets[role] = new
+        else:
+            unchanged[role] = new
+    if not targets:
         return []
-    hooks = _hook_listing(before)
+    hooks = _hook_listing(before)  # Never repair a route if this listing cannot be trusted.
     moves = []
     route_names = {name: role for role, name in names.items() if role in ("reviewer", "fixer")}
     for hook in hooks:
@@ -427,15 +445,17 @@ def _hook_moves(before: dict, after: dict) -> list[tuple[int, str, str]]:
         parts = urlsplit(old)
         # Match a complete webhook route segment, not a substring of another route.
         installed_name = parts.path.rsplit("/webhooks/", 1)[-1] if "/webhooks/" in parts.path else ""
-        if installed_name in route_names and old not in expected:
-            raise config.ConfigError(f"installed {route_names[installed_name]} hook {hook['id']} "
-                                     f"points at unexpected URL {old!r}; no changes made")
-        if old not in expected:
+        role = route_names.get(installed_name)
+        if role is None:
             continue
-        role, new = expected[old]
-        if not isinstance(hook.get("id"), int) or not new:
-            raise config.ConfigError(f"invalid installed {role} hook; no changes made")
-        moves.append((hook["id"], old, new))
+        if role in unchanged and old == unchanged[role]:
+            continue
+        if role in targets and old == targets[role]:
+            continue  # Already corrected independently; do not rewrite it.
+        if role not in targets or old not in expected or expected[old][0] != role:
+            raise config.ConfigError(f"installed {role} hook {hook['id']} "
+                                     f"points at unexpected URL {old!r}; no changes made")
+        moves.append((hook["id"], old, targets[role]))
     return moves
 
 
@@ -820,7 +840,7 @@ def cmd_apply(args) -> int:
     # Preflight remote hooks before any local mutation. Snapshot each owned route and roll back
     # both surfaces on any failure; config is published only after route/hook readback agrees.
     try:
-        hook_moves = _hook_moves(loop, updated)
+        hook_moves = _hook_moves(loop, updated, binds)
     except config.ConfigError as exc:
         print(f"refused: {exc}")
         return 2

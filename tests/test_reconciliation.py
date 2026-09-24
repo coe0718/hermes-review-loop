@@ -175,17 +175,49 @@ def main():
                      deliver='discord')
     old_config = config_path.read_bytes()
     old_fixer = routes.route('reconcile-fix')
+    stale_route = routes.route('reconcile-review')
+    hooks[1] = routes.url_for_profile('reconcile-review', 'vex', t.HOST)
+    stale_hooks = hooks.copy()
     with mock.patch.object(gh, 'api', side_effect=api):
         rc, out = t.run_cli(t.parser_for(stable_form).parse_args(
             ['apply', '--loop', 'reconcile', '--dry-run']))
     assert rc == 0 and 'profile vex → reviewer-profile' in out, (rc, out)
-    assert routes.route('reconcile-review')['profile'] == 'vex'
+    assert routes.route('reconcile-review') == stale_route and hooks == stale_hooks
+
+    # Reviewer probe: unchanged settings must update both the stale route and its GitHub hook.
+    with mock.patch.object(gh, 'api', return_value=None):
+        rc, out = t.run_cli(unchanged_apply)
+    assert rc == 2 and 'hook listing' in out, (rc, out)
+    assert routes.route('reconcile-review') == stale_route and hooks == stale_hooks
+    assert config_path.read_bytes() == old_config
+    print('PASS unchanged settings refuse route repair on untrusted hook listing')
+
+    def fail_repair(loop, path, method='GET', body=None, login=None):
+        if method == 'PATCH' and path.endswith('/hooks/1') and body['config']['url'] != stale_hooks[1]:
+            hooks[1] = body['config']['url']  # Simulate a lost response after GitHub applied it.
+            return None
+        return api(loop, path, method, body, login)
+    with mock.patch.object(gh, 'api', side_effect=fail_repair):
+        rc, out = t.run_cli(unchanged_apply)
+    assert rc == 2 and 'reconciliation FAILED' in out, (rc, out)
+    assert routes.route('reconcile-review') == stale_route and hooks == stale_hooks
+    assert config_path.read_bytes() == old_config
+    print('PASS unchanged settings roll back route and hook after ambiguous hook PATCH')
+
+    hooks[1] = routes.url_for_profile('reconcile-review', 'tuck', t.HOST)
+    with mock.patch.object(gh, 'api', side_effect=api):
+        rc, out = t.run_cli(unchanged_apply)
+    assert rc == 2 and 'unexpected URL' in out, (rc, out)
+    assert routes.route('reconcile-review') == stale_route and config_path.read_bytes() == old_config
+    hooks.update(stale_hooks)
+    print('PASS unchanged settings refuse unknown hook destination')
+
     with mock.patch.object(gh, 'api', side_effect=api):
         rc, out = t.run_cli(unchanged_apply)
     assert rc == 0 and routes.route('reconcile-review')['profile'] == 'reviewer-profile', (rc, out)
-    assert routes.route('reconcile-fix') == old_fixer
+    assert hooks == old_hooks and routes.route('reconcile-fix') == old_fixer
     assert config_path.read_bytes() == old_config
-    print('PASS unchanged settings reconcile only the stale owned route')
+    print('PASS unchanged settings reconcile stale owned route and hook atomically')
 
     # A stale profile is not permission to overwrite a route with another gate's script.
     foreign = routes.route('reconcile-review')
@@ -219,7 +251,7 @@ def main():
     assert not (t.LOOPS_DIR / 'badfix.json').exists()
     assert not routes.route('badfix-review') and not routes.route('badfix-fix')
     print('PASS ineligible configured fixer fails before config and route writes')
-    print('16/16 reconciliation cases pass')
+    print('19/19 reconciliation cases pass')
 
 
 if __name__ == '__main__':
