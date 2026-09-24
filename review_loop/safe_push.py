@@ -46,12 +46,22 @@ def _sha(value: object) -> str:
     return value
 
 
+# Files that act on the repository rather than live in it. A workflow runs with the
+# repository's Actions secrets, so writing one would hand a credentialless fixer those
+# secrets through CI; the others change checkout, review ownership or submodule sources.
+CONTROL_FILES = {".gitmodules", ".gitattributes"}
+CONTROL_PATHS = {"codeowners", "docs/codeowners"}
+
+
 def _path(value: object) -> str:
     if (not isinstance(value, str) or len(value) > 512 or not value
             or any(not SEGMENT.fullmatch(part) or part in (".", "..")
                    or part.lower() == ".git"
                    for part in value.split("/"))):
         raise broker.BrokerDenied("unsafe file path")
+    parts = value.lower().split("/")
+    if parts[0] == ".github" or CONTROL_FILES.intersection(parts) or value.lower() in CONTROL_PATHS:
+        raise broker.BrokerDenied("repository control file")
     return value
 
 
@@ -195,8 +205,10 @@ def _git_cas(loop: dict, repo: str, branch: str, head: str,
                 raise broker.BrokerDenied("manifest replaces nonregular file")
             blob = _sha(run("--git-dir", str(bare), "hash-object", "-w", "--stdin",
                             input=data).decode())
+            # Keep an edited script executable; a new file is a plain file.
+            mode = existing.get(path, "100644")
             run("--git-dir", str(bare), "update-index", "--add", "--cacheinfo",
-                f"100644,{blob},{path}")
+                f"{mode},{blob},{path}")
         tree = _sha(run("--git-dir", str(bare), "write-tree").decode())
         base_tree = _sha(run("--git-dir", str(bare), "rev-parse", f"{head}^{{tree}}").decode())
         if tree == base_tree:

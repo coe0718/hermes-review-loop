@@ -260,8 +260,11 @@ class SafePushTests(unittest.TestCase):
             with self.assertRaises(broker.BrokerDenied):
                 self.push(case)
         self.assertEqual(self.fake.calls, [])
-        self.assertEqual(safe_push._manifest(manifest(".github/workflows/test.yml"))[1][0][0],
-                         ".github/workflows/test.yml")
+        for name in (".github/workflows/test.yml", ".GitHub/CODEOWNERS", ".gitmodules",
+                     "vendor/.gitattributes", "CODEOWNERS", "docs/CODEOWNERS"):
+            with self.subTest(name=name), self.assertRaises(broker.BrokerDenied):
+                safe_push._manifest(manifest(name))
+        self.assertEqual(safe_push._manifest(manifest("src/codeowners.py"))[1][0][0], "src/codeowners.py")
         self.assertEqual(safe_push._manifest(manifest("docs/release..notes.lock"))[1][0][0], "docs/release..notes.lock")
 
     def test_prewrite_failure_and_lost_response_reconcile(self):
@@ -333,7 +336,8 @@ class RealBareCAS(unittest.TestCase):
             git("init", "--bare", local)
             base_blob = git("--git-dir", local, "hash-object", "-w", "--stdin", input="base")
             link_blob = git("--git-dir", local, "hash-object", "-w", "--stdin", input="file")
-            tree = git("--git-dir", local, "mktree", input=f"100644 blob {base_blob}\tfile\n120000 blob {link_blob}\tlink\n")
+            tree = git("--git-dir", local, "mktree", input=f"100644 blob {base_blob}\tfile\n120000 blob {link_blob}\tlink\n"
+                                                            f"100755 blob {base_blob}\trun.sh\n")
             env = {**os.environ, "GIT_AUTHOR_NAME": "Fixture", "GIT_AUTHOR_EMAIL": "fixture@example.org",
                    "GIT_COMMITTER_NAME": "Fixture", "GIT_COMMITTER_EMAIL": "fixture@example.org"}
             base = git("--git-dir", local, "commit-tree", tree, input="base\n", env=env)
@@ -353,13 +357,16 @@ class RealBareCAS(unittest.TestCase):
                     with self.subTest(path=path), self.assertRaises(broker.BrokerDenied):
                         cas(base, [(path, b"evil")])
                 journal = []
-                new = cas(base, [("file", b"updated"), ("src/added.py", b"new")],
+                new = cas(base, [("file", b"updated"), ("src/added.py", b"new"), ("run.sh", b"#!/bin/sh\n")],
                           before_push=lambda sha: journal.append(sha))
                 self.assertEqual(journal, [new])
                 self.assertEqual(git("--git-dir", remote, "rev-parse", "refs/heads/fix-7"), new)
                 self.assertEqual(git("--git-dir", remote, "rev-list", "--parents", "-n", "1", new), f"{new} {base}")
                 self.assertEqual(git("--git-dir", remote, "show", f"{new}:file"), "updated")
                 self.assertEqual(git("--git-dir", remote, "show", f"{new}:src/added.py"), "new")
+                modes = {line.split("\t")[1]: line.split(" ")[0] for line in
+                         git("--git-dir", remote, "ls-tree", new).splitlines()}
+                self.assertEqual((modes["run.sh"], modes["file"]), ("100755", "100644"))
                 self.assertEqual(git("--git-dir", remote, "show", "-s", "--format=%an <%ae>|%cn <%ce>", new),
                                  "fix <3+fix@users.noreply.github.com>|fix <3+fix@users.noreply.github.com>")
                 # Concurrent advance after advertised fetch is rejected by the exact lease.
