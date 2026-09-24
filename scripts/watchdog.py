@@ -36,7 +36,7 @@ import time
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from review_loop import config, gate, gh, routes, state as state_mod  # noqa: E402
-from review_loop.util import age_min, log, now_iso  # noqa: E402
+from review_loop.util import age_min, epoch, log, now_iso  # noqa: E402
 
 TEST = bool(os.environ.get("REVIEW_LOOP_TEST"))
 
@@ -171,27 +171,54 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
     if not TEST and not hooks_armed(loop):
         return lines                              # parked on purpose: say nothing, ever
 
-    if not watch.get("armed_since"):
-        # First sighting of a live loop: stamp the moment. Heads older than this predate the
-        # loop being armed, so they are history, not stalls.
-        watch["armed_since"] = now
-        st.watch_save(watch)
-        st.note("loop observed armed — baseline set; older heads excluded")
-        drain_queued(loop, st, lines)
-        return lines
-
-    armed_since = 0.0 if TEST else watch["armed_since"]
-    grace = 0.0 if TEST else loop["grace_min"]
-    marker_grace = 0.0 if TEST else loop["marker_grace_min"]
-    cooldown = 0.0 if TEST else loop["cooldown_h"] * 3600
-    breach = st.breach_all()
-
     prs = gh.open_prs(loop)
     if not isinstance(prs, list):
         lines.append(f"⚠️ {loop['id']}: could not list open PRs — stall scan skipped this run")
         drain_queued(loop, st, lines)  # individual PR reads may still work
         return lines
 
+    # A commit's authored/committed date says nothing about when its SHA reached a PR.
+    # Snapshot the heads on the first *successful* armed sweep, before any stall evaluation.
+    # Those heads are history; later SHA changes get their own durable observation clock.
+    first_sweep = not watch.get("armed_since")
+    if first_sweep:
+        watch["armed_since"] = now
+    heads = watch.get("heads")
+    if not isinstance(heads, dict):
+        heads = {}
+    current_heads: dict[str, dict] = {}
+    for pr in prs:
+        if not isinstance(pr, dict):
+            continue
+        author = ((pr.get("user") or {}).get("login") or "").lower()
+        if author not in set(loop["fixers"]) or pr.get("draft"):
+            continue
+        if (pr.get("base") or {}).get("ref") != loop["base"]:
+            continue
+        number = pr.get("number")
+        head = (pr.get("head") or {}).get("sha") or ""
+        if not number or not head:
+            continue
+        key = str(number)
+        previous = heads.get(key) if isinstance(heads.get(key), dict) else {}
+        if previous.get("sha") == head:
+            current_heads[key] = previous
+        else:
+            # A first-seen old PR could be preexisting; created_at only establishes
+            # eligibility for genuinely new PRs, never the time of a later push.
+            new_pr = epoch(pr.get("created_at")) >= int(watch["armed_since"])
+            current_heads[key] = {"sha": head, "observed_at":
+                                  now if previous or (not first_sweep and new_pr) else None}
+    watch["heads"] = current_heads
+    st.watch_save(watch)                 # persist observations even if review reads fail
+    if first_sweep:
+        st.note("loop observed armed — head snapshot set; existing heads excluded")
+        return lines
+
+    grace = 0.0 if TEST else loop["grace_min"]
+    marker_grace = 0.0 if TEST else loop["marker_grace_min"]
+    cooldown = 0.0 if TEST else loop["cooldown_h"] * 3600
+    breach = st.breach_all()
     alerts: list[tuple[int, str, str]] = []
     seen: dict[str, float] = {}
 
@@ -218,8 +245,8 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
         at_head = gate.changes_at_head(reviews, loop, head)
         changes = gate.verdicts(reviews, loop)
         marker = breach.get(f"{loop['repo']}#{number}") or {}
-        pushed_epoch = gh.commit_epoch(loop, head)
-        head_postdates_arming = TEST or pushed_epoch > armed_since
+        observed_at = current_heads[str(number)]["observed_at"]
+        head_postdates_arming = TEST or observed_at is not None
         kind = ""
 
         if marker.get("head") == head and age_min(marker.get("at")) > marker_grace:
@@ -234,9 +261,9 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
                 kind = (f"fixer never pushed — changes requested {mins / 60:.1f}h ago at head "
                         f"{head[:7]} by {gate.reviewer_login(at_head[-1])}")
         else:
-            mins = (time.time() - pushed_epoch) / 60 if pushed_epoch else 0.0
-            if mins > grace and head_postdates_arming:
-                kind = (f"reviewer never posted a verdict — head {head[:7]} pushed "
+            mins = (now - observed_at) / 60 if observed_at is not None else 0.0
+            if (TEST or mins > grace) and head_postdates_arming:
+                kind = (f"reviewer never posted a verdict — head {head[:7]} observed "
                         f"{mins / 60:.1f}h ago, 0 verdicts at this head")
 
         if kind:

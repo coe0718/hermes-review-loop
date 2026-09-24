@@ -140,8 +140,15 @@ one message, not a re-read of the whole thread.
 
 ## The watchdog's four shapes
 
-Read from GitHub every 15 minutes, against the heads that postdate the moment the loop was first
-seen armed (`armed_since`, which is what keeps a loop's history out of its alerts):
+Read from GitHub every 15 minutes. The first successful armed sweep snapshots existing PR heads
+as history. Each subsequent SHA change gets a durable first-observed timestamp in `watchdog.json`;
+the reviewer grace starts then, not at the commit's authored/committed date. A first-seen PR created
+since arming also gets a clock; an old PR first seen later is conservatively baseline-only until its
+head changes. Existing `watchdog.json` files without `heads` establish this conservative snapshot on
+their next successful sweep. Unreadable PR listings do not advance the snapshot, and unreadable
+review lists do not produce verdict-dependent alerts. An old PR whose head changed before the
+first successful observation cannot be distinguished from an unchanged old PR without an event
+record, so it remains baseline-only until the next observed SHA change. The four shapes are:
 
 1. reviewer never posted a verdict for a quiet head;
 2. fixer never pushed after a verdict;

@@ -47,7 +47,7 @@ Every one of those is a *silent* failure, so this plugin makes each one loud or 
 |---|---|
 | push without a request | the gate only wakes the reviewer on an explicit request (and the fixer's prompt spells out the `gh api` call) |
 | fixer never pushes | the watchdog reports "changes requested N hours ago at head X, fixer never pushed" |
-| reviewer never posts | "head pushed N hours ago, 0 verdicts at this head" |
+| reviewer never posts | "head first observed N hours ago, 0 verdicts at this head" |
 | verdict ping-pong forever | the cap is counted in **verdicts**; hitting it hands the PR to an adjudicator instead of buying round four |
 | two runs, one clone | a seat is a capacity with a per-PR ledger; `concurrency: 2+` gives each PR its own clone, build dir and tmp dir, and an unisolatable run is queued rather than shared |
 | a run dies mid-way | the lock expires; a stalled head frees itself |
