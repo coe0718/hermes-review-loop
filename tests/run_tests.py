@@ -3425,6 +3425,32 @@ def group_cleanup() -> None:
     check("branch worktree at artifacts base survives", base_sentinel.read_text() if base_sentinel.exists() else None,
           "preserve base\n")
 
+    # The loop's own isolation workspace is a full clone (artifacts/<N>/<seat>/repo). Its .git
+    # is ours: refusing it as a "nested checkout" would leave every isolated PR on disk forever.
+    reset(prs={"7": pr(7, state="closed")})
+    base = STATE_DIR / "artifacts" / "7"
+    iso = base / "reviewer" / "repo"
+    iso.parent.mkdir(parents=True)
+    subprocess.run(["git", "clone", "-q", "--local", str(CLONE), str(iso)], check=True,
+                   capture_output=True)
+    (base / "reviewer" / "target").mkdir()
+    (base / "reviewer" / "target" / "build.log").write_text("z" * 1024 + "\n")
+    run("cleanup.py", None, "--loop", "widgets", "--pr", "7")
+    check("isolated per-PR workspace is removed", base.exists(), False)
+    check("  the loop clone is untouched", (CLONE / "README.md").exists(), True)
+
+    # ...but only the real directory: an artifacts path reached through a symlink is not ours.
+    reset(prs={"7": pr(7, state="closed")})
+    elsewhere = TMP / "elsewhere-artifacts"
+    shutil.rmtree(elsewhere, ignore_errors=True)
+    subprocess.run(["git", "clone", "-q", "--local", str(CLONE), str(elsewhere / "reviewer" / "repo")],
+                   check=True, capture_output=True)
+    (STATE_DIR / "artifacts").mkdir(parents=True)
+    (STATE_DIR / "artifacts" / "7").symlink_to(elsewhere, target_is_directory=True)
+    run("cleanup.py", None, "--loop", "widgets", "--pr", "7")
+    check("symlinked artifacts dir is not followed",
+          (elsewhere / "reviewer" / "repo" / "README.md").exists(), True)
+
     # Configured roots are discovery boundaries, not permission to remove another repo.
     reset(prs={"7": pr(7, state="closed")})
     other = REVIEWS / "pr7-other-repo"

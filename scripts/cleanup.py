@@ -137,8 +137,15 @@ def contains_nested_git(path: pathlib.Path, registered_worktree: bool = False) -
 
 
 def owned_candidate(path: pathlib.Path, roots: list[pathlib.Path],
-                    clone: pathlib.Path | None, registered: set[pathlib.Path]) -> bool:
-    """Only root-contained artifacts or registered detached checkouts may be removed."""
+                    clone: pathlib.Path | None, registered: set[pathlib.Path],
+                    loop_artifacts: pathlib.Path | None = None) -> bool:
+    """Only root-contained artifacts or registered detached checkouts may be removed.
+
+    ``loop_artifacts`` is this PR's ``artifacts/<N>`` directory under the loop's own state dir,
+    resolved. The loop created it (isolation clones live at ``artifacts/<N>/<seat>/repo``), so
+    the nested ``.git`` inside it is ours and does not disqualify it the way a nested checkout
+    in a shared root does.
+    """
     if has_symlink_component(path):
         return False
     candidate = path.resolve()
@@ -151,6 +158,8 @@ def owned_candidate(path: pathlib.Path, roots: list[pathlib.Path],
     # repository's contents belong to this loop (including inherited owners).
     if owner and (owner != candidate or candidate not in registered):
         return False
+    if loop_artifacts is not None and candidate == loop_artifacts:
+        return True
     # A PR-named build directory may enclose an unrelated checkout. Do not recurse
     # through a Git registration we cannot prove belongs to this clone.
     if contains_nested_git(path, candidate in registered):
@@ -339,6 +348,11 @@ def clean_pr(loop: dict, number: int, dry: bool, quiet: bool, force: bool = Fals
     base = config.artifacts_dir(loop, number)
     if base.exists() and base not in cands:
         cands.append(base)
+    # The loop's own per-PR artifacts dir, only when it is a real directory under the loop's
+    # real state dir: a symlinked state dir or artifacts path gets the ordinary checks.
+    state_dir = config._path(loop["state_dir"])
+    loop_artifacts = (base.resolve() if base.is_dir() and not has_symlink_component(base)
+                      and inside(base.resolve(), state_dir.resolve()) else None)
 
     for cand in cands:
         # Pin the directory identity BEFORE ownership checks; a real-directory
@@ -348,7 +362,8 @@ def clean_pr(loop: dict, number: int, dry: bool, quiet: bool, force: bool = Fals
         except OSError as exc:
             log(f"    SKIP (changed candidate): {cand}: {exc}", quiet)
             continue
-        if not owned_candidate(cand, roots, clone.resolve() if clone else None, registered):
+        if not owned_candidate(cand, roots, clone.resolve() if clone else None, registered,
+                               loop_artifacts):
             log(f"    SKIP (outside owned cleanup scope): {cand}", quiet)
             continue
         # Every source (worktree list, configured roots, artifacts base) shares this
