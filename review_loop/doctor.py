@@ -464,7 +464,10 @@ def check_cron_job(loop: dict) -> Check:
         return Check("cron:job", ABSENT, f"no job named {wanted!r} in {path}",
                      cron_fix(loop))
     job_id = str(job.get("id") or "?")
-    if not job.get("enabled", True) or job.get("state") in ("paused", "completed"):
+    # Match the scheduler's runnable predicate: a stored pause timestamp blocks firing even
+    # when enabled=True and the display state has already been normalized to "scheduled".
+    if (not job.get("enabled", True) or job.get("state") in ("paused", "completed")
+            or bool(job.get("paused_at"))):
         state = job.get("state")
         reason = ("completed" if state == "completed" else "paused or disabled")
         fix = (cron_fix(loop) if state == "completed" else

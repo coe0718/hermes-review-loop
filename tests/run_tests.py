@@ -2890,6 +2890,19 @@ def group_doctor() -> None:
     check("a bare-list job store is still read", rc, 0)
     check("  and the job counts as verified", "✅ cron:job" in out, True)
 
+    # The scheduler's runnable predicate rejects pause markers even if enabled stays true.
+    for marker in ({"paused_at": "2026-09-24T10:00:00+00:00"}, {"state": "paused"}):
+        install_doctor_fixture()
+        cron_file = TMP / "hermes-home" / "cron" / "jobs.json"
+        jobs = json.loads(cron_file.read_text())
+        jobs["jobs"][0].update(marker)
+        cron_file.write_text(json.dumps(jobs))
+        rc, out = run_doctor("--loop", "widgets")
+        check(f"enabled watchdog with {marker!r} cannot fire", rc, 1)
+        check("  reports pause marker rather than a verified wake",
+              "❌ cron:job" in out and "✅ cron:job" not in out
+              and "hermes cron resume watchdog-job" in out, True)
+
     install_doctor_fixture()
     cron_file.write_text(json.dumps({"jobs": [{"id": "watchdog-job",
                                                "name": cli.watchdog_job_name({"id": "widgets"}),
