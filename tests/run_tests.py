@@ -2604,9 +2604,11 @@ def install_doctor_fixture() -> dict:
         "schedule_display": "every 15m", "next_run_at": PAST, "deliver": "local"}]}))
     DATA["world"]["hooks"] = [
         {"id": 41, "active": True, "events": ["pull_request"],
-         "config": {"url": f"{HOST}/p/reviewer-profile/webhooks/widgets-review"}},
+         "config": {"url": f"{HOST}/p/reviewer-profile/webhooks/widgets-review",
+                    "content_type": "json"}},
         {"id": 42, "active": True, "events": ["pull_request_review"],
-         "config": {"url": f"{HOST}/p/fixer-profile/webhooks/widgets-fix"}},
+         "config": {"url": f"{HOST}/p/fixer-profile/webhooks/widgets-fix",
+                    "content_type": "json"}},
     ]
     save_world()
     return config.load_id("widgets")
@@ -2648,12 +2650,12 @@ def group_doctor() -> None:
     before_posts = len(RECEIVED)
     rc, out = run_doctor("--loop", "widgets")
     check("a correct install passes", rc, 0)
-    check("  every check verified", "widgets: 20 verified, 0 failed, 0 unknown (of 20 checks)" in out,
+    check("  every check verified", "widgets: 21 verified, 0 failed, 0 unknown (of 21 checks)" in out,
           True)
     check("  nothing is marked failed", "❌" in out, False)
     check("  the header says it is read-only",
           "read-only: it writes nothing and fires nothing" in out, True)
-    for name in ("config", "profile:reviewer", "profile:fixer", "credential:reviewer",
+    for name in ("config", "profile:reviewer", "profile:fixer", "profile:adjudicator", "credential:reviewer",
                  "credential:fixer", "token:rev-coach", "token:dev-fixer", "read_token",
                  "route:widgets-review", "route:widgets-fix", "route:widgets-breach", "scripts",
                  "cron:shim", "cron:job", "clone", "state_dir", "roots", "gateway",
@@ -2742,6 +2744,17 @@ def group_doctor() -> None:
     check("an adjudicator route waking a seat fails", rc, 1)
     check("  and names adjudicator.profile", "❌ route:widgets-breach" in out
           and "adjudicator.profile" in out, True)
+
+    install_doctor_fixture()
+    cfg = load_loop()
+    cfg["adjudicator"]["profile"] = "missing-judge"
+    save_loop(cfg)
+    edit_subs(lambda subs: subs["widgets-breach"].update(profile="missing-judge"))
+    rc, out = run_doctor("--loop", "widgets")
+    check("a correctly routed adjudicator without a profile home fails", rc, 1)
+    check("  adjudicator profile is absent, never verified", "❌ profile:adjudicator" in out
+          and "✅ route:widgets-breach" in out, True)
+    check("  remediation names the missing profile", "hermes profile create missing-judge" in out, True)
 
     install_doctor_fixture()
     SUBS.unlink()
@@ -2872,7 +2885,7 @@ def group_doctor() -> None:
                                       "script": cli.SHIM_NAME, "enabled": True,
                                       "state": "scheduled", "no_agent": True,
                                       "schedule": {"kind": "interval", "minutes": 15},
-                                      "schedule_display": "every 15m"}]))
+                                      "schedule_display": "every 15m", "next_run_at": PAST}]))
     rc, out = run_doctor("--loop", "widgets")
     check("a bare-list job store is still read", rc, 0)
     check("  and the job counts as verified", "✅ cron:job" in out, True)
@@ -2886,6 +2899,17 @@ def group_doctor() -> None:
     check("a paused watchdog job fails", rc, 1)
     check("  with the command to resume it", "❌ cron:job" in out
           and "hermes cron resume watchdog-job" in out, True)
+
+    for next_run in (None, "", "not-a-date"):
+        install_doctor_fixture()
+        cron_file = TMP / "hermes-home" / "cron" / "jobs.json"
+        jobs = json.loads(cron_file.read_text())
+        jobs["jobs"][0]["next_run_at"] = next_run
+        cron_file.write_text(json.dumps(jobs))
+        rc, out = run_doctor("--loop", "widgets")
+        check(f"enabled watchdog with next_run_at={next_run!r} fails", rc, 1)
+        check("  cannot claim the watchdog will fire", "❌ cron:job" in out
+              and "next_run_at" in out, True)
 
     install_doctor_fixture()
     cron_file.write_text(json.dumps({"jobs": []}))
@@ -3015,6 +3039,20 @@ def group_doctor() -> None:
     rc, out = run_doctor("--loop", "widgets")
     check("a hook that never delivers this event fails", rc, 1)
     check("  and names the event", "❌ hook:widgets-review" in out and "pull_request" in out, True)
+
+    for content_type in ("form", None):
+        install_doctor_fixture()
+        config = DATA["world"]["hooks"][0]["config"]
+        if content_type is None:
+            config.pop("content_type")
+        else:
+            config["content_type"] = content_type
+        save_world()
+        rc, out = run_doctor("--loop", "widgets")
+        check(f"{content_type!r} hook content type fails", rc, 1)
+        check("  reviewer hook is not verified", "❌ hook:widgets-review" in out
+              and "✅ hook:widgets-fix" in out, True)
+        check("  JSON requirement is explicit", "content_type" in out and "json" in out, True)
 
     section("doctor — adversarial preflight")
     install_doctor_fixture()

@@ -42,6 +42,7 @@ import os
 import pathlib
 import re
 import socket
+from datetime import datetime
 from urllib.parse import urlsplit
 
 from . import config, gh, routes
@@ -171,8 +172,7 @@ def check_config(loop: dict) -> Check:
                  f"{path} (repo {loop['repo']}, cap {loop['cap']}, base {loop['base']})")
 
 
-def check_profile(loop: dict, seat: str) -> Check:
-    name = str(loop["seats"][seat].get("profile") or "")
+def _check_profile(name: str, seat: str) -> Check:
     if not name:
         return Check(f"profile:{seat}", ABSENT, "no profile named for this seat",
                      f"re-run init with --{seat}-profile <an existing profile>")
@@ -182,6 +182,13 @@ def check_profile(loop: dict, seat: str) -> Check:
     return Check(f"profile:{seat}", ABSENT, f"no profile home at {path}",
                  f"`hermes profile create {name}`, or re-run init with --{seat}-profile pointing "
                  f"at a profile that exists: the run happens as this profile")
+
+def check_profile(loop: dict, seat: str) -> Check:
+    return _check_profile(str(loop["seats"][seat].get("profile") or ""), seat)
+
+def check_adjudicator_profile(loop: dict) -> Check:
+    return _check_profile(str((loop.get("adjudicator") or {}).get("profile") or "default"),
+                          "adjudicator")
 
 
 def check_credential(loop: dict, seat: str) -> Check:
@@ -484,12 +491,20 @@ def check_cron_job(loop: dict) -> Check:
         return Check("cron:job", MISMATCH,
                      f"{job_id} has no valid stored schedule (display text does not schedule work)",
                      cron_fix(loop))
+    next_run = job.get("next_run_at")
+    try:
+        if not isinstance(next_run, str) or not next_run.strip():
+            raise ValueError("missing next run")
+        datetime.fromisoformat(next_run.replace("Z", "+00:00"))
+    except ValueError:
+        return Check("cron:job", MISMATCH,
+                     f"{job_id} has no valid next_run_at — the scheduler will never select it",
+                     cron_fix(loop))
     schedule = (job.get("schedule_display")
                 or ((job.get("schedule") or {}).get("display") if isinstance(job.get("schedule"), dict)
                     else "")
                 or "?")
-    return Check("cron:job", VERIFIED,
-                 f"{job_id} {schedule}, next {job.get('next_run_at') or '?'}")
+    return Check("cron:job", VERIFIED, f"{job_id} {schedule}, next {next_run}")
 
 
 def check_clone(loop: dict) -> Check:
@@ -670,6 +685,12 @@ def check_hook(loop: dict, hooks: list, seat: str, name: str, url: str) -> Check
         return Check(f"hook:{name}", MISMATCH, f"hook {hook_id} is paused",
                      f"`hermes review-loop arm --loop {loop['id']}` (or activate hook {hook_id} "
                      f"in the repo's settings)")
+    content_type = match["config"].get("content_type")
+    if content_type != "json":
+        return Check(f"hook:{name}", MISMATCH,
+                     f"hook {hook_id} has content_type {content_type!r}, expected 'json'",
+                     f"re-run init --hooks, or set hook {hook_id}'s content_type to json: "
+                     "the gate reads a JSON payload, not form-encoded data")
     return Check(f"hook:{name}", VERIFIED,
                  f"hook {hook_id} → [webhook URL redacted] ({event}, active)")
 
@@ -691,6 +712,8 @@ def check_loop(loop: dict, offline: bool = False) -> list[Check]:
     for seat in ("reviewer", "fixer"):
         checks.append(check_profile(loop, seat))
         checks.append(check_credential(loop, seat))
+    if str((loop.get("adjudicator") or {}).get("route") or ""):
+        checks.append(check_adjudicator_profile(loop))
     checks.extend(check_tokens(loop))
     checks.append(check_read_token(loop))
     checks.extend(check_routes(loop))
