@@ -52,8 +52,10 @@ def main() -> None:
         silence("PR author or head no longer matches breach")
     reviews = gate.fetch_reviews(loop, number)
     # An approval can arrive after the cap breach was parked but before its wake.
-    # The latest head is settled; do not claim the marker or start adjudication.
-    if gate.approved_at_head(reviews, loop, head):
+    # Only the latest effective same-head verdict settles it; an older approval
+    # cannot veto a later changes-requested verdict at the cap.
+    latest = gate.latest_effective_review_at_head(reviews, loop, head)
+    if latest is not None and gh.review_state(latest) == "APPROVED":
         silence("PR head was approved after the breach")
     if len(gate.verdicts(reviews, loop)) < loop["cap"]:
         silence("review cap is no longer spent")

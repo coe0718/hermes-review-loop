@@ -48,7 +48,8 @@ class PostCapApprovalTest(unittest.TestCase):
                         "repository": {"full_name": "acme/widgets"},
                         "_loop": {"role": "adjudicator", "pr": 7, "head": HEAD}}
 
-    def run_gate(self, approval_head, status="awaiting-adjudication"):
+    def run_gate(self, approval_head, status="awaiting-adjudication", later_verdict=None,
+                 earlier_verdict=None):
         marker = {"pr": 7, "head": HEAD, "rounds": 3, "reason": "cap", "status": status}
         if status == "delivery-pending":
             marker.update(delivery_token="in-flight", delivery_at=0)
@@ -57,7 +58,15 @@ class PostCapApprovalTest(unittest.TestCase):
                     "commit_id": OLD_HEAD} for i in range(3)]
         if approval_head:
             reviews.append({"id": 4, "state": "APPROVED", "user": {"login": "reviewer"},
-                            "commit_id": approval_head})
+                            "commit_id": approval_head, "submitted_at": "2026-01-01T00:00:00Z"})
+        if earlier_verdict:
+            reviews.append({"id": 4, "state": earlier_verdict,
+                            "user": {"login": "reviewer"}, "commit_id": HEAD,
+                            "submitted_at": "2026-01-01T00:00:00Z"})
+        if later_verdict:
+            reviews.append({"id": 5, "state": later_verdict,
+                            "user": {"login": "reviewer"}, "commit_id": HEAD,
+                            "submitted_at": "2026-01-02T00:00:00Z"})
         self.reviews.write_text(json.dumps(reviews))
         result = subprocess.run([sys.executable, str(ROOT / "scripts/gate_adjudicator.py")],
                                 input=json.dumps(self.payload), text=True, capture_output=True,
@@ -87,6 +96,19 @@ class PostCapApprovalTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["_loop"]["head"], HEAD)
         self.assertEqual(self.st.breach_get(7)["status"], "adjudicating")
+
+    def test_older_approval_then_newer_changes_at_cap_claims_breach(self):
+        result = self.run_gate(HEAD, later_verdict="CHANGES_REQUESTED")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["_loop"]["head"], HEAD)
+        self.assertEqual(self.st.breach_get(7)["status"], "adjudicating")
+
+    def test_latest_approval_suppresses_earlier_changes_at_cap(self):
+        result = self.run_gate(None, earlier_verdict="CHANGES_REQUESTED",
+                               later_verdict="APPROVED")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(result.stdout.strip().startswith("{"), result.stdout)
+        self.assertEqual(self.st.breach_get(7)["status"], "awaiting-adjudication")
 
 
 if __name__ == "__main__":
