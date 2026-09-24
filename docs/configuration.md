@@ -88,7 +88,7 @@ erase one when you run `apply`. A public GitHub webhook should use HTTPS.
 | `pending.json` | `{seat: {"repo#PR": {at, head, url, reason}}}` — queued, not run |
 | `inflight.json` | `{"review:PR:sha" / "fix:PR:sha": ts}` — this head is already being handled |
 | `breach.json` | `{"repo#PR": {head, rounds, cap, reason, at, status}}` — awaiting adjudication |
-| `watchdog.json` | `armed_since`, `{heads: {PR: {sha, observed_at}}}` (null clock for baseline heads), alert history, last run |
+| `watchdog.json` | `armed_since`, `{heads: {PR: {sha, observed_at, last_seen_at}}}` (null observation for baseline/invalid clocks; absent PR clocks retained 30 days since last seen), alert history, last run |
 | `watchdog.log` | one line per sweep, and per breach |
 | `artifacts/<PR>/<seat>/` | where a run must keep its worktrees, build dirs and logs — per PR *and* per seat, so the two never share a checkout |
 

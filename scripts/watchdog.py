@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import pathlib
 import sys
@@ -39,6 +40,15 @@ from review_loop import config, gate, gh, routes, state as state_mod  # noqa: E4
 from review_loop.util import age_min, epoch, log, now_iso  # noqa: E402
 
 TEST = bool(os.environ.get("REVIEW_LOOP_TEST"))
+HEAD_RETENTION_SEC = 30 * 86400  # retain absent PRs long enough for transient listing/state changes
+
+
+def valid_clock(value: object, now: float) -> float | None:
+    """Treat corrupt or future persisted clocks as unknown, never as a grace deadline."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    clock = float(value)
+    return clock if math.isfinite(clock) and 0 < clock <= now else None
 
 
 # -- is the loop actually live? -------------------------------------------------
@@ -81,6 +91,7 @@ def drain(loop: dict, st: state_mod.LoopState, seat: str, quiet: bool = False) -
         if key in live:
             # A free *other* slot is not permission to wake this PR twice.
             continue
+        entry = items[key]
         try:
             number = int(str(key).split("#")[-1])
         except Exception:
@@ -103,6 +114,15 @@ def drain(loop: dict, st: state_mod.LoopState, seat: str, quiet: bool = False) -
             log(f"drain: PR #{number} is {pr.get('state')} — dropped from queue")
             continue
         head = (pr.get("head") or {}).get("sha") or ""
+        if not head:
+            log(f"drain: PR #{number} head unreadable — left queued")
+            continue
+        if entry.get("head") != head:
+            # A queued event is authorization for exactly its observed head. Drop it;
+            # a new webhook for the new SHA must be evaluated through the normal gate.
+            st.queue_pop(seat, key)
+            log(f"drain: PR #{number} moved since queued — stale head dropped")
+            continue
         base = (pr.get("base") or {}).get("ref") or ""
         author = ((pr.get("user") or {}).get("login") or "").lower()
         if pr.get("draft") or base != loop["base"] or author not in set(loop["fixers"]):
@@ -173,8 +193,9 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
 
     prs = gh.open_prs(loop)
     if not isinstance(prs, list):
-        lines.append(f"⚠️ {loop['id']}: could not list open PRs — stall scan skipped this run")
-        drain_queued(loop, st, lines)  # individual PR reads may still work
+        # Without a complete listing, even individually readable PRs cannot establish
+        # that the sweep's scheduling view is current. Explicit --drain still rechecks.
+        lines.append(f"⚠️ {loop['id']}: could not list open PRs — stall scan and queue drain skipped this run")
         return lines
 
     # A commit's authored/committed date says nothing about when its SHA reached a PR.
@@ -187,6 +208,16 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
     if not isinstance(heads, dict):
         heads = {}
     current_heads: dict[str, dict] = {}
+    for key, previous in heads.items():
+        if not isinstance(previous, dict) or not previous.get("sha"):
+            continue
+        # Older state has no last_seen_at. Give it one bounded retention window
+        # instead of erasing a live observation during the schema transition.
+        last_seen = valid_clock(previous.get("last_seen_at"), now) or now
+        if now - last_seen < HEAD_RETENTION_SEC:
+            current_heads[key] = {"sha": previous["sha"],
+                                  "observed_at": valid_clock(previous.get("observed_at"), now),
+                                  "last_seen_at": last_seen}
     for pr in prs:
         if not isinstance(pr, dict):
             continue
@@ -200,19 +231,21 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
         if not number or not head:
             continue
         key = str(number)
-        previous = heads.get(key) if isinstance(heads.get(key), dict) else {}
+        previous = current_heads.get(key, {})
         if previous.get("sha") == head:
-            current_heads[key] = previous
+            current_heads[key] = {**previous, "last_seen_at": now}
         else:
             # A first-seen old PR could be preexisting; created_at only establishes
             # eligibility for genuinely new PRs, never the time of a later push.
             new_pr = epoch(pr.get("created_at")) >= int(watch["armed_since"])
             current_heads[key] = {"sha": head, "observed_at":
-                                  now if previous or (not first_sweep and new_pr) else None}
+                                  now if previous or (not first_sweep and new_pr) else None,
+                                  "last_seen_at": now}
     watch["heads"] = current_heads
     st.watch_save(watch)                 # persist observations even if review reads fail
     if first_sweep:
         st.note("loop observed armed — head snapshot set; existing heads excluded")
+        drain_queued(loop, st, lines)
         return lines
 
     grace = 0.0 if TEST else loop["grace_min"]

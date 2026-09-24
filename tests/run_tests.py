@@ -1132,6 +1132,33 @@ def group_watchdog() -> None:
     check("  signature is valid for that route", verify_sig(RECEIVED[-1], "widgets-review"), True)
     check("  queue is now empty", load_state("pending.json"), {})
 
+    # A queued A must not turn into a synthetic request for B. A fresh event can
+    # subsequently enqueue B, but the stale request has no authority to wake it.
+    for seat, reviews in (("reviewer", []), ("fixer", [review(REVIEWER, head=HEAD_B)])):
+        reset(prs={"7": {**pr(7, head=HEAD_B), "reviews": reviews}})
+        state_file("pending.json").write_text(json.dumps({seat: {
+            f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "url": "u", "reason": "busy"}}}))
+        before = len(RECEIVED)
+        out, _, _ = run("watchdog.py", None, "--loop", "widgets", "--drain", "--seat", seat)
+        check(f"stale {seat} A queue never wakes B", len(RECEIVED) - before, 0)
+        check(f"stale {seat} A queue is discarded", load_state("pending.json"), {})
+        check(f"stale {seat} queue is not reported started", "started the queued run" in out, False)
+    # An unreadable PR leaves the queue alone for a later safe retry.
+    reset(prs={"7": pr(7, head=HEAD_B)})
+    state_file("pending.json").write_text(json.dumps({"reviewer": {
+        f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "url": "u", "reason": "busy"}}}))
+    run("watchdog.py", None, "--loop", "widgets", "--drain", "--seat", "reviewer",
+        extra_env={"REVIEW_LOOP_GH_STUB": "/bin/false"})
+    check("unreadable fresh PR keeps queue for retry", f"{REPO}#7" in
+          load_state("pending.json").get("reviewer", {}), True)
+    # A genuinely new B request is independently eligible, rather than inheriting A.
+    state_file("pending.json").write_text(json.dumps({"reviewer": {
+        f"{REPO}#7": {"at": time.time(), "head": HEAD_B, "url": "u", "reason": "fresh"}}}))
+    before = len(RECEIVED)
+    run("watchdog.py", None, "--loop", "widgets", "--drain", "--seat", "reviewer")
+    check("fresh B request is woken", len(RECEIVED) - before, 1)
+    check("fresh B wake carries B", json.loads(RECEIVED[-1]["body"])["pull_request"]["head"]["sha"], HEAD_B)
+
     # a queued request for a head that was already reviewed dies quietly
     reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER)]}})
     state_file("pending.json").write_text(json.dumps(
@@ -1315,6 +1342,53 @@ def group_watchdog() -> None:
     save_world()
     run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
     check("failed listing preserves prior snapshot", load_state("watchdog.json")["heads"], old["heads"])
+    state_file("pending.json").write_text(json.dumps({"reviewer": {
+        f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "url": "u", "reason": "busy"}}}))
+    before = len(RECEIVED)
+    run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    check("failed listing never drains queue", len(RECEIVED) - before, 0)
+    check("failed listing leaves queue intact", f"{REPO}#7" in
+          load_state("pending.json").get("reviewer", {}), True)
+
+    # Clock survives transient omission, draft, and close/reopen at the same SHA.
+    for absent in (None, pr(7, head=HEAD_B, draft=True), pr(7, head=HEAD_B, state="closed")):
+        reset(prs={"7": pr(7)})
+        run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+        set_prs({"7": pr(7, head=HEAD_B)})
+        run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+        watch = load_state("watchdog.json")
+        watch["heads"]["7"]["observed_at"] = time.time() - 3600
+        state_file("watchdog.json").write_text(json.dumps(watch))
+        set_prs({"7": absent} if absent is not None else {})
+        run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+        check(f"{absent and ('draft' if absent['draft'] else 'closed') or 'omitted'} retains clock",
+              load_state("watchdog.json")["heads"]["7"]["observed_at"], watch["heads"]["7"]["observed_at"])
+        set_prs({"7": pr(7, head=HEAD_B)})
+        out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+        check("return at same SHA alarms on original clock", "reviewer never posted" in out, True)
+
+    # Old noncurrent observations are pruned; malformed timestamps cannot crash a scan
+    # or masquerade as a trusted grace clock.
+    reset(prs={"7": pr(7)})
+    run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    watch = load_state("watchdog.json")
+    watch["heads"]["999"] = {"sha": HEAD_B, "observed_at": time.time() - 40 * 86400,
+                                "last_seen_at": time.time() - 40 * 86400}
+    watch["heads"]["7"]["observed_at"] = "not-a-timestamp"
+    state_file("watchdog.json").write_text(json.dumps(watch))
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    check("malformed clock never crashes scan", "watchdog failed" in out, False)
+    check("malformed clock is not a false stall", "reviewer never posted" in out, False)
+    check("aged absent observation is pruned", "999" in load_state("watchdog.json")["heads"], False)
+    # After the bounded absence, an old PR at the same SHA is not a fresh push.
+    watch = load_state("watchdog.json")
+    watch["heads"]["7"] = {"sha": HEAD_A, "observed_at": time.time() - 41 * 86400,
+                             "last_seen_at": time.time() - 40 * 86400}
+    state_file("watchdog.json").write_text(json.dumps(watch))
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    check("expired clock cannot cause a false stall", "reviewer never posted" in out, False)
+    check("expired old head is conservative baseline",
+          load_state("watchdog.json")["heads"]["7"]["observed_at"], None)
 
     # stuck state, and paused means silent
     reset(prs={})
