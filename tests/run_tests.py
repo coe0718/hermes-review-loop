@@ -1350,6 +1350,52 @@ def group_watchdog() -> None:
     check("failed listing leaves queue intact", f"{REPO}#7" in
           load_state("pending.json").get("reviewer", {}), True)
 
+    # A malformed arming clock cannot grant a historical grace deadline. Recovery
+    # snapshots only after a successful listing, while safe queued work still drains.
+    for bad_clock in ("not-a-timestamp", [1], True, False, 0, time.time() + 86400):
+        reset(prs={"7": pr(7), "9": pr(9, head=HEAD_B)})
+        old_clock = time.time() - 7200
+        state_file("watchdog.json").write_text(json.dumps({
+            "armed_since": bad_clock,
+            "heads": {"7": {"sha": HEAD_A, "observed_at": old_clock,
+                             "last_seen_at": old_clock}}}))
+        state_file("pending.json").write_text(json.dumps({"reviewer": {
+            f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "url": "u", "reason": "busy"},
+            f"{REPO}#9": {"at": time.time(), "head": HEAD_A, "url": "u", "reason": "stale"}}}))
+        before = len(RECEIVED)
+        started = time.time()
+        out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+        watch = load_state("watchdog.json")
+        label = repr(bad_clock)
+        check(f"{label} recovery does not crash", "watchdog failed" in out, False)
+        check(f"{label} recovery does not alert", "silent stall" in out, False)
+        check(f"{label} re-arms at recovery, not historical time",
+              isinstance(watch.get("armed_since"), (int, float)) and
+              started <= watch["armed_since"] <= time.time(), True)
+        check(f"{label} baselines existing head", watch["heads"]["7"]["observed_at"], None)
+        check(f"{label} drains authorized same head", len(RECEIVED) - before, 1)
+        check(f"{label} leaves second queued item for capacity", f"{REPO}#9" in
+              load_state("pending.json").get("reviewer", {}), True)
+        out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+        check(f"{label} next sweep does not prematurely alert", "silent stall" in out, False)
+        check(f"{label} rejects stale queued head", load_state("pending.json"), {})
+        check(f"{label} never wakes stale head", len(RECEIVED) - before, 1)
+
+    # Failed listing cannot establish a safe recovery baseline or drain.
+    reset(prs={"7": pr(7)})
+    state_file("watchdog.json").write_text(json.dumps({"armed_since": [1]}))
+    state_file("pending.json").write_text(json.dumps({"reviewer": {
+        f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "url": "u", "reason": "busy"}}}))
+    DATA["world"]["prs"] = None
+    save_world()
+    before = len(RECEIVED)
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    check("invalid arming plus failed listing reports uncertainty", "could not list open PRs" in out, True)
+    check("invalid arming plus failed listing retains state", load_state("watchdog.json")["armed_since"], [1])
+    check("invalid arming plus failed listing does not drain", len(RECEIVED) - before, 0)
+    check("invalid arming plus failed listing keeps queue", f"{REPO}#7" in
+          load_state("pending.json").get("reviewer", {}), True)
+
     # Clock survives transient omission, draft, and close/reopen at the same SHA.
     for absent in (None, pr(7, head=HEAD_B, draft=True), pr(7, head=HEAD_B, state="closed")):
         reset(prs={"7": pr(7)})

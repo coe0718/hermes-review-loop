@@ -201,10 +201,13 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
     # A commit's authored/committed date says nothing about when its SHA reached a PR.
     # Snapshot the heads on the first *successful* armed sweep, before any stall evaluation.
     # Those heads are history; later SHA changes get their own durable observation clock.
-    first_sweep = not watch.get("armed_since")
+    # A malformed persisted arming clock has no trustworthy ordering against PR
+    # creation or prior observations. Re-arm only after this successful listing and
+    # baseline its heads; never coerce strings/bools or reuse old grace clocks.
+    first_sweep = valid_clock(watch.get("armed_since"), now) is None
     if first_sweep:
         watch["armed_since"] = now
-    heads = watch.get("heads")
+    heads = {} if first_sweep else watch.get("heads")
     if not isinstance(heads, dict):
         heads = {}
     current_heads: dict[str, dict] = {}
