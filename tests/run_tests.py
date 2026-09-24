@@ -1271,6 +1271,84 @@ def group_cleanup() -> None:
     check("branch worktree at artifacts base survives", base_sentinel.read_text() if base_sentinel.exists() else None,
           "preserve base\n")
 
+    # Configured roots are discovery boundaries, not permission to remove another repo.
+    reset(prs={"7": pr(7, state="closed")})
+    other = REVIEWS / "pr7-other-repo"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(other)], check=True)
+    other_sentinel = other / "uncommitted.txt"
+    other_sentinel.write_text("other repo's branch\n")
+    clone_child = CLONE / "pr7-cache"
+    clone_child.mkdir()
+    (clone_child / "sentinel.txt").write_text("inside clone\n")
+    cfg = json.loads((LOOPS_DIR / "widgets.json").read_text())
+    cfg["roots"].append(str(CLONE))
+    (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
+    run("cleanup.py", None, "--loop", "widgets", "--pr", "7")
+    check("unrelated repository branch survives", other_sentinel.read_text() if other_sentinel.exists() else None,
+          "other repo's branch\n")
+    check("PR-named directory inside clone survives", (clone_child / "sentinel.txt").exists(), True)
+
+    reset(prs={"7": pr(7, state="closed")})
+    outside = TMP / "pr7-outside"
+    subprocess.run(["git", "-C", str(CLONE), "worktree", "add", "--detach", str(outside), "HEAD"],
+                   check=True, capture_output=True)
+    (outside / "sentinel.txt").write_text("outside roots\n")
+    run("cleanup.py", None, "--loop", "widgets", "--pr", "7")
+    check("detached worktree outside roots survives", (outside / "sentinel.txt").exists(), True)
+    check("outside worktree stays registered", str(outside) in subprocess.run(
+        ["git", "-C", str(CLONE), "worktree", "list", "--porcelain"],
+        capture_output=True, text=True).stdout, True)
+    if outside.exists():
+        subprocess.run(["git", "-C", str(CLONE), "worktree", "remove", "--force", str(outside)], check=True)
+
+    reset(prs={"7": pr(7, state="closed")})
+    external = TMP / "external-cleanup"
+    shutil.rmtree(external, ignore_errors=True)
+    external.mkdir()
+    (external / "pr7-sentinel").write_text("external root\n")
+    linked = TMP / "linked-root"
+    linked.unlink(missing_ok=True)
+    linked.symlink_to(external, target_is_directory=True)
+    cfg = json.loads((LOOPS_DIR / "widgets.json").read_text())
+    cfg["roots"].append(str(linked))
+    (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
+    run("cleanup.py", None, "--loop", "widgets", "--pr", "7")
+    check("symlinked root cannot delete external child", (external / "pr7-sentinel").exists(), True)
+
+    reset(prs={"7": pr(7, state="closed")})
+    unrelated = TMP / "pr7-unrelated-root"
+    shutil.rmtree(unrelated, ignore_errors=True)
+    unrelated.mkdir()
+    (unrelated / "neutral.log").write_text("unrelated child\n")
+    subprocess.run(["git", "-C", str(CLONE), "worktree", "add", "--detach",
+                    str(unrelated / "neutral-wt"), "HEAD"], check=True, capture_output=True)
+    (unrelated / "neutral-wt" / "sentinel.txt").write_text("not PR 7\n")
+    cfg = json.loads((LOOPS_DIR / "widgets.json").read_text())
+    cfg["roots"].append(str(unrelated))
+    (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
+    run("cleanup.py", None, "--loop", "widgets", "--pr", "7")
+    check("root name does not attribute unrelated child", (unrelated / "neutral.log").exists(), True)
+    check("root name does not attribute neutral detached checkout",
+          (unrelated / "neutral-wt" / "sentinel.txt").exists(), True)
+    run("cleanup.py", None, "--loop", "widgets", "--sweep")
+    check("sweep does not attribute unrelated child", (unrelated / "neutral.log").exists(), True)
+    check("sweep does not attribute neutral detached checkout",
+          (unrelated / "neutral-wt" / "sentinel.txt").exists(), True)
+
+    reset(prs={"7": pr(7, state="closed")})
+    nested_repo = REVIEWS / "pr7-bundle" / "developer"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(nested_repo)], check=True)
+    (nested_repo / "uncommitted.txt").write_text("nested repo\n")
+    link = REVIEWS / "pr7-external-link"
+    external = TMP / "external-cleanup"
+    external.mkdir(exist_ok=True)
+    (external / "sentinel.txt").write_text("external link\n")
+    link.symlink_to(external, target_is_directory=True)
+    run("cleanup.py", None, "--loop", "widgets", "--pr", "7")
+    check("nested unrelated checkout survives parent removal", (nested_repo / "uncommitted.txt").exists(), True)
+    check("symlink child is not removed or followed", link.is_symlink() and
+          (external / "sentinel.txt").exists(), True)
+
     # state is cleared for that PR
     reset(prs={"7": pr(7, state="closed", merged="2026-02-02T00:00:00Z")})
     state_file("locks.json").write_text(json.dumps({"reviewer": {"at": time.time(), "key": f"{REPO}#7"}}))

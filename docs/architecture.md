@@ -160,7 +160,10 @@ against a head that moved on.
 A finished PR gives its disk back: worktrees, build directories, probe logs, plus the loop's own
 state (locks, queue, in-flight marks, breach marker). Rails, because this deletes real directories:
 
-- only paths inside the loop's configured `roots` are considered;
+- only paths inside non-symlink configured `roots` (or the loop's artifacts directory) are
+  considered; a root's PR-like name does not attribute every child to that PR;
+- detached worktrees must be registered to this clone and inside an allowed root. Other Git
+  checkouts, nested repositories, the clone and its contents are protected even if PR-named;
 - a worktree with a **branch** checked out is never touched — that is somebody's working tree, not
   a review artifact (only detached checkouts are cleaned);
 - evidence patterns (`phase3`, `evidence`, `soak`, `release-verification`) are skipped: regenerable

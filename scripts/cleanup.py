@@ -14,7 +14,9 @@ Two modes:
 
 Safety rails, because this deletes real directories:
 
-* only paths *inside* the loop's configured roots are ever considered;
+* only paths inside non-symlink configured roots or the artifacts directory are considered;
+* only detached worktrees registered to this clone are removable, and only inside those roots;
+  other Git repositories and nested checkouts are protected;
 * a worktree with a **branch** checked out is never touched — that is somebody's working
   tree, not a review artifact (only detached review checkouts are cleaned);
 * evidence patterns (``phase3``, ``evidence``, ``soak``, ``release-verification``) are
@@ -32,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import re
 import shutil
@@ -89,6 +92,66 @@ def worktrees(clone: pathlib.Path) -> list[dict]:
         elif cur is not None and line.startswith("branch "):
             cur["branch"] = line.split(" ", 1)[1].replace("refs/heads/", "")
     return [t for t in trees if pathlib.Path(t["path"]) != clone]
+
+
+def has_symlink_component(path: pathlib.Path) -> bool:
+    absolute = path.absolute()
+    return any(part.is_symlink() for part in (absolute, *absolute.parents))
+
+
+def safe_roots(loop: dict, number: int) -> list[pathlib.Path]:
+    roots = [pathlib.Path(p).expanduser() for p in loop["roots"]]
+    roots.append(config.artifacts_dir(loop, number).parent)
+    return [root.resolve() for root in roots if root.is_dir() and not has_symlink_component(root)]
+
+
+def inside(path: pathlib.Path, parent: pathlib.Path) -> bool:
+    return path == parent or parent in path.parents
+
+
+def git_owner(path: pathlib.Path) -> pathlib.Path | None:
+    directory = path if path.is_dir() else path.parent
+    try:
+        proc = subprocess.run(["git", "-C", str(directory), "rev-parse", "--show-toplevel"],
+                              capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return pathlib.Path(proc.stdout.strip()).resolve() if proc.returncode == 0 and proc.stdout.strip() else None
+
+
+def contains_nested_git(path: pathlib.Path, registered_worktree: bool = False) -> bool:
+    if not path.is_dir():
+        return False
+    for directory, dirs, files in os.walk(path, followlinks=False):
+        if registered_worktree and pathlib.Path(directory) == path:
+            files = [name for name in files if name != ".git"]
+            dirs = [name for name in dirs if name != ".git"]
+        if ".git" in dirs or ".git" in files:
+            return True
+    return False
+
+
+def owned_candidate(path: pathlib.Path, roots: list[pathlib.Path],
+                    clone: pathlib.Path | None, registered: set[pathlib.Path]) -> bool:
+    """Only root-contained artifacts or registered detached checkouts may be removed."""
+    if has_symlink_component(path):
+        return False
+    candidate = path.resolve()
+    if not any(inside(candidate, root) for root in roots):
+        return False
+    if clone and (inside(candidate, clone) or inside(clone, candidate)):
+        return False
+    owner = git_owner(path)
+    # A root may itself be nested in the repository holding this configuration;
+    # that ancestor alone does not turn its scratch artifacts into checkouts.
+    inherited_repo = owner and any(owner in root.parents for root in roots)
+    if owner and not inherited_repo and (owner != candidate or candidate not in registered):
+        return False
+    # A PR-named build directory may enclose an unrelated checkout. Do not recurse
+    # through a Git registration we cannot prove belongs to this clone.
+    if contains_nested_git(path, candidate in registered):
+        return False
+    return True
 
 
 def du(path: pathlib.Path) -> int:
@@ -179,13 +242,14 @@ def clean_pr(loop: dict, number: int, dry: bool, quiet: bool, force: bool = Fals
         clear_state(loop, number, quiet)
 
     clone = config.clone_path(loop)
-    roots = [pathlib.Path(p).expanduser() for p in loop["roots"]] + [config.artifacts_dir(loop, number).parent]
+    roots = safe_roots(loop, number)
     trees = worktrees(clone) if clone else []
+    registered = {pathlib.Path(tree["path"]).resolve() for tree in trees if not tree["branch"]}
     protected = {pathlib.Path(tree["path"]).resolve() for tree in trees if tree["branch"]}
 
     cands: list[pathlib.Path] = []
     for tree in trees:
-        if pr_from_path(tree["path"]) != number:
+        if pr_from_path(pathlib.Path(tree["path"]).name) != number:
             continue
         if tree["branch"]:
             log(f"    SKIP (branch checked out: {tree['branch']}): {tree['path']}", quiet)
@@ -197,13 +261,16 @@ def clean_pr(loop: dict, number: int, dry: bool, quiet: bool, force: bool = Fals
         for child in root.iterdir():
             if child in cands:
                 continue
-            if pr_from_path(str(child)) == number:
+            if pr_from_path(child.name) == number:
                 cands.append(child)
     base = config.artifacts_dir(loop, number)
     if base.exists() and base not in cands:
         cands.append(base)
 
     for cand in cands:
+        if not owned_candidate(cand, roots, clone.resolve() if clone else None, registered):
+            log(f"    SKIP (outside owned cleanup scope): {cand}", quiet)
+            continue
         # Every source (worktree list, configured roots, artifacts base) shares this
         # final guard. Resolve aliases and protect enclosing paths as well: rmtree
         # on a parent would remove a nested branch checkout and uncommitted work.
@@ -236,15 +303,15 @@ def sweep(loop: dict, dry: bool, quiet: bool) -> int:
         return 0
     by_pr: dict[int, list[dict]] = {}
     for tree in worktrees(clone):
-        number = pr_from_path(tree["path"])
+        number = pr_from_path(pathlib.Path(tree["path"]).name)
         if number:
             by_pr.setdefault(number, []).append(tree)
     # Roots can hold a PR's logs with no worktree left; those still count.
     for root in [pathlib.Path(p).expanduser() for p in loop["roots"]]:
-        if not root.exists():
+        if not root.is_dir() or has_symlink_component(root):
             continue
         for child in root.iterdir():
-            number = pr_from_path(str(child))
+            number = pr_from_path(child.name)
             if number:
                 by_pr.setdefault(number, [])
 
