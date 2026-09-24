@@ -62,6 +62,13 @@ def pr_from_path(path: str) -> int | None:
     return int(hits[-1]) if hits else None
 
 
+def overlaps_branch_worktree(path: pathlib.Path, protected: set[pathlib.Path]) -> bool:
+    """Never delete a branch checkout, anything inside it, or its enclosing directory."""
+    candidate = path.resolve()
+    return any(candidate == branch or candidate in branch.parents or branch in candidate.parents
+               for branch in protected)
+
+
 def worktrees(clone: pathlib.Path) -> list[dict]:
     try:
         proc = subprocess.run(["git", "-C", str(clone), "worktree", "list", "--porcelain"],
@@ -172,6 +179,7 @@ def clean_pr(loop: dict, number: int, dry: bool, quiet: bool, force: bool = Fals
     clone = config.clone_path(loop)
     roots = [pathlib.Path(p).expanduser() for p in loop["roots"]] + [config.artifacts_dir(loop, number).parent]
     trees = worktrees(clone) if clone else []
+    protected = {pathlib.Path(tree["path"]).resolve() for tree in trees if tree["branch"]}
 
     cands: list[pathlib.Path] = []
     for tree in trees:
@@ -194,6 +202,12 @@ def clean_pr(loop: dict, number: int, dry: bool, quiet: bool, force: bool = Fals
         cands.append(base)
 
     for cand in cands:
+        # Every source (worktree list, configured roots, artifacts base) shares this
+        # final guard. Resolve aliases and protect enclosing paths as well: rmtree
+        # on a parent would remove a nested branch checkout and uncommitted work.
+        if overlaps_branch_worktree(cand, protected):
+            log(f"    SKIP (branch worktree): {cand}", quiet)
+            continue
         size = du(cand)
         if dry:
             log(f"    would remove {human(size):>10}  {cand}", quiet)

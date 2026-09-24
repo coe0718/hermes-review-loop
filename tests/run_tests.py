@@ -1226,6 +1226,51 @@ def group_cleanup() -> None:
           "pr7-wt" in subprocess.run(["git", "-C", str(CLONE), "worktree", "list"],
                                      capture_output=True, text=True).stdout, False)
 
+    # A branch checkout matching the *same* closed PR must survive the configured-root
+    # scan, even when a configured root points inside that checkout.
+    reset(prs={"7": pr(7, state="closed")})
+    branch = REVIEWS / "pr7-dev"
+    subprocess.run(["git", "-C", str(CLONE), "worktree", "add", "-b", "fix/pr7",
+                    str(branch), "HEAD"], check=True, capture_output=True)
+    sentinel = branch / "uncommitted.txt"
+    sentinel.write_text("do not lose local work\n")
+    nested = branch / "pr7-logs"
+    nested.mkdir()
+    (nested / "build.log").write_text("preserve\n")
+    cfg = json.loads((LOOPS_DIR / "widgets.json").read_text())
+    cfg["roots"].append(str(branch))
+    (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
+    out, _, _ = run("cleanup.py", None, "--loop", "widgets", "--pr", "7")
+    check("same-PR branch sentinel survives root cleanup", sentinel.read_text() if sentinel.exists() else None,
+          "do not lose local work\n")
+    check("nested candidate inside branch survives", (nested / "build.log").exists(), True)
+    check("branch remains registered", str(branch) in subprocess.run(
+        ["git", "-C", str(CLONE), "worktree", "list", "--porcelain"],
+        capture_output=True, text=True).stdout, True)
+
+    # A root child enclosing a branch checkout is just as destructive to remove.
+    reset(prs={"7": pr(7, state="closed")})
+    parent = REVIEWS / "pr7-container"
+    parent.mkdir()
+    inside = parent / "developer"
+    subprocess.run(["git", "-C", str(CLONE), "worktree", "add", "-b", "fix/inside7",
+                    str(inside), "HEAD"], check=True, capture_output=True)
+    (inside / "uncommitted.txt").write_text("inside branch\n")
+    run("cleanup.py", None, "--loop", "widgets", "--pr", "7")
+    check("parent candidate containing branch survives", (inside / "uncommitted.txt").exists(), True)
+
+    # The explicit artifacts base is a separate candidate source, not just a root scan.
+    reset(prs={"7": pr(7, state="closed")})
+    base = STATE_DIR / "artifacts" / "7"
+    base.parent.mkdir(parents=True)
+    subprocess.run(["git", "-C", str(CLONE), "worktree", "add", "-b", "fix/base7",
+                    str(base), "HEAD"], check=True, capture_output=True)
+    base_sentinel = base / "uncommitted.txt"
+    base_sentinel.write_text("preserve base\n")
+    run("cleanup.py", None, "--loop", "widgets", "--pr", "7")
+    check("branch worktree at artifacts base survives", base_sentinel.read_text() if base_sentinel.exists() else None,
+          "preserve base\n")
+
     # state is cleared for that PR
     reset(prs={"7": pr(7, state="closed", merged="2026-02-02T00:00:00Z")})
     state_file("locks.json").write_text(json.dumps({"reviewer": {"at": time.time(), "key": f"{REPO}#7"}}))
