@@ -10,7 +10,9 @@ sha: 0000000000000000000000000000000000000000   # replaced with the release comm
 description: Unattended PR review between two agents — one pushes, a different one reviews, the
   budget is counted in verdicts, a watchdog reports silent stalls, and a finished PR gives its
   local disk back. Disclosure — creates webhook routes and a cron job, calls the GitHub API with
-  repo-scope tokens you provide, and deletes local review artifacts for merged or closed PRs.
+  repo-scope tokens you provide, and deletes local review artifacts for merged or closed PRs. With
+  an observer feed configured (opt-in per loop) it also posts short read-only notices about loop
+  transitions — PR URL, head, event, next turn — to the chat that feed names, and to nothing else.
 maintainer: coe0718
 tier: community
 category: automation

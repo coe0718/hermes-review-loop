@@ -19,7 +19,7 @@ import time
 import tempfile
 from urllib.parse import urlsplit
 
-from . import config, doctor, gate, gh, prompts, routes
+from . import config, doctor, gate, gh, observer, prompts, routes, state as state_mod
 
 SHIM_NAME = "review-loop-watchdog.py"
 
@@ -58,6 +58,7 @@ if proc.returncode != 0 and proc.stderr.strip():
 def routes_for(loop: dict) -> dict:
     """The conventional route names for a loop, and the names ``init`` writes."""
     return {"reviewer": f"{loop['id']}-review", "fixer": f"{loop['id']}-fix",
+            "observer": f"{loop['id']}-observe",
             "adjudicator": f"{loop['id']}-breach"}
 
 
@@ -75,6 +76,9 @@ def _routes_of(loop: dict) -> dict:
     adjudicator = str((loop.get("adjudicator") or {}).get("route") or "")
     if adjudicator:
         names["adjudicator"] = adjudicator
+    observer_route = str((loop.get("observer") or {}).get("route") or "")
+    if observer_route:
+        names["observer"] = observer_route
     return names
 
 
@@ -82,7 +86,7 @@ def _routes_of(loop: dict) -> dict:
 # is written: the registry is shared with every other plugin on the host, and rebinding someone
 # else's route to our profile would be a silent takeover of their webhook.
 GATE_SCRIPT = {"reviewer": "gate_reviewer.py", "fixer": "gate_fixer.py",
-               "adjudicator": "gate_adjudicator.py"}
+               "adjudicator": "gate_adjudicator.py", "observer": "observe.py"}
 
 
 def _verify_routes(loop: dict, roles) -> None:
@@ -94,8 +98,9 @@ def _verify_routes(loop: dict, roles) -> None:
     artifact here that another plugin could own.
     """
     mine = _routes_of(loop)
-    wanted = [role for role in config.ROUTE_ROLES if role in set(roles) and role in mine]
-    names = [mine[role] for role in config.ROUTE_ROLES if role in mine]
+    route_roles = (*config.ROUTE_ROLES, "observer")
+    wanted = [role for role in route_roles if role in set(roles) and role in mine]
+    names = [mine[role] for role in route_roles if role in mine]
     shared = sorted({name for name in names if names.count(name) > 1})
     if shared:
         raise config.ConfigError(
@@ -130,7 +135,8 @@ def _verify_routes(loop: dict, roles) -> None:
                 f"route {name!r} runs {script!r}, not {GATE_SCRIPT[role]!r} — it belongs to "
                 "something else; pick another route name")
         expected_prompt = {"reviewer": prompts.REVIEWER, "fixer": prompts.FIXER,
-                           "adjudicator": prompts.ADJUDICATOR}[role]
+                           "adjudicator": prompts.ADJUDICATOR,
+                           "observer": prompts.OBSERVER}[role]
         if entry.get("prompt") != expected_prompt:
             raise config.ConfigError(
                 f"route {name!r} does not have this {role} gate's prompt — ownership cannot be "
@@ -148,7 +154,7 @@ def _install_routes(loop: dict, roles=None) -> dict:
     names = _routes_of(loop)
     host = config.webhook_host(loop.get("host"), required=True)
     skill = loop.get("skill") or ""
-    wanted = config.ROUTE_ROLES if roles is None else tuple(roles)
+    wanted = (*config.ROUTE_ROLES, "observer") if roles is None else tuple(roles)
     written: dict = {}
     for role in config.ROUTE_ROLES:
         if role not in wanted or role not in names:
@@ -176,6 +182,16 @@ def _install_routes(loop: dict, roles=None) -> dict:
                              description=f"{loop['repo']} — adjudicate a loop that spent its "
                                           "budget", **common)
         written[role] = name
+    if "observer" in wanted and "observer" in names:
+        observer_cfg = loop["observer"]
+        name = names["observer"]
+        routes.new_route(name, profile=observer_cfg.get("profile", "default"),
+                         prompt=prompts.OBSERVER, events=["pull_request"],
+                         script="observe.py", deliver=observer_cfg.get("deliver", "telegram"),
+                         deliver_only=True, host=host,
+                         description=f"{loop['repo']} — read-only observer feed: one short "
+                                     "notice per loop transition")
+        written["observer"] = name
     return written
 
 
@@ -322,6 +338,41 @@ def _busy_seats(loop: dict, roles: set[str]) -> list[str]:
                              for key, entry in sorted(live.items()))
             lines.append(f"{seat} is in flight on {held}")
     return lines
+
+
+def _observer_check(loop: dict) -> None:
+    """Refuse an observer destination the gateway could not deliver without waking an agent.
+
+    ``deliver_only`` is the gateway's no-agent mode and it rejects a ``log`` target outright: a
+    route configured that way does not merely fail to deliver a notice, it stops the gateway from
+    starting. So the mistake is caught here, before anything is written, rather than at the
+    gateway's next restart.
+    """
+    observer_cfg = loop.get("observer") or {}
+    if observer_cfg.get("route") and (observer_cfg.get("deliver") or "log") == "log":
+        raise config.ConfigError(
+            "observer.deliver must be a real destination (telegram, discord, ...) — an observer "
+            "route never wakes an agent, and the gateway refuses a deliver_only file target")
+
+
+def _observer_args(args, loop_id: str) -> dict:
+    """The observer block a new loop starts with — empty when the feed was not asked for.
+
+    Opt-in by construction: naming a profile (or a route) is the whole switch, and a loop without
+    one behaves exactly as it did before this existed.
+    """
+    if not (args.observer_profile or args.observer_route):
+        return {}
+    observer_cfg = {"route": args.observer_route or f"{loop_id}-observe",
+                    "profile": args.observer_profile or "default",
+                    "deliver": args.observer_deliver}
+    if args.observer_events:
+        observer_cfg["events"] = args.observer_events
+    if args.observer_digest_min:
+        observer_cfg["digest_min"] = args.observer_digest_min
+    return observer_cfg
+
+
 
 
 def _install_hooks(loop: dict, token_login: str | None) -> list[str]:
@@ -594,6 +645,7 @@ def cmd_init(args) -> int:
                                            / (args.id or args.repo.split("/")[-1])),
         "host": args.host, "grace_min": args.grace_min,
         "ttl_min": args.ttl_min, "inflight_ttl_min": args.inflight_ttl_min,
+        "observer": _observer_args(args, args.id or args.repo.split("/")[-1]),
     }
     # A seat-level capacity wins over the loop default, so only write it when it was asked for.
     for seat, value in (("reviewer", args.reviewer_concurrency), ("fixer", args.fixer_concurrency)):
@@ -603,6 +655,8 @@ def cmd_init(args) -> int:
     raw["seats"]["reviewer"]["route"] = names["reviewer"]
     raw["seats"]["fixer"]["route"] = names["fixer"]
     roles = {"reviewer", "fixer"} | ({"adjudicator"} if raw["adjudicator"] else set())
+    if raw["observer"].get("route"):
+        roles.add("observer")
     try:
         loop = config.normalize(raw)
         # Routes are installed even without --hooks; never write a partial loop with
@@ -612,6 +666,7 @@ def cmd_init(args) -> int:
         # ownership are all checked before a single file is written.
         config.verify_seats(loop, roles)
         _verify_routes(loop, roles)
+        _observer_check(loop)
     except config.ConfigError as exc:
         print(f"config refused: {exc}")
         return 2
@@ -627,10 +682,20 @@ def cmd_init(args) -> int:
             print("  would create the two repo hooks (pull_request, pull_request_review)")
         if args.schedule:
             print(f"  would install the watchdog cron job ({args.schedule})")
+        if loop.get("observer", {}).get("route"):
+            print(f"  would write route: {loop['observer']['route']}")
         return 0
 
     path = config.config_dir() / f"{loop['id']}.json"
-    previous_config = path.read_bytes() if path.exists() else None
+    if path.exists():
+        print(f"refused: loop {loop['id']!r} already exists; use `hermes review-loop set` "
+              "to change it without losing observer destination/receipt bindings")
+        return 2
+    observer_name = (loop.get("observer") or {}).get("route")
+    if observer_name and routes.route(observer_name):
+        print(f"refused: route {observer_name!r} already exists and is not this observer's route")
+        return 2
+    previous_config = None
     previous_routes = {name: routes.route(name) for name in _routes_of(loop).values()}
     try:
         path = _write_config(loop)
@@ -697,8 +762,8 @@ def cmd_init(args) -> int:
 def cmd_set(args) -> int:
     """Change a loop's settings in place, through the same validation ``init`` uses.
 
-    Nothing route-side needs re-writing: prompts are rendered from the payload at fire time, so a
-    new cap or concurrency takes effect on the next event. The rails still apply — ``concurrency``
+    Seat prompts are rendered from the payload at fire time; observer destination changes also
+    reconcile the delivery-only route before updating config. The rails still apply — ``concurrency``
     above 1 without a ``clone`` is refused here exactly as it is at init, because a parallel run
     that cannot be isolated would share a checkout.
     """
@@ -722,23 +787,110 @@ def cmd_set(args) -> int:
             seats[seat]["concurrency"] = value
             seat_changes[seat] = value
 
-    if not changes and not seat_changes:
+    # The observer is a nested block, so it is collected the same way the seats are: flags the
+    # operator did not pass leave the existing answer alone, and a flag that means "drop it"
+    # (--observer-disable) is explicit rather than implied by an empty string.
+    observer_cfg = dict(loop.get("observer") or {})
+    if args.observer_disable:
+        observer_cfg = {}
+    if args.observer_route:
+        observer_cfg["route"] = args.observer_route
+    if args.observer_profile:
+        observer_cfg["profile"] = args.observer_profile
+    if args.observer_profile and not observer_cfg.get("route"):
+        observer_cfg["route"] = f"{loop['id']}-observe"
+    if args.observer_deliver:
+        observer_cfg["deliver"] = args.observer_deliver
+    if args.observer_events is not None:
+        observer_cfg["events"] = args.observer_events
+    if args.observer_digest_min is not None:
+        observer_cfg["digest_min"] = args.observer_digest_min
+    if args.observer_mute or args.observer_unmute:
+        if not observer_cfg.get("route"):
+            # Muting something that does not exist would write a feed with nowhere to go — a
+            # configuration error the operator would only discover by finding no notices.
+            print("no observer feed on this loop — name one with --observer-route / "
+                  "--observer-profile first")
+            return 2
+    if args.observer_mute:
+        observer_cfg["mute"] = True
+    if args.observer_unmute:
+        observer_cfg["mute"] = False
+
+    if not changes and not seat_changes and observer_cfg == (loop.get("observer") or {}):
         print("nothing to change — pass at least one setting "
-              "(--concurrency, --reviewer-concurrency, --fixer-concurrency, --cap, --clone, ...)")
+              "(--concurrency, --reviewer-concurrency, --fixer-concurrency, --cap, --clone, "
+              "--observer-profile, ...)")
         return 0
 
     try:
-        updated = config.normalize({**loop, **changes, "seats": seats})
+        updated = config.normalize({**loop, **changes, "seats": seats, "observer": observer_cfg})
+        _observer_check(updated)
     except config.ConfigError as exc:
         print(f"refused: {exc}")
         return 2
 
+    before = loop.get("observer") or {}
+    after = updated.get("observer") or {}
+    # Disabling stops new notices and removes the route, but leaves the outbox intact.
+    # Keep its former destination as a tombstone: otherwise re-enabling at a new
+    # destination (or host) could forward a queued private PR link there.
+    previous = loop.get("observer_disabled") or {}
+    bound = before or previous
+    old_target = {k: bound.get(k) for k in ("route", "profile", "deliver")}
+    old_target["host"] = previous.get("host") if previous else loop.get("host")
+    new_target = {k: after.get(k) for k in ("route", "profile", "deliver")}
+    new_target["host"] = updated.get("host")
+    destination_changed = any(before.get(k) != after.get(k)
+                              for k in ("route", "profile", "deliver"))
+    if bound and after and old_target != new_target:
+        try:
+            outstanding = observer.unsettled(state_mod.state_for(loop))
+        except (OSError, ValueError) as exc:
+            print(f"observer ledger cannot be checked — destination unchanged: {exc}")
+            return 2
+        if outstanding:
+            print(f"refused: {outstanding} observer notice(s) are unsettled; retry/resolve "
+                  "them before changing the route, profile, delivery or host")
+            return 2
+    if after:
+        updated.pop("observer_disabled", None)
+    elif before:
+        updated["observer_disabled"] = old_target
+    if destination_changed and after:
+        name = after["route"]
+        reserved = {cfg.get("route") for cfg in loop["seats"].values()}
+        reserved.add((loop.get("adjudicator") or {}).get("route"))
+        if name in reserved:
+            print("refused: observer route must not replace a seat or adjudicator route")
+            return 2
+        existing = routes.route(name)
+        if existing and name != before.get("route"):
+            print(f"refused: route {name!r} already exists and is not this observer's route")
+            return 2
+        try:
+            host = config.webhook_host(updated.get("host"), required=True)
+            routes.new_route(name, profile=after["profile"], prompt=prompts.OBSERVER,
+                             events=["pull_request"], script="observe.py",
+                             deliver=after["deliver"], deliver_only=True, host=host,
+                             description=f"{updated['repo']} — read-only observer feed")
+        except (OSError, ValueError, config.ConfigError) as exc:
+            print(f"observer route could not be reconciled; loop config unchanged: {exc}")
+            return 2
     path = _write_config(updated)
+    if destination_changed and before.get("route") and before["route"] != after.get("route"):
+        try:
+            routes.remove_route(before["route"])
+        except (OSError, ValueError) as exc:
+            print(f"warning: old observer route {before['route']!r} remains; remove it manually: {exc}")
     for key, value in changes.items():
         print(f"  {key}: {loop.get(key)!r} → {value!r}")
     for seat, value in seat_changes.items():
         was = config.seat_concurrency(loop, seat)
         print(f"  {seat} concurrency: {was} → {value}  (this seat only)")
+    if updated.get("observer") != (loop.get("observer") or {}):
+        print(f"  observer: {observer.describe(loop.get('observer') or {})} → "
+              f"{observer.describe(updated.get('observer') or {})}")
     print(f"loop config updated: {path}")
 
     if "concurrency" in changes:
@@ -810,6 +962,16 @@ def cmd_apply(args) -> int:
     if not changes and not identity and not binds:
         print(f"[{loop['id']}] already matches the plugin settings")
         return 0
+    if not args.dry_run and updated.get("host") != loop.get("host") and loop.get("observer"):
+        try:
+            outstanding = observer.unsettled(state_mod.state_for(loop))
+        except (OSError, ValueError) as exc:
+            print(f"observer ledger cannot be checked — host unchanged: {exc}")
+            return 2
+        if outstanding:
+            print(f"refused: {outstanding} observer notice(s) are unsettled; retry/resolve "
+                  "them before changing the host")
+            return 2
     for name, was, now in list(changes) + list(identity):
         print(f"  {name}: {was} → {now}")
     for role, (name, current, target) in sorted(binds.items()):
@@ -1002,6 +1164,22 @@ def cmd_status(args) -> int:
             for key, entry in breaches.items():
                 print(f"  breach:     {key} at {(entry.get('head') or '')[:7]} "
                       f"— {entry.get('status')}")
+        observer_cfg = loop.get("observer") or {}
+        print(f"  observer:   {observer.describe(observer_cfg)}")
+        if not observer_cfg and loop.get("observer_disabled"):
+            print("  observer:   disabled — existing notices remain owed; restoring the original "
+                  "destination can resume them")
+        if observer_cfg or loop.get("observer_disabled"):
+            counts = observer.owed(st)
+            owed = sum(n for status, n in counts.items() if status != "delivered")
+            print(f"  observer:   {counts.get('delivered', 0)} delivered · {owed} owed "
+                  f"(failed or waiting)")
+            # Only a live feed can be broken: a muted or absent one is reported above, and calling
+            # that a problem would be crying wolf at a setting the operator chose.
+            if observer_cfg and not observer.configured(loop):
+                problem = observer.unusable(loop)
+                if problem:
+                    print(f"  observer:   ⚠ {problem}")
         watch = st.watch()
         if watch.get("last_run"):
             print(f"  watchdog:   last run {watch['last_run']}")
@@ -1197,6 +1375,22 @@ def register_cli(ctx, settings: dict | None = None) -> None:
         init.add_argument("--adjudicator-profile", default="",
                           help="Hermes profile for the adjudicator (default: the plugin setting, "
                                "else the launch profile)")
+        init.add_argument("--observer-route", default="",
+                          help="route name for the read-only observer feed "
+                               "(default: <id>-observe)")
+        init.add_argument("--observer-profile", default="",
+                          help="Hermes profile the observer feed belongs to (its chat) — naming "
+                               "one switches the feed on")
+        init.add_argument("--observer-deliver", default="telegram",
+                          help="where the gateway delivers the feed (telegram, discord, ...); "
+                               "the feed never wakes an agent")
+        init.add_argument("--observer-events", default="",
+                          help="comma-separated transitions to send, from "
+                               "opened,handoff,verdict,approved,escalation,stall,closed "
+                               "(default: all)")
+        init.add_argument("--observer-digest-min", type=int, default=0,
+                          help="batch the feed into one message per this many minutes "
+                               "(0 = one notice per transition)")
         init.add_argument("--host", default=d["host"],
                           help="your gateway webhook origin (required unless set in plugin settings)")
         init.add_argument("--grace-min", type=int, default=d["grace_min"])
@@ -1248,6 +1442,22 @@ def register_cli(ctx, settings: dict | None = None) -> None:
         change.add_argument("--ttl-min", type=int, help="how long a run may hold its slot")
         change.add_argument("--inflight-ttl-min", type=int)
         change.add_argument("--host", help="gateway webhook host")
+        change.add_argument("--observer-route", help="route the observer feed delivers through")
+        change.add_argument("--observer-profile", help="profile that owns the observer destination")
+        change.add_argument("--observer-deliver",
+                            help="where the gateway delivers the feed (telegram, discord, ...)")
+        change.add_argument("--observer-events", default=None,
+                            help="comma-separated transitions to send, from "
+                                 "opened,handoff,verdict,approved,escalation,stall,closed "
+                                 "(blank = all)")
+        change.add_argument("--observer-digest-min", type=int, default=None,
+                            help="batch the feed into one message per N minutes (0 = per "
+                                 "transition)")
+        change.add_argument("--observer-mute", action="store_true",
+                            help="stop the feed without forgetting it")
+        change.add_argument("--observer-unmute", action="store_true", help="resume a muted feed")
+        change.add_argument("--observer-disable", action="store_true",
+                            help="drop this loop's observer config entirely")
         change.set_defaults(func=cmd_set)
 
         apply_cmd = sub.add_parser("apply", help="Push the plugin settings onto a loop")

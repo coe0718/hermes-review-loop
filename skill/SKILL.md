@@ -84,6 +84,13 @@ directly rather than trusting anyone's summary. That means three things for how 
   same PR (a warm build directory is the point) and deleted when the PR closes. Anything you need to
   keep belongs on the PR, not on this disk.
 
+If the loop carries an **observer feed**, your transitions are announced to it — the gate reports the
+handoff, the verdict, the escalation and the terminal close on its own, from the state change rather
+than from anything you say. So do not relay to it, and do not treat it as a participant: it is
+read-only, it holds no seat, and a notice it never receives changes nothing about your turn. Your
+job is still to end your turn with a push-and-request or a verdict; the observer hears about it
+either way, and nothing you write in a summary is what reaches it.
+
 ## When something is wrong with the loop itself
 
 Say it plainly in your summary — a gate that fired when it should not have, a stale head, a

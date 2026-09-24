@@ -24,6 +24,7 @@ gates deadlock against each other, each waiting for the other's hold to clear.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import pathlib
 import subprocess
@@ -31,7 +32,7 @@ import sys
 import time
 import urllib.request
 
-from . import config, gh, isolation, routes, state as state_mod
+from . import config, gh, isolation, observer, routes, state as state_mod
 from .util import iso_at, log, now_iso, silence
 
 
@@ -74,7 +75,8 @@ def seat_key(loop: dict, number: int) -> str:
 
 
 def pr_url(loop: dict, number: int) -> str:
-    return f"https://github.com/{loop['repo']}/pull/{number}"
+    """The PR's web URL. ``gh`` owns it, because the observer's notices need it too."""
+    return gh.pr_url(loop, number)
 
 
 def artifacts_for(loop: dict, number: int) -> str:
@@ -149,6 +151,35 @@ def reviews_at_head(reviews: list, loop: dict, head: str) -> list:
     """Reviewer reviews at this head, including non-verdicts for diagnostics only."""
     return [r for r in reviews
             if isinstance(r, dict) and is_reviewer(r, loop) and r.get("commit_id") == head]
+
+
+def latest_effective_review_at_head(reviews: list, loop: dict, head: str) -> dict | None:
+    """Latest live verdict, or unknown when the same-head chronology cannot be proved.
+
+    REST order is not a verdict. Dismissed reviews and comments do not supersede a verdict;
+    an unfamiliar state or undatable verdict cannot authorize a merge instruction.
+    """
+    candidates = []
+    for review in reviews_at_head(reviews, loop, head):
+        state = gh.review_state(review)
+        if state in {"DISMISSED", "COMMENTED", "PENDING"}:
+            continue
+        if state not in {"APPROVED", "CHANGES_REQUESTED"}:
+            return None
+        try:
+            submitted = datetime.fromisoformat(review["submitted_at"].replace("Z", "+00:00"))
+            review_id = int(review["id"])
+            if submitted.tzinfo is None or review_id <= 0:
+                return None
+            candidates.append((submitted.astimezone(timezone.utc), review_id, review))
+        except (KeyError, AttributeError, TypeError, ValueError, OverflowError):
+            return None
+    if not candidates:
+        return None
+    latest = max(candidates, key=lambda item: (item[0], item[1]))
+    if sum((submitted, review_id) == latest[:2] for submitted, review_id, _ in candidates) != 1:
+        return None
+    return latest[2]
 
 
 def approved_at_head(reviews: list, loop: dict, head: str) -> bool:
@@ -340,13 +371,13 @@ def _explain_hooks(armed, armed_error: str) -> str:
 def explain_facts(loop: dict, number: int) -> dict:
     """Everything ``explain`` reasons about, read once, with the reason any read failed.
 
-    Read-only by construction: three GETs, and a state directory that is only ever opened for
+    Read-only by construction: PR/review/hook GETs, and a state directory that is only ever opened for
     reading (``live_locks``, ``inflight_at`` and ``queue_items`` never persist their pruning).
     """
     pr, pr_error = gh.fetch(loop, gh.pr_path(loop, number))
     if pr is None and (pr_error == "HTTP 404" or pr_error.startswith("HTTP 404 ")):
         pr_error = ""  # GitHub hides inaccessible resources behind 404 as well.
-    reviews, reviews_error = gh.fetch(loop, gh.reviews_path(loop, number))
+    reviews, reviews_error = gh.reviews_read(loop, number)
     armed, armed_error = hooks_read(loop)
     return {"pr": pr, "pr_error": pr_error, "reviews": reviews, "reviews_error": reviews_error,
             "armed": armed, "armed_error": armed_error, "read_at": time.time()}
@@ -396,9 +427,12 @@ def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> di
     if reviews is not None:
         spent = len(verdicts(reviews, loop))
         if head:
-            changes = changes_at_head(reviews, loop, head)
+            latest = latest_effective_review_at_head(reviews, loop, head)
+            changes = (changes_at_head(reviews, loop, head)
+                       if latest is not None and gh.review_state(latest) == "CHANGES_REQUESTED"
+                       else [])
             at_head = len(changes)
-            approved = approved_at_head(reviews, loop, head)
+            approved = latest is not None and gh.review_state(latest) == "APPROVED"
             reviewed = reviewed_at_head(reviews, loop, head)
             head_states = sorted({gh.review_state(r) for r in reviews_at_head(reviews, loop, head)})
 
@@ -721,16 +755,23 @@ def breach(loop: dict, st: state_mod.LoopState, number: int, head: str, rounds: 
                 and (current.get("head") or {}).get("sha") == head)
 
     route = loop.get("adjudicator", {}).get("route")
+    def observe_reserved(marker: dict) -> None:
+        observer.notify(loop, st, "escalation", number, head, identity=str(marker["rounds"]),
+                        outcome=f"{marker['rounds']}/{loop['cap']} verdicts, no approval",
+                        next_turn="adjudicator delivery pending" if route else "you")
+
     outcome = st.breach_deliver(number, entry, current_head,
                                 lambda marker: wake_adjudicator(loop, number, head,
                                                                 marker["rounds"], marker["reason"])
-                                if route else True)
+                                if route else True, reserved=observe_reserved)
     if outcome == "new":
         st.note(f"breach {loop['repo']}#{number} at {head[:7]}: {reason}")
         if not route:
             log("no adjudicator configured — marker written, nothing woken")
-    elif outcome == "stale":
+
+    if outcome == "stale":
         log(f"#{number} @ {head[:7]} no longer current — not escalating")
+
 
 
 def ping_start(loop: dict, seat: str, text: str) -> None:

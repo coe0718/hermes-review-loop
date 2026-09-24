@@ -143,15 +143,22 @@ def url_for(name: str, host: str | None = None) -> str | None:
     return url_for_profile(name, entry.get("profile", "default"), base)
 
 
-def target(name: str, host: str | None = None):
+def target(name: str, host: str | None = None, *, expected: dict | None = None):
     """(url, secret_bytes) for a route, or None when it is missing or has no secret."""
     entry = route(name)
     if not entry:
         log(f"route {name!r} not found in {subs_path().name}")
         return None
+    if expected is not None and any((entry.get(k) or {}) != value if k == "deliver_extra"
+                                    else entry.get(k) != value for k, value in expected.items()):
+        log(f"route {name!r} no longer matches its delivery contract")
+        return None
     secret = entry.get("secret") or ""
     try:
-        url = url_for(name, host)
+        base = config.webhook_host(host or entry.get("host"))
+        profile = entry.get("profile", "default")
+        url = (f"{base}/webhooks/{name}" if profile == "default"
+               else f"{base}/p/{profile}/webhooks/{name}") if base else None
     except config.ConfigError as exc:
         log(f"route {name!r} has invalid webhook host: {exc}")
         return None
@@ -161,9 +168,10 @@ def target(name: str, host: str | None = None):
     return url, secret.encode()
 
 
-def fire(name: str, event: str, payload: dict, tag: str, host: str | None = None) -> bool:
+def fire(name: str, event: str, payload: dict, tag: str, host: str | None = None,
+         *, expected: dict | None = None) -> bool:
     """POST a signed payload at a route. Returns True only on an HTTP 2xx."""
-    target_ = target(name, host)
+    target_ = target(name, host, expected=expected)
     if not target_:
         return False
     url, secret = target_
@@ -186,10 +194,15 @@ def fire(name: str, event: str, payload: dict, tag: str, host: str | None = None
 
 def new_route(name: str, *, profile: str, prompt: str, events: list[str], script: str,
                deliver: str, description: str = "", skills: list[str] | None = None,
-               host: str | None = None) -> dict:
+               host: str | None = None, deliver_only: bool = False,
+               deliver_extra: dict | None = None) -> dict:
     """Create (or update) a route entry and write it back to the gateway's file.
 
     The secret is generated here, not asked for. 0600, same file the gateway reads.
+
+    ``deliver_only`` is the gateway's own "no agent here" mode: the rendered prompt *is* the
+    message that reaches ``deliver``, with no model run and nothing to review afterwards. That
+    is what makes an observer route a feed rather than a third seat.
     """
     import secrets as _secrets
 
@@ -210,6 +223,12 @@ def new_route(name: str, *, profile: str, prompt: str, events: list[str], script
             "created_at": prior.get("created_at") or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "script": script,
         }
+        # Written only when asked for, so the seats' routes keep exactly the shape they had:
+        # an entry that gains a key the gateway has not seen yet is a change nobody reviewed.
+        if deliver_only:
+            entry["deliver_only"] = True
+        if deliver_extra:
+            entry["deliver_extra"] = dict(deliver_extra)
         if host:
             entry["host"] = host
         data[name] = entry

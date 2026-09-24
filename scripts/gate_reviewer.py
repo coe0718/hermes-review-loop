@@ -25,7 +25,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from review_loop import gate, gh  # noqa: E402
+from review_loop import gate, gh, observer  # noqa: E402
 from review_loop.util import log, silence  # noqa: E402
 
 ACTIONS = {"opened", "ready_for_review", "reopened", "review_requested"}
@@ -39,19 +39,29 @@ def main() -> None:
 
     if action == "closed":
         number = gate.number_of(payload, pr)
-        gate.reclaim(loop, number, "merged" if pr.get("merged") else "closed")
+        # A delayed close can arrive after a reopen, or while GitHub is unavailable. Neither
+        # the event snapshot nor cleanup's quiet zero exit code proves anything was removed.
+        current = gh.pr(loop, number)
+        if (not isinstance(current, dict) or current.get("number") != number
+                or current.get("state") != "closed"):
+            silence("close event is stale or current PR state is unavailable")
+        closing = "merged" if (current.get("merged") or current.get("merged_at")) else "closed"
+        gate.reclaim(loop, number, closing)
+        # Reclaim is best-effort and has no success receipt. Report the close, not freed disk.
+        observer.notify(loop, st, "closed", number, (current.get("head") or {}).get("sha") or "",
+                        identity=closing, outcome=closing, next_turn="nothing — cleanup attempted")
         silence()
 
     if action not in ACTIONS:
         silence(f"action {action!r} is not a review trigger")
 
+    sender = ((payload.get("sender") or {}).get("login") or "").lower()
     if action == "review_requested":
         # Only an explicit request for THIS seat counts, and only from the fixer side: a
         # request aimed at another reviewer, or from a stranger, is somebody else's business.
         requested = ((payload.get("requested_reviewer") or {}).get("login") or "").lower()
         if requested != loop["reviewer_seat"]:
             silence(f"review requested from {requested or 'nobody'} — not this seat")
-        sender = ((payload.get("sender") or {}).get("login") or "").lower()
         if sender not in set(loop["fixers"]) | {"patchhive"} and sender not in loop["reviewers"]:
             silence(f"sender {sender or 'unknown'} is not a fixer")
 
@@ -66,16 +76,17 @@ def main() -> None:
     seat = "reviewer"
     number = gate.number_of(payload, pr)
     head = gate.head_of(pr)
-    if action == "review_requested":
-        current = gh.pr(loop, number)
-        if (not isinstance(current, dict) or current.get("number") != number
-                or current.get("state") != "open"
-                or (current.get("head") or {}).get("sha") != head):
-            silence("review request is stale or current PR is unavailable")
-        # Eligibility must be judged against current facts, not only the old snapshot.
-        if (current.get("draft") or (current.get("base") or {}).get("ref") != loop["base"]
-                or ((current.get("user") or {}).get("login") or "").lower() not in loop["fixers"]):
-            silence("current PR is no longer eligible for this review")
+    # Every trigger can arrive after a push or close. Never claim a seat or escalate
+    # using the event snapshot if GitHub now points at another head.
+    current = gh.pr(loop, number)
+    if (not isinstance(current, dict) or current.get("number") != number
+            or current.get("state") != "open"
+            or (current.get("head") or {}).get("sha") != head):
+        silence("review trigger is stale or current PR is unavailable")
+    # Eligibility must be judged against current facts, not only the old snapshot.
+    if (current.get("draft") or (current.get("base") or {}).get("ref") != loop["base"]
+            or ((current.get("user") or {}).get("login") or "").lower() not in loop["fixers"]):
+        silence("current PR is no longer eligible for this review")
 
     reviews = gate.fetch_reviews(loop, number)
     if gate.reviewed_at_head(reviews, loop, head):
@@ -105,6 +116,13 @@ def main() -> None:
                                        role="reviewer")
     st.inflight(f"review:{number}:{head}", record=True)
     gate.ping_start(loop, seat, gate.start_text(loop, seat, number, head, rounds + 1))
+    # The feed is told last: by now the seat is claimed, the run is recorded and the seat's own
+    # channel has been pinged, so a destination that hangs costs seconds at the end of a gate and
+    # never a handoff, a queue slot or a seat. `handoff` is the fixer's push-then-ask; everything
+    # else here is a first look at a head nobody has reviewed yet.
+    observer.notify(loop, st, "handoff" if action == "review_requested" else "opened", number, head,
+                    identity=action, actor=sender if action == "review_requested" else author,
+                    next_turn="reviewer", round_no=rounds + 1)
     print(json.dumps(payload))
 
 

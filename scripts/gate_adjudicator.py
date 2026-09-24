@@ -30,7 +30,9 @@ def main() -> None:
     if type(number) is not int or number < 1 or fields.get("pr") != number:
         silence("invalid breach PR number")
     marker = st.breach_get(number)
-    if marker.get("status") != "awaiting-adjudication" or marker.get("pr") != number:
+    if (marker.get("status") != "awaiting-adjudication"
+            and not (marker.get("status") == "delivery-pending"
+                     and marker.get("delivery_token"))) or marker.get("pr") != number:
         silence("no pending breach for this PR")
     head = marker.get("head")
     rounds = marker.get("rounds")
@@ -49,6 +51,12 @@ def main() -> None:
     if author not in loop["fixers"] or (pr.get("head") or {}).get("sha") != head:
         silence("PR author or head no longer matches breach")
     reviews = gate.fetch_reviews(loop, number)
+    # An approval can arrive after the cap breach was parked but before its wake.
+    # Only the latest effective same-head verdict settles it; an older approval
+    # cannot veto a later changes-requested verdict at the cap.
+    latest = gate.latest_effective_review_at_head(reviews, loop, head)
+    if latest is not None and gh.review_state(latest) == "APPROVED":
+        silence("PR head was approved after the breach")
     if len(gate.verdicts(reviews, loop)) < loop["cap"]:
         silence("review cap is no longer spent")
     # The signed route may redeliver the same POST. Claim only after all fresh
