@@ -464,15 +464,20 @@ def check_cron_job(loop: dict) -> Check:
         return Check("cron:job", ABSENT, f"no job named {wanted!r} in {path}",
                      cron_fix(loop))
     job_id = str(job.get("id") or "?")
-    if job.get("enabled") is False or str(job.get("state") or "") == "paused":
-        return Check("cron:job", MISMATCH, f"{job_id} ({wanted}) is paused",
-                     f"`hermes cron resume {job_id}`: a paused watchdog never reports a stall")
+    if not job.get("enabled", True) or job.get("state") in ("paused", "completed"):
+        state = job.get("state")
+        reason = ("completed" if state == "completed" else "paused or disabled")
+        fix = (cron_fix(loop) if state == "completed" else
+               f"`hermes cron resume {job_id}`: the scheduler skips a disabled watchdog")
+        return Check("cron:job", MISMATCH, f"{job_id} ({wanted}) is {reason}",
+                     fix)
     if job.get("script") != SHIM_NAME or job.get("no_agent") is not True:
         return Check("cron:job", MISMATCH,
                      f"{job_id} runs {job.get('script')!r} (no_agent={job.get('no_agent')!r}), "
                      f"expected {SHIM_NAME!r} with --no-agent", cron_fix(loop))
     schedule_data = job.get("schedule")
     valid = False
+    missing_croniter = False
     if isinstance(schedule_data, dict):
         kind = schedule_data.get("kind")
         if kind == "interval":
@@ -483,11 +488,15 @@ def check_cron_job(loop: dict) -> Check:
             if isinstance(expression, str):
                 try:
                     from croniter import croniter
-                    croniter(expression)
-                    valid = True
-                except (ImportError, ValueError, TypeError, KeyError):
-                    valid = False
-    if not valid:
+                except ImportError:
+                    missing_croniter = True
+                else:
+                    try:
+                        croniter(expression)
+                        valid = True
+                    except (ValueError, TypeError, KeyError):
+                        pass
+    if not valid and not missing_croniter:
         return Check("cron:job", MISMATCH,
                      f"{job_id} has no valid stored schedule (display text does not schedule work)",
                      cron_fix(loop))
@@ -498,8 +507,13 @@ def check_cron_job(loop: dict) -> Check:
         datetime.fromisoformat(next_run.replace("Z", "+00:00"))
     except ValueError:
         return Check("cron:job", MISMATCH,
-                     f"{job_id} has no valid next_run_at — the scheduler will never select it",
+                     f"{job_id} has no valid next_run_at — cannot verify the next wake "
+                     "(the scheduler may recompute a missing value for a recurring job)",
                      cron_fix(loop))
+    if missing_croniter:
+        return Check("cron:job", UNKNOWN,
+                     f"{job_id} cron schedule could not be validated here (croniter unavailable); "
+                     "the stored job may be valid — check on the scheduler host")
     schedule = (job.get("schedule_display")
                 or ((job.get("schedule") or {}).get("display") if isinstance(job.get("schedule"), dict)
                     else "")

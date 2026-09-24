@@ -2900,6 +2900,39 @@ def group_doctor() -> None:
     check("  with the command to resume it", "❌ cron:job" in out
           and "hermes cron resume watchdog-job" in out, True)
 
+    for enabled in (None, 0, ""):
+        install_doctor_fixture()
+        cron_file = TMP / "hermes-home" / "cron" / "jobs.json"
+        jobs = json.loads(cron_file.read_text())
+        jobs["jobs"][0]["enabled"] = enabled
+        cron_file.write_text(json.dumps(jobs))
+        rc, out = run_doctor("--loop", "widgets")
+        check(f"falsey enabled={enabled!r} cannot verify a wake", rc, 1)
+        check("  job is a mismatch, not verified", "❌ cron:job" in out
+              and "✅ cron:job" not in out, True)
+
+    install_doctor_fixture()
+    cron_file = TMP / "hermes-home" / "cron" / "jobs.json"
+    jobs = json.loads(cron_file.read_text())
+    jobs["jobs"][0]["state"] = "completed"
+    cron_file.write_text(json.dumps(jobs))
+    rc, out = run_doctor("--loop", "widgets")
+    check("completed watchdog cannot verify a wake", rc, 1)
+    check("  terminal state is identified", "❌ cron:job" in out and "completed" in out, True)
+
+    install_doctor_fixture()
+    jobs = json.loads(cron_file.read_text())
+    jobs["jobs"][0]["schedule"] = {"kind": "cron", "expr": "*/15 * * * *"}
+    cron_file.write_text(json.dumps(jobs))
+    with mock.patch.dict(sys.modules, {"croniter": None}):
+        rc, out = run_doctor("--loop", "widgets")
+        strict_rc, strict_out = run_doctor("--loop", "widgets", "--strict")
+    check("missing croniter leaves cron expression undecided", rc, 0)
+    check("  reports unknown validation, not invalid stored job",
+          "⚠️ cron:job" in out and "❌ cron:job" not in out and "croniter" in out, True)
+    check("  strict mode fails undecided validation", strict_rc, 1)
+    check("  strict mode keeps the unknown label", "⚠️ cron:job" in strict_out, True)
+
     for next_run in (None, "", "not-a-date"):
         install_doctor_fixture()
         cron_file = TMP / "hermes-home" / "cron" / "jobs.json"
@@ -2910,6 +2943,8 @@ def group_doctor() -> None:
         check(f"enabled watchdog with next_run_at={next_run!r} fails", rc, 1)
         check("  cannot claim the watchdog will fire", "❌ cron:job" in out
               and "next_run_at" in out, True)
+        check("  does not claim the scheduler will never select it",
+              "will never select it" in out, False)
 
     install_doctor_fixture()
     cron_file.write_text(json.dumps({"jobs": []}))
@@ -3140,7 +3175,8 @@ def group_doctor() -> None:
     # A standalone checkout deliberately has no croniter; installed Hermes does.
     import importlib.util
     if importlib.util.find_spec("croniter") is None:
-        check("cron schedule fails closed without croniter", "❌ cron:job" in out, True)
+        check("cron schedule is undecided without croniter", rc == 0
+              and "⚠️ cron:job" in out and "❌ cron:job" not in out, True)
     else:
         check("real Hermes cron schedule passes", rc, 0)
 
@@ -3149,7 +3185,11 @@ def group_doctor() -> None:
     jobs["jobs"][0]["schedule"] = {"kind": "cron", "expr": "61 25 * * *"}
     job_file.write_text(json.dumps(jobs))
     rc, out = run_doctor("--loop", "widgets")
-    check("invalid cron expression fails", "❌ cron:job" in out, True)
+    if importlib.util.find_spec("croniter") is None:
+        check("invalid cron expression cannot be diagnosed without validator",
+              "⚠️ cron:job" in out and "❌ cron:job" not in out, True)
+    else:
+        check("invalid cron expression fails", "❌ cron:job" in out, True)
 
     install_doctor_fixture()
     jobs = json.loads(job_file.read_text())
