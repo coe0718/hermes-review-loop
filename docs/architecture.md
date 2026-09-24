@@ -23,16 +23,24 @@ A **seat** is a role, not an agent: `reviewer` and `fixer`. Each seat is bound t
 (the way it is woken). Both seats are declared per loop, so the same install can run a different
 pair of agents on a different repository with a different budget.
 
-A seat is a **capacity, not a mutex**. `concurrency` says how many PRs it may work at once:
+A seat is a **capacity, not a mutex**, and each seat has its own:
 
-- `concurrency: 1` — serialized. A second request queues and drains when the seat frees.
-- `concurrency: 2+` — **parallel with isolation**: each PR runs in its own clone with its own build
-  and temp directories, so two runs cannot corrupt each other. Requires `clone` in the loop config,
-  because without a source to isolate from the config loader refuses the setting outright.
+| setting | effect |
+|---|---|
+| `concurrency` (loop) | the default limit for both seats |
+| `seats.reviewer.concurrency` | the reviewer's own limit (Vex: two reviews at once) |
+| `seats.fixer.concurrency` | the fixer's own limit (Drey: one fix at a time) |
 
-The ledger is keyed by **PR**, not by seat, so the same PR never runs twice even with a free slot —
-and the same *head* never runs twice at all (in-flight marks). A slot expires (`ttl_min`), so a
-crashed run cannot wedge a loop.
+`hermes review-loop set --reviewer-concurrency 2 --fixer-concurrency 1` is the shape Jeremy asked
+for: *Drey works on X PRs at once MAX, Vex reviews Y at once, everything else queues.* A seat-level
+value wins over the loop default; `1` (serialized) is the fallback everywhere. Above 1 a loop
+**must** have a `clone`, because a parallel run that cannot be isolated would share a checkout —
+and that rail is checked against the *effective* value per seat, so a seat-level 2 is caught even
+when the loop default stays 1.
+
+The ledger is keyed by **PR**, so the same PR never runs twice even with a free slot — and the same
+*head* never runs twice at all (in-flight marks). A slot expires (`ttl_min`), so a crashed run
+cannot wedge a loop.
 
 ## Isolation (parallel without the shared-clone bug)
 
@@ -40,14 +48,21 @@ Isolation is not a performance feature; it is the difference between a parallel 
 publishes **wrong verdicts**. A review mutates its checkout — worktrees, `checkout --detach`,
 stashes, `merge --abort` — so two runs in one clone delete each other's working trees mid-review.
 
-Per PR, the gate prepares:
+Per PR **and per seat**, the gate prepares:
 
 ```
 {state_dir}/artifacts/<PR>/
-├── repo/     own clone: own origin, own credential helper, own detached checkout at the head
-├── target/   CARGO_TARGET_DIR — reused across that PR's rounds (the cold build is paid once)
-└── tmp/      TMPDIR, so nothing collides in a shared /tmp
+├── reviewer/   own clone, target/, tmp/ — what the review runs in
+└── fixer/      own clone, target/, tmp/ — what the fix runs in
 ```
+
+Per seat, not merely per PR, because the two seats genuinely overlap on one PR: a fix run is only
+released when the reviewer's gate *observes* the push, so the fixer's process may still be winding
+down while the review starts. One workspace per PR would have them sharing a checkout — the exact
+corruption isolation exists to prevent.
+
+Each clone is its own `git clone --local` (hardlinked object store), its own `origin`, its own
+credential helper, and its own detached checkout at the head under review.
 
 Cheap by construction: the clone is `git clone --local`, which hardlinks the object store, and git
 data is tiny next to build output (the loop this was built for: **25 MB of git, 177 GB of build

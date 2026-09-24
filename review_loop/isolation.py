@@ -42,15 +42,21 @@ TARGET_DIR = "target"
 TMP_DIR = "tmp"
 
 
-def paths(loop: dict, number: int) -> dict:
-    """The isolation root for a PR, and the directories inside it. Pure — creates nothing."""
-    root = config.artifacts_dir(loop, number)
+def paths(loop: dict, number: int, seat: str = "reviewer") -> dict:
+    """The isolation root for a PR *and a seat*, and the directories inside it. Creates nothing.
+
+    Per seat, not merely per PR, because the two seats can overlap on the same PR: a fix run is
+    only released when the reviewer's gate *observes* the push, so the fixer's process may still be
+    winding down while the review starts. One workspace per PR would have them sharing a checkout —
+    the exact corruption isolation exists to prevent.
+    """
+    root = config.artifacts_dir(loop, number) / seat
     return {"root": root, "clone": root / CLONE_DIR, "target": root / TARGET_DIR,
             "tmp": root / TMP_DIR}
 
 
-def exists(loop: dict, number: int) -> bool:
-    return (paths(loop, number)["clone"] / ".git").exists()
+def exists(loop: dict, number: int, seat: str = "reviewer") -> bool:
+    return (paths(loop, number, seat)["clone"] / ".git").exists()
 
 
 def _git(*args: str, cwd=None, timeout: int = 300) -> subprocess.CompletedProcess:
@@ -80,8 +86,8 @@ def _configure(clone: pathlib.Path, loop: dict, login: str) -> None:
     _git("config", "user.email", f"{login or 'review-loop'}@users.noreply.github.com", cwd=clone)
 
 
-def ensure(loop: dict, number: int, head: str = "", login: str = "") -> dict | None:
-    """Create or reuse this PR's isolated workspace and check out ``head`` in it.
+def ensure(loop: dict, number: int, seat: str, head: str = "", login: str = "") -> dict | None:
+    """Create or reuse this PR-and-seat workspace and check out ``head`` in it.
 
     Returns the workspace (root, clone, target, tmp, env, created) or ``None`` when isolation is
     not possible. Callers treat ``None`` as "no isolated run", never as "use the shared clone".
@@ -90,7 +96,7 @@ def ensure(loop: dict, number: int, head: str = "", login: str = "") -> dict | N
     if not source or not (source / ".git").exists():
         return None  # nothing to clone from — the loop has no clone configured
 
-    p = paths(loop, number)
+    p = paths(loop, number, seat)
     root, clone = p["root"], p["clone"]
 
     # A rail with teeth: the configured clone must never live inside the isolation root, or a
@@ -150,27 +156,28 @@ def ensure(loop: dict, number: int, head: str = "", login: str = "") -> dict | N
                 return None
 
     return {"root": str(root), "clone": str(clone), "target": str(p["target"]),
-            "tmp": str(p["tmp"]), "env": env(loop, number), "created": created}
+            "tmp": str(p["tmp"]), "env": env(loop, number, seat), "created": created}
 
 
-def env(loop: dict, number: int) -> dict:
+def env(loop: dict, number: int, seat: str = "reviewer") -> dict:
     """The environment a run needs so its build output lands in its own sandbox.
 
     ``CARGO_TARGET_DIR`` and ``TMPDIR`` are the two that matter for the Rust harnesses this was
     built against: without them two runs share one target directory and one /tmp namespace and
     corrupt each other while looking isolated. Set them per run — never globally.
     """
-    p = paths(loop, number)
+    p = paths(loop, number, seat)
     merged = {"CARGO_TARGET_DIR": str(p["target"]), "TMPDIR": str(p["tmp"]),
-              "REVIEW_LOOP_WORKSPACE": str(p["root"]), "REVIEW_LOOP_PR": str(number)}
+              "REVIEW_LOOP_WORKSPACE": str(p["root"]), "REVIEW_LOOP_PR": str(number),
+              "REVIEW_LOOP_SEAT": seat}
     if loop.get("clone"):
         merged["REVIEW_LOOP_SHARED_CLONE"] = str(config.clone_path(loop))
     return merged
 
 
-def describe(workspace: dict | None, loop: dict, number: int) -> str:
+def describe(workspace: dict | None, loop: dict, number: int, seat: str = "reviewer") -> str:
     """One paragraph for a prompt: where this run works and what it must not touch."""
-    p = paths(loop, number)
+    p = paths(loop, number, seat)
     if not workspace:
         shared = loop.get("clone") or "(no clone configured)"
         return (f"No isolated workspace was prepared for this PR, so run against the shared clone "
@@ -185,5 +192,6 @@ def describe(workspace: dict | None, loop: dict, number: int) -> str:
             f"  logs:   {workspace['root']}\n"
             f"That clone is yours alone (its own origin, its own credential helper, its own "
             f"detached checkout) — commit and push from there if you are the fixer. Never touch "
-            f"the shared clone at {loop.get('clone') or '(none)'} and never write inside the "
-            f"repository without committing to the PR branch.")
+            f"the shared clone at {loop.get('clone') or '(none)'}, the other seat's workspace "
+            f"under {p['root'].parent}, or the repository itself without committing to the PR "
+            f"branch.")

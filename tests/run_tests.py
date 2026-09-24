@@ -402,7 +402,8 @@ def group_settings() -> None:
     def ns(**kw):
         base = dict(loop="widgets", concurrency=None, cap=None, clone=None, base=None,
                     grace_min=None, marker_grace_min=None, ttl_min=None,
-                    inflight_ttl_min=None, host=None)
+                    inflight_ttl_min=None, host=None, reviewer_concurrency=None,
+                    fixer_concurrency=None)
         base.update(kw)
         return SimpleNamespace(**base)
 
@@ -423,17 +424,31 @@ def group_settings() -> None:
     check("set 2 → accepted", rc, 0)
     check("  written to the config", file_loop().get("concurrency"), 2)
     check("  and it says what changed", "concurrency: 1 → 2" in out, True)
-    check("  and where the sandboxes go", "own clone under" in out, True)
+    check("  and the effective capacities", "parallel now: reviewer 2 · fixer 2" in out, True)
+
+    # per seat: Drey and Vex get their own numbers
+    rc, out = call(fixer_concurrency=1)
+    check("fixer-only setting → accepted", rc, 0)
+    check("  fixer written", file_loop()["seats"]["fixer"]["concurrency"], 1)
+    check("  reviewer keeps the loop default", file_loop()["seats"].get("reviewer", {}).get(
+        "concurrency"), None)
+    check("  and it says who it applies to", "(this seat only)" in out, True)
+    check("  effective split reported", "parallel now: reviewer 2 · fixer 1" in out, True)
+
+    rc, out = call(concurrency=3)
+    check("changing the default again → accepted", rc, 0)
+    check("  and it flags the seat that overrides it",
+          "fixer has its own concurrency" in out, True)
 
     rc, out = call(cap=4)
     check("set cap → accepted", rc, 0)
     check("  cap written", file_loop().get("cap"), 4)
-    check("  concurrency untouched", file_loop().get("concurrency"), 2)
+    check("  capacities untouched", config.seat_concurrency(config.load_id("widgets"), "fixer"), 1)
 
     rc, out = call(concurrency=0)
     check("set 0 → refused", rc, 2)
     check("  with the reason", "must be >= 1" in out, True)
-    check("  nothing written", file_loop().get("concurrency"), 2)
+    check("  nothing written", file_loop().get("concurrency"), 3)
 
     rc, out = call()
     check("set with nothing → says so", "nothing to change" in out, True)
@@ -451,6 +466,11 @@ def group_settings() -> None:
     check("  the loop still says serialized",
           json.loads((LOOPS_DIR / "solo.json").read_text())["concurrency"], 1)
 
+    # a seat-level number is caught even when the loop default stays serialized
+    rc, out = call(loop="solo", reviewer_concurrency=2)
+    check("seat-level parallel without a clone → refused", rc, 2)
+    check("  and it names the seat", "seats.reviewer.concurrency > 1 requires 'clone'" in out, True)
+
     # the round trip that a stranger's install depends on: what we write must read back
     rt = config.normalize({"id": "rt", "repo": "acme/rt", "fixers": [FIXER],
                            "reviewers": [REVIEWER], "reviewer_seat": SEAT,
@@ -467,11 +487,11 @@ def group_settings() -> None:
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         cli.cmd_status(ns(loop="widgets"))
-    check("status reports the setting", "parallel:   2 PR(s) per seat" in buf.getvalue(), True)
+    check("status reports the setting", "parallel:   reviewer 3 · fixer 1" in buf.getvalue(), True)
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         cli.cmd_list(ns())
-    check("list reports it too", "parallel=2" in buf.getvalue(), True)
+    check("list reports it too", "reviewer=3 fixer=1" in buf.getvalue(), True)
 
 
 def group_budget() -> None:
@@ -671,6 +691,46 @@ def group_parallel() -> None:
     check("no sandbox + concurrency 2 → queued", kind, "SILENT")
     check("  and it says isolation is why", "no isolated workspace" in err, True)
     check("  no slot left held", load_state("locks.json").get("reviewer", {}), {})
+
+    section("parallel — each seat its own number, each seat its own sandbox")
+    reset(prs={"7": pr(7), "9": pr(9)})
+    set_concurrency(1)                     # loop default stays serialized...
+    cfg = json.loads((LOOPS_DIR / "widgets.json").read_text())
+    cfg["seats"]["reviewer"]["concurrency"] = 2      # ...Vex gets 2, Drey keeps 1
+    (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
+    head = real_head()
+    # A verdict at the older head so the fixer has something to answer, plus a newer head so the
+    # reviewer still has something to review: the same PR, two different turns.
+    subprocess.run(["git", "-C", str(CLONE), "commit", "--allow-empty", "-qm", "second"],
+                   capture_output=True, text=True)
+    newer = real_head()
+    set_prs({"7": {**pr(7, head=newer), "reviews": [review(REVIEWER, head=head, rid=5)]},
+             "9": {**pr(9, head=newer), "reviews": [review(REVIEWER, head=head, rid=6)]}})
+
+    kind_r7, out_r7, _ = run("gate_reviewer.py", pr_payload(7, head=newer))
+    check("reviewer 2 → first review runs", kind_r7, "FIRE")
+    check("reviewer 2 → second review runs too",
+          run("gate_reviewer.py", pr_payload(9, head=newer))[0], "FIRE")
+    kind_f7, out_f7, _ = run("gate_fixer.py", review_payload(7, head=newer, rid=5))
+    check("fixer 1 → its fix runs", kind_f7, "FIRE")
+    check("  the fix released that PR's review slot",
+          len(load_state("locks.json").get("reviewer", {})), 1)
+    kind_f9, _, err_f9 = run("gate_fixer.py", review_payload(9, head=newer, rid=6))
+    check("fixer 1 → a second fix queues", kind_f9, "SILENT")
+    check("  and it says capacity", "at capacity 1/1" in err_f9, True)
+
+    iso_r = json.loads(out_r7)["_loop"]["isolation"]
+    iso_f = json.loads(out_f7)["_loop"]["isolation"]
+    check("the two seats never share a sandbox", iso_r["clone"] != iso_f["clone"], True)
+    check("  the reviewer's is a reviewer workspace", f"/{7}/reviewer/" in iso_r["clone"], True)
+    check("  the fixer's is a fixer workspace", f"/{7}/fixer/" in iso_f["clone"], True)
+    check("  both are real clones",
+          (pathlib.Path(iso_r["clone"]) / ".git").exists()
+          and (pathlib.Path(iso_f["clone"]) / ".git").exists(), True)
+    check("  the payload reports its own seat", iso_f["seat"], "fixer")
+    check("  at the head under review",
+          subprocess.run(["git", "-C", iso_f["clone"], "rev-parse", "HEAD"],
+                         capture_output=True, text=True).stdout.strip(), newer)
 
 
 def group_watchdog() -> None:

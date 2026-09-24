@@ -76,30 +76,32 @@ def artifacts_for(loop: dict, number: int) -> str:
     return str(config.artifacts_dir(loop, number))
 
 
-def isolation_block(loop: dict, number: int, workspace: dict | None) -> dict:
+def isolation_block(loop: dict, number: int, workspace: dict | None, seat: str) -> dict:
     """Where this run is allowed to work — always present, so no prompt key renders as text.
 
     The gate decided the workspace; the prompt only repeats the decision. ``isolated: false``
     means no sandbox could be built, which is only allowed to happen at ``concurrency = 1``.
     """
-    p = isolation.paths(loop, number)
+    p = isolation.paths(loop, number, seat)
     shared = str(config.clone_path(loop)) if loop.get("clone") else ""
     if workspace:
         env = " ".join(f"{k}={v}" for k, v in workspace["env"].items()
                        if k in ("CARGO_TARGET_DIR", "TMPDIR"))
         return {"isolated": True, "root": workspace["root"], "clone": workspace["clone"],
                 "target": workspace["target"], "tmp": workspace["tmp"], "env": env,
-                "shared": shared, "brief": isolation.describe(workspace, loop, number)}
+                "shared": shared, "seat": seat,
+                "brief": isolation.describe(workspace, loop, number, seat)}
     return {"isolated": False, "root": str(p["root"]), "clone": shared or str(p["root"]),
-            "target": "", "tmp": "", "env": "", "shared": shared,
-            "brief": isolation.describe(None, loop, number)}
+            "target": "", "tmp": "", "env": "", "shared": shared, "seat": seat,
+            "brief": isolation.describe(None, loop, number, seat)}
 
 
-def loop_block(loop: dict, number: int, head: str, workspace: dict | None = None, **extra) -> dict:
+def loop_block(loop: dict, number: int, head: str, workspace: dict | None = None,
+               seat: str = "reviewer", **extra) -> dict:
     block = {"pr": number, "repo": loop["repo"], "head": head, "cap": loop["cap"],
              "url": pr_url(loop, number), "artifacts": artifacts_for(loop, number),
-             "concurrency": int(loop.get("concurrency") or 1),
-             "isolation": isolation_block(loop, number, workspace)}
+             "concurrency": config.seat_concurrency(loop, seat),
+             "isolation": isolation_block(loop, number, workspace, seat)}
     block.update(extra)
     return block
 
@@ -271,7 +273,7 @@ def take_seat(loop: dict, st: state_mod.LoopState, seat: str, number: int, head:
     the caller would rather have a queued PR than a wrong one.
     """
     key = seat_key(loop, number)
-    capacity = int(loop.get("concurrency") or 1)
+    capacity = config.seat_concurrency(loop, seat)
 
     if st.is_active(seat, key):
         log(f"{seat} is already running {key} — refusing a second run at the same PR")
@@ -288,7 +290,7 @@ def take_seat(loop: dict, st: state_mod.LoopState, seat: str, number: int, head:
 
     st.acquire(seat, key, head, why)
 
-    workspace = isolation.ensure(loop, number, head, login=login or "")
+    workspace = isolation.ensure(loop, number, seat, head, login=login or "")
     if workspace is None and capacity > 1:
         st.release_if(seat, key)
         st.queue_add(seat, key, head, pr_url(loop, number),

@@ -64,7 +64,7 @@ def drain(loop: dict, st: state_mod.LoopState, seat: str, quiet: bool = False) -
     items = st.queue_items(seat)
     if not items:
         return 0
-    capacity = int(loop.get("concurrency") or 1)
+    capacity = config.seat_concurrency(loop, seat)
     live = st.active(seat)
     free = capacity - len(live)
     if free <= 0:

@@ -67,6 +67,23 @@ DEFAULTS: dict = {
 SEAT_KEYS = ("reviewer", "fixer")
 
 
+def seat_concurrency(loop: dict, seat: str) -> int:
+    """How many PRs this seat may work at once.
+
+    A seat's own ``concurrency`` wins; the loop-level value is the default for every seat; and 1
+    (serialized) is the fallback. Per seat is the shape that matters: a fixer and a reviewer are
+    different models on different budgets, and wanting two reviews in flight rarely means wanting
+    two fixes in flight.
+    """
+    seat_cfg = (loop.get("seats") or {}).get(seat) or {}
+    value = seat_cfg.get("concurrency")
+    if value is None or value == "":
+        value = loop.get("concurrency", 1)
+    if value is None or value == "":
+        value = 1
+    return int(value)
+
+
 class ConfigError(Exception):
     """A loop file that cannot be trusted to drive a run."""
 
@@ -150,10 +167,24 @@ def normalize(raw: dict, source: pathlib.Path | None = None) -> dict:
     loop["concurrency"] = int(raw_capacity)
     if loop["concurrency"] < 1:
         raise ConfigError(f"{where}: 'concurrency' must be >= 1 (1 = serialized)")
-    if loop["concurrency"] > 1 and not loop.get("clone"):
-        # Above one run per seat, isolation is not a preference: without a clone to isolate from,
-        # two runs would share whatever checkout they find, which is the wrong-verdict bug.
-        raise ConfigError(f"{where}: 'concurrency' > 1 requires 'clone' (runs must be isolated)")
+
+    for seat in SEAT_KEYS:
+        raw = seats[seat].get("concurrency")
+        if raw is None or raw == "":
+            continue
+        seats[seat]["concurrency"] = int(raw)
+        if seats[seat]["concurrency"] < 1:
+            raise ConfigError(f"{where}: seats.{seat}.concurrency must be >= 1 (1 = serialized)")
+
+    if not loop.get("clone"):
+        # Above one run at once, isolation is not a preference: without a clone to isolate from,
+        # two runs would share whatever checkout they find, which is the wrong-verdict bug. Check
+        # the effective value per seat, so a seat-level 2 is caught even when the loop default is 1.
+        for seat in SEAT_KEYS:
+            if seat_concurrency(loop, seat) > 1:
+                raise ConfigError(
+                    f"{where}: seats.{seat}.concurrency > 1 requires 'clone' "
+                    f"(runs must be isolated)")
 
     loop["host"] = str(loop.get("host") or DEFAULTS["host"]).rstrip("/")
     if not loop.get("state_dir"):

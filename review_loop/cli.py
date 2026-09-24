@@ -171,7 +171,8 @@ def cmd_init(args) -> int:
             "fixer": {"profile": args.fixer_profile, "route": "",
                       "login": args.fixer[0], "agent": args.fixer_agent},
         },
-        "adjudicator": {"route": args.adjudicator_route, "profile": args.adjudicator_profile} if args.adjudicator_route else {},
+        "adjudicator": ({"route": args.adjudicator_route, "profile": args.adjudicator_profile}
+                        if args.adjudicator_route else {}),
         "skill": args.skill,
         "tokens": tokens, "read_token": args.read_token or (args.reviewer_seat or args.reviewer[0]),
         "clone": args.clone, "roots": args.root or [],
@@ -181,6 +182,10 @@ def cmd_init(args) -> int:
     if not args.reviewer_seat and len(args.reviewer) > 1:
         print("with several reviewer logins, --reviewer-seat names which one this loop's route serves")
         return 2
+    # A seat-level capacity wins over the loop default, so only write it when it was asked for.
+    for seat, value in (("reviewer", args.reviewer_concurrency), ("fixer", args.fixer_concurrency)):
+        if value is not None:
+            raw["seats"][seat]["concurrency"] = value
     names = {"reviewer": f"{raw['id']}-review", "fixer": f"{raw['id']}-fix"}
     raw["seats"]["reviewer"]["route"] = names["reviewer"]
     raw["seats"]["fixer"]["route"] = names["fixer"]
@@ -226,30 +231,44 @@ def cmd_set(args) -> int:
               "inflight_ttl_min": args.inflight_ttl_min, "host": args.host}
     changes = {k: v for k, v in wanted.items()
                if v is not None and v != "" and v != loop.get(k)}
-    if not changes:
+
+    seats = {seat: dict(cfg) for seat, cfg in loop["seats"].items()}
+    seat_changes = {}
+    for seat, value in (("reviewer", args.reviewer_concurrency), ("fixer", args.fixer_concurrency)):
+        if value is not None and value != config.seat_concurrency(loop, seat):
+            seats[seat]["concurrency"] = value
+            seat_changes[seat] = value
+
+    if not changes and not seat_changes:
         print("nothing to change — pass at least one setting "
-              "(--concurrency, --cap, --clone, --base, --grace-min, ...)")
+              "(--concurrency, --reviewer-concurrency, --fixer-concurrency, --cap, --clone, ...)")
         return 0
 
     try:
-        updated = config.normalize({**loop, **changes})
+        updated = config.normalize({**loop, **changes, "seats": seats})
     except config.ConfigError as exc:
         print(f"refused: {exc}")
         return 2
 
     path = _write_config(updated)
     for key, value in changes.items():
-        was = loop.get(key)
-        print(f"  {key}: {was!r} → {value!r}"
-              + ("   (each seat runs this many PRs at once)" if key == "concurrency" else ""))
+        print(f"  {key}: {loop.get(key)!r} → {value!r}")
+    for seat, value in seat_changes.items():
+        was = config.seat_concurrency(loop, seat)
+        print(f"  {seat} concurrency: {was} → {value}  (this seat only)")
     print(f"loop config updated: {path}")
+
     if "concurrency" in changes:
-        capacity = updated["concurrency"]
-        if capacity > 1:
-            print(f"parallel: up to {capacity} PRs per seat, each in its own clone under "
-                  f"{config.artifacts_dir(updated, 0).parent}")
-        else:
-            print("serialized: one run per seat; a second request queues")
+        # Say it out loud, because a loop-wide default that a seat overrides is exactly the kind
+        # of setting someone changes twice and wonders why nothing moved.
+        for seat in ("reviewer", "fixer"):
+            if (loop["seats"].get(seat) or {}).get("concurrency") is not None:
+                print(f"  note: {seat} has its own concurrency "
+                      f"({loop['seats'][seat]['concurrency']}) — the loop default does not apply to it")
+
+    print("  parallel now: " + " · ".join(
+        f"{seat} {config.seat_concurrency(updated, seat)}" for seat in ("reviewer", "fixer"))
+        + "   (1 = serialized; everything above the limit queues)")
     return 0
 
 
@@ -259,8 +278,9 @@ def cmd_list(args) -> int:
         print(f"no loops configured in {config.config_dir()}")
         return 0
     for loop in loops:
-        print(f"{loop['id']:<20} {loop['repo']:<30} cap={loop['cap']} "
-              f"parallel={loop.get('concurrency', 1)} "
+        seats = " ".join(f"{seat}={config.seat_concurrency(loop, seat)}"
+                         for seat in ("reviewer", "fixer"))
+        print(f"{loop['id']:<20} {loop['repo']:<30} cap={loop['cap']} {seats} "
               f"fixers={','.join(loop['fixers'])} reviewers={','.join(loop['reviewers'])}")
     return 0
 
@@ -273,9 +293,10 @@ def cmd_status(args) -> int:
         st = state_mod.state_for(loop)
         print()
         print(f"[{loop['id']}] {loop['repo']}  (cap {loop['cap']}, base {loop['base']})")
-        capacity = int(loop.get("concurrency") or 1)
-        print(f"  parallel:   {capacity} PR(s) per seat"
-              + ("" if capacity > 1 else " — serialized; a second request queues"))
+        print("  parallel:   " + " · ".join(
+            f"{seat} {config.seat_concurrency(loop, seat)}"
+            + ("" if config.seat_concurrency(loop, seat) > 1 else " (serialized)")
+            for seat in ("reviewer", "fixer")))
         print(f"  clone:      {loop['clone'] or '(none)'}")
         print(f"  state:      {st.dir}")
         print(f"  seats:      reviewer={loop['seats']['reviewer']['login']} "
@@ -286,11 +307,11 @@ def cmd_status(args) -> int:
             for key, entry in (entries or {}).items():
                 held = (time.time() - entry.get("at", time.time())) / 60
                 print(f"  running:    {seat} on {key} for {held:.0f}m")
-        capacity = int(loop.get("concurrency") or 1)
         for seat in ("reviewer", "fixer"):
             queued = len(st.queue_items(seat))
             if queued:
-                print(f"  queued:     {seat} {queued} ({capacity} at a time)")
+                print(f"  queued:     {seat} {queued} "
+                      f"({config.seat_concurrency(loop, seat)} at a time)")
         queue = st.queue_all()
         for seat, items in queue.items():
             for key, entry in items.items():
@@ -361,8 +382,13 @@ def register_cli(ctx) -> None:
         init.add_argument("--fixer-agent", default="", help="display name for the fixer")
         init.add_argument("--cap", type=int, default=3, help="verdicts allowed before adjudication")
         init.add_argument("--concurrency", type=int, default=1,
-                          help="PRs this seat may work at once: 1 = serialized (default). "
-                               "Above 1 needs --clone, because each PR then gets its own clone.")
+                          help="default PRs per seat at once: 1 = serialized (default). "
+                               "Above 1 needs --clone, because each run then gets its own clone. "
+                               "Override per seat with --reviewer-concurrency / --fixer-concurrency.")
+        init.add_argument("--reviewer-concurrency", type=int, default=None,
+                          help="PRs the reviewer may work at once (overrides --concurrency)")
+        init.add_argument("--fixer-concurrency", type=int, default=None,
+                          help="PRs the fixer may work at once (overrides --concurrency)")
         init.add_argument("--base", default="main")
         init.add_argument("--clone", default="", help="local clone the runs may use")
         init.add_argument("--root", action="append", default=[], help="a directory reviews may clean (repeatable)")
@@ -387,8 +413,12 @@ def register_cli(ctx) -> None:
         change = sub.add_parser("set", help="Change a loop's settings in place")
         change.add_argument("--loop", required=True)
         change.add_argument("--concurrency", type=int,
-                            help="how many PRs each seat may work at once (1 = serialized; "
-                                 "above 1 needs a clone, since each PR gets its own)")
+                            help="default PRs per seat at once (1 = serialized; above 1 needs a "
+                                 "clone, since each run gets its own)")
+        change.add_argument("--reviewer-concurrency", type=int, default=None,
+                            help="how many PRs the reviewer may work at once")
+        change.add_argument("--fixer-concurrency", type=int, default=None,
+                            help="how many PRs the fixer may work at once")
         change.add_argument("--cap", type=int, help="verdicts allowed before adjudication")
         change.add_argument("--clone", help="local clone the runs isolate from")
         change.add_argument("--base", help="base branch the loop watches")

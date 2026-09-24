@@ -72,7 +72,7 @@ def main() -> None:
     workspace = gate.take_seat(loop, st, seat, number, pr_head, f"fix #{number} @ {pr_head[:7]}",
                               login=(loop["seats"][seat].get("login") or ""))
 
-    payload["_loop"] = gate.loop_block(loop, number, pr_head, workspace, round=prior + 1,
+    payload["_loop"] = gate.loop_block(loop, number, pr_head, workspace, seat=seat, round=prior + 1,
                                        role="fixer", verdict="changes_requested",
                                        reviewer=gate.reviewer_login(review))
     st.inflight(f"fix:{number}:{pr_head}", record=True)

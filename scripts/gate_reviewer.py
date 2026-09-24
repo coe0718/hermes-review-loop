@@ -87,7 +87,7 @@ def main() -> None:
         log(f"released fixer seat for {gate.seat_key(loop, number)}")
     gate.drain_seat(loop, "fixer")
 
-    payload["_loop"] = gate.loop_block(loop, number, head, workspace, round=rounds + 1,
+    payload["_loop"] = gate.loop_block(loop, number, head, workspace, seat=seat, round=rounds + 1,
                                        role="reviewer")
     st.inflight(f"review:{number}:{head}", record=True)
     gate.ping_start(loop, seat, gate.start_text(loop, seat, number, head, rounds + 1))

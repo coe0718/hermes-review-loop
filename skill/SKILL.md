@@ -68,17 +68,18 @@ the cap is wrong for this PR, say so in your summary and let the operator change
 
 ## What the loop records about you
 
-The gate, not you, keeps the books: per-seat run ledgers, the queue, in-flight marks and breach
-markers live under the loop's state directory, and the watchdog reads GitHub state directly rather
-than trusting anyone's summary. That means three things for how you work:
+The gate, not you, keeps the books: per-seat run ledgers, per-seat capacity, the queue, in-flight
+marks and breach markers live under the loop's state directory, and the watchdog reads GitHub state
+directly rather than trusting anyone's summary. That means three things for how you work:
 
 * your review's verdict count comes from the reviews on the PR, so a verdict you post is the
   round — commenting without a verdict does not consume one;
-* a run that died mid-way leaves a slot that expires, so you never need to clean up after yourself
-  for the loop to keep moving;
-* your PR's workspace is reused if you are woken again on the same PR — a warm build directory is
-  the point — and deleted when the PR closes. Anything you need to keep belongs on the PR, not on
-  this disk.
+* a seat has a limit (the reviewer's and the fixer's are set separately), so work above it waits in
+  the queue — being queued is normal and costs nothing; a run that died mid-way leaves a slot that
+  expires, so you never need to clean up after yourself for the loop to keep moving;
+* your PR's workspace — one clone per PR *and per seat* — is reused if you are woken again on the
+  same PR (a warm build directory is the point) and deleted when the PR closes. Anything you need to
+  keep belongs on the PR, not on this disk.
 
 ## When something is wrong with the loop itself
 
