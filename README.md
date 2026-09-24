@@ -163,6 +163,11 @@ each value, so you can tell what the form actually holds without opening it. Set
 **profile** they were saved in, and the rails still apply: a concurrency above 1 with no clone is
 refused at `init`, at `set` and at `apply` alike.
 
+The settings form and the loop config are different surfaces on purpose: the form is per profile and
+holds defaults, the loop file is per repository and holds the truth. Point a seat at this plugin's
+own skill by its qualified name — `--skill hermes-review-loop:review-loop` — since plugin skills are
+never copied into `~/.hermes/skills/`.
+
 ## What the loop guarantees
 
 - **One PR, one seat.** A PR is held by the reviewer *or* the fixer, never both: a review never

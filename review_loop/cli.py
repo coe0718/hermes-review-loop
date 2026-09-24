@@ -322,7 +322,7 @@ def cmd_settings(args) -> int:
     for key, spec in config.SETTINGS_SCHEMA.items():
         value = d[key]
         source = "set" if str((_SETTINGS or {}).get(key, "")) not in ("", "None") else "default"
-        print(f"  {key:<19} {str(value):<26} [{source}]  {spec['description']}")
+        print(f"  {key:<21} {str(value):<26} [{source}]  {spec['description']}")
     if not _SETTINGS:
         print("\nnothing set — every value above is the schema default")
     print("\napply them to a loop with: hermes review-loop apply --loop <id>"
@@ -488,7 +488,9 @@ def register_cli(ctx, settings: dict | None = None) -> None:
         init.add_argument("--state-dir", default="")
         init.add_argument("--token", action="append", default=[], help="login=/path/to/pat (repeatable)")
         init.add_argument("--read-token", default="", help="login whose token reads GitHub")
-        init.add_argument("--skill", default="", help="skill the seats should load")
+        init.add_argument("--skill", default="",
+                          help="skill the seats are told to load. A plugin-provided skill is "
+                               "qualified, e.g. hermes-review-loop:review-loop")
         init.add_argument("--adjudicator-route", default="")
         init.add_argument("--adjudicator-profile", default="default")
         init.add_argument("--host", default=d["host"], help="gateway webhook host")
