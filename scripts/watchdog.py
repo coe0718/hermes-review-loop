@@ -37,7 +37,7 @@ import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from review_loop import config, gate, gh, observer, routes, situation, transition, state as state_mod  # noqa: E402
+from review_loop import config, gate, gh, observer, route_intent, routes, situation, transition, state as state_mod  # noqa: E402
 from review_loop.util import age_min, epoch, log, now_iso  # noqa: E402
 
 TEST = bool(os.environ.get("REVIEW_LOOP_TEST"))
@@ -382,6 +382,17 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
 
     if not TEST and not gate.hooks_armed(loop):
         return lines                              # parked on purpose: say nothing, ever
+
+    # Self-heal first, and independent of GitHub listing: a route another registry writer erased
+    # or rewrote (issue #1) is a loop that cannot wake a seat, whatever the PRs look like.
+    try:
+        healed = route_intent.heal(loop)
+    except Exception as exc:                      # never let the heal hide the stall scan
+        healed = [f"⚠️ Review loop [{loop['id']}] route self-heal failed: "
+                  f"{type(exc).__name__}: {exc}"]
+    if healed:
+        lines.extend(healed)
+        st.note("route self-heal: " + " | ".join(line.strip() for line in healed))
 
     prs = gh.open_prs(loop)
     if not isinstance(prs, list):

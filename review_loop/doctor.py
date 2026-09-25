@@ -45,7 +45,7 @@ import socket
 from datetime import datetime
 from urllib.parse import urlsplit
 
-from . import config, gh, routes
+from . import config, gh, route_intent, routes
 
 VERIFIED = "verified"
 ABSENT = "absent"
@@ -330,6 +330,51 @@ def check_routes(loop: dict) -> list[Check]:
     adjudicator = check_adjudicator_route(loop, data)
     if adjudicator:
         checks.append(adjudicator)
+    return _intent_overlay(loop, data, checks)
+
+
+REPAIR_FIX = ("the next armed watchdog sweep restores it from the plugin's intent record with the "
+              "same secret — or run `hermes review-loop doctor --repair` now; if the change was "
+              "intended, make it through `hermes review-loop set/apply/uninstall` instead")
+
+
+def _intent_overlay(loop: dict, data: dict, checks: list[Check]) -> list[Check]:
+    """Compare the live registry with the plugin's own record of its routes (issue #1).
+
+    Read-only, like every check here. A route another registry writer changed can still look
+    well-formed (a fresh secret, say) — only the record knows it no longer matches GitHub's hook.
+    With no record yet (an install that predates it) the route checks stand as they are.
+    """
+    try:
+        intent = route_intent.load(loop)
+    except route_intent.IntentError as exc:
+        return checks + [Check("route-intent", MISMATCH, str(exc),
+                               "restore the file, or re-run `hermes review-loop apply` so the "
+                               "plugin records its routes again")]
+    if intent is None:
+        return checks
+    drifted = route_intent.drift(loop, data, intent)
+    by_name = {check.name: check for check in checks}
+    for name in sorted(set(intent) & set(route_intent.routes_of(loop).values())):
+        check = by_name.get(f"route:{name}")
+        fields = drifted.get(name)
+        if check is None:
+            if fields:
+                checks.append(Check(f"route:{name}", MISMATCH,
+                                    "differs from the plugin's intent record: " + ", ".join(fields),
+                                    REPAIR_FIX))
+            continue
+        if not fields:
+            if check.status == VERIFIED:
+                check.detail += " · matches intent record"
+            continue
+        what = ("erased by another registry writer" if fields == ["missing"]
+                else "differs from the plugin's intent record: " + ", ".join(fields))
+        if check.status == VERIFIED:
+            check.status, check.detail = MISMATCH, what
+        else:
+            check.detail += f" ({what})"
+        check.fix = REPAIR_FIX
     return checks
 
 
