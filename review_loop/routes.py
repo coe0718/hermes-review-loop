@@ -37,15 +37,94 @@ def all_routes() -> dict:
         return {}
 
 
-def _read_for_write(path: pathlib.Path) -> dict:
+def _parse_for_write(path: pathlib.Path, raw: bytes | None) -> dict:
     """Unlike best-effort reads, writes must not replace an unreadable registry."""
-    try:
-        data = json.loads(path.read_text())
-    except FileNotFoundError:
+    if raw is None:
         return {}
+    data = json.loads(raw)
     if not isinstance(data, dict):
         raise ValueError(f"route registry {path} must be a JSON object")
     return data
+
+
+# -- optimistic concurrency against writers that do not take our lock -----------------------
+#
+# Hermes's own CLI/dashboard subscription writers rewrite this file without the plugin's
+# ``flock``. So every plugin read-modify-write records the file's identity when it reads, and
+# re-checks it immediately before ``os.replace``: if a native writer published in between, the
+# plugin re-reads and re-applies its edit instead of publishing a registry built from stale
+# bytes. What remains is the gap between that last check and the ``rename`` itself (a few
+# syscalls), plus a native writer that read *before* our publish and writes *after* it — that
+# one overwrites us, and only the intent record + self-heal (``route_intent``) repairs it.
+
+CONFLICT_RETRIES = 5
+
+
+class RegistryConflictError(OSError):
+    """A non-cooperating writer kept changing the registry; nothing was published."""
+
+    published = False
+
+
+def _identity_of(st: os.stat_result | None, raw: bytes | None):
+    if st is None:
+        return None
+    return (st.st_ino, st.st_mtime_ns, st.st_size,
+            hashlib.sha256(raw or b"").hexdigest())
+
+
+def _snapshot(path: pathlib.Path):
+    """(identity, bytes) read from one open file; (None, None) when the file does not exist."""
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        return None, None
+    try:
+        st = os.fstat(fd)
+        chunks = []
+        while True:
+            chunk = os.read(fd, 1 << 16)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        raw = b"".join(chunks)
+    finally:
+        os.close(fd)
+    return _identity_of(st, raw), raw
+
+
+def _identity(path: pathlib.Path):
+    """The registry's identity right now: inode, mtime, size and a content hash."""
+    return _snapshot(path)[0]
+
+
+class _RegistryChanged(Exception):
+    pass
+
+
+def _transact(path: pathlib.Path, edit):
+    """Locked, optimistic read-modify-write of the registry.
+
+    ``edit(data)`` mutates the parsed registry in place and returns ``(write, result)``. It must
+    be a pure function of ``data``: on a detected concurrent write it is re-run against the
+    fresh bytes, so a native writer's edit survives alongside ours.
+    """
+    with _registry_lock(path):
+        for _ in range(CONFLICT_RETRIES):
+            identity, raw = _snapshot(path)
+            data = _parse_for_write(path, raw)
+            write, result = edit(data)
+            if not write:
+                return result
+            try:
+                _write_registry(path, data, expected=identity)
+            except _RegistryChanged:
+                log(f"route registry {path.name} changed under a plugin edit; re-applying")
+                continue
+            return result
+    raise RegistryConflictError(
+        f"route registry {path} kept changing under the plugin's edit "
+        f"({CONFLICT_RETRIES} attempts); nothing was published")
 
 
 @contextmanager
@@ -73,8 +152,14 @@ class RegistryDurabilityError(OSError):
     published = True
 
 
-def _write_registry(path: pathlib.Path, data: dict) -> None:
+_UNCHECKED = object()
+
+
+def _write_registry(path: pathlib.Path, data: dict, expected=_UNCHECKED) -> None:
     """Publish owner-only bytes atomically, then sync the containing directory.
+
+    With ``expected`` (an identity from ``_snapshot``), the live file is re-checked immediately
+    before ``os.replace``; a mismatch raises ``_RegistryChanged`` and publishes nothing.
 
     Before replacement, failures leave the old inode intact. After replacement,
     a directory sync failure raises RegistryDurabilityError: the new bytes are
@@ -94,6 +179,8 @@ def _write_registry(path: pathlib.Path, data: dict) -> None:
             os.fsync(fd)
         finally:
             os.close(fd)
+        if expected is not _UNCHECKED and _identity(path) != expected:
+            raise _RegistryChanged()
         os.replace(temp, path)
         try:
             directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
@@ -213,15 +300,15 @@ def new_route(name: str, *, profile: str, prompt: str, events: list[str], script
     import secrets as _secrets
 
     path = subs_path()
-    with _registry_lock(path):
-        data = _read_for_write(path)
+
+    def edit(data: dict):
         prior = data.get(name) or {}
         if not isinstance(prior, dict):
             raise ValueError(f"route {name!r} must be a JSON object")
         entry = {
             "description": description or prior.get("description", ""),
             "events": list(events),
-            "secret": prior.get("secret") or _secrets.token_hex(32),
+            "secret": prior.get("secret") or secret,
             "prompt": prompt,
             "skills": list(skills or prior.get("skills") or []),
             "deliver": deliver,
@@ -238,29 +325,74 @@ def new_route(name: str, *, profile: str, prompt: str, events: list[str], script
         if host:
             entry["host"] = host
         data[name] = entry
-        _write_registry(path, data)
-        return entry
+        return True, entry
+
+    # Generated once, outside the retry loop: a re-applied edit must not mint a second secret.
+    secret = _secrets.token_hex(32)
+    return _transact(path, edit)
 
 
 def remove_route(name: str) -> bool:
-    path = subs_path()
-    with _registry_lock(path):
-        data = _read_for_write(path)
+    def edit(data: dict):
         if name not in data:
-            return False
+            return False, False
         data.pop(name)
-        _write_registry(path, data)
-        return True
+        return True, True
+
+    return _transact(subs_path(), edit)
 
 
 def restore_entries(entries: dict[str, dict | None]) -> None:
     """Restore only owned route entries after an incomplete multi-route update."""
-    path = subs_path()
-    with _registry_lock(path):
-        data = _read_for_write(path)
+    def edit(data: dict):
         for name, entry in entries.items():
             if entry is None:
                 data.pop(name, None)
             else:
                 data[name] = entry
-        _write_registry(path, data)
+        return True, None
+
+    _transact(subs_path(), edit)
+
+
+def heal_entries(expected: dict[str, dict], fields: tuple[str, ...], owned) -> tuple[dict, dict]:
+    """Put back the plugin's own routes a non-cooperating writer erased or rewrote.
+
+    ``expected`` is the plugin's intent record (name → full entry). Under the lock, against the
+    live bytes, each name is: left alone when every watched ``field`` already matches; restored
+    when missing, or present and still ``owned(entry)`` (one of this plugin's gate scripts);
+    reported as a conflict — never overwritten — when something else now holds the name.
+    Other names in the registry are not read for anything but preservation. A malformed
+    registry raises (fail closed) exactly like every other plugin write.
+
+    Returns ``(restored, conflicts)``: name → list of fields restored ("missing" for an erased
+    route), and name → reason.
+    """
+    def edit(data: dict):
+        restored: dict = {}
+        conflicts: dict = {}
+        for name, want in expected.items():
+            live = data.get(name)
+            if live is None:
+                data[name] = dict(want)
+                restored[name] = ["missing"]
+                continue
+            if not isinstance(live, dict):
+                conflicts[name] = "registry entry is not a JSON object"
+                continue
+            diff = [key for key in fields if live.get(key) != want.get(key)]
+            if not diff:
+                continue
+            if not owned(live):
+                conflicts[name] = (f"now runs {live.get('script')!r}, not a review-loop gate — "
+                                   "something else holds this name")
+                continue
+            merged = {**live, **want}
+            for key in fields:          # a watched key the plugin never wrote is not kept either
+                if key not in want:
+                    merged.pop(key, None)
+            data[name] = merged
+            restored[name] = diff
+        return bool(restored), (restored, conflicts)
+
+    return _transact(subs_path(), edit)

@@ -24,8 +24,28 @@ running loop.
 
 Route edits are serialized only among cooperating review-loop plugin processes, using a sibling
 lock file and atomic replacement. Native Hermes CLI and dashboard subscription edits do **not**
-take that lock, so concurrent native/plugin edits can still overwrite each other. Fully solving
-that race requires an upstream shared lock/protocol for every registry writer. If directory sync
+take that lock (issue #1; upstream fix pending in NousResearch/hermes-agent#120964), so the plugin
+mitigates the race from its side — it does not close it:
+
+* **Optimistic writes.** Each plugin edit records the registry's inode, mtime, size and content
+  hash when it reads, re-checks them immediately before `os.replace`, and re-reads and re-applies
+  its edit (up to 5 attempts, then `RegistryConflictError` with nothing published) if a native
+  write landed in between — so the plugin no longer overwrites a concurrent native change.
+* **Intent record + self-heal.** Every route the plugin installs or rebinds is also copied,
+  secret included, to `<state_dir>/route-intent.json` (0600, atomic). Every armed watchdog sweep
+  compares this loop's routes with it and restores any route a native writer erased or changed
+  (secret, script, prompt, events, profile, `deliver_only`, host) with the **same secret**, so
+  GitHub's hook keeps authenticating, and says what it restored in its cron output. Other routes
+  are never touched; a name now held by a non-review-loop script is reported, not overwritten; a
+  malformed registry is never overwritten. Change or remove routes through `set`/`apply`/
+  `uninstall` — they update the record — or self-heal will put a native edit back.
+* **What remains.** A few syscalls between the final identity check and the rename, and a native
+  writer that read *before* a plugin publish and writes *after* it, can still drop a plugin edit
+  (or a native one). The plugin's lost routes come back on the next armed sweep; a native edit
+  the plugin overwrote in that window does not. Between sweeps a broken route can miss
+  deliveries. See [docs/issue-1-route-self-heal.md](issue-1-route-self-heal.md).
+
+If directory sync
 fails after replacement, the plugin raises `RegistryDurabilityError(published=True)`: the new
 registry is visible, but crash durability is unconfirmed; do not assume the operation rolled back.
 
@@ -89,7 +109,9 @@ reported as `absent`: "the API refused to tell me" and "there are no hooks" are 
 and printing the second when the first is true sends you hunting for a hook that exists (reading
 the repo's hooks needs `admin:repo_hook`, so a token without it shows ⚠️, not ❌).
 
-It writes nothing — no config, no route registry, no state, no GitHub hook — and it never fires a
+It writes nothing — no config, no route registry, no state, no GitHub hook — unless you pass
+`--repair`, whose one write is restoring this loop's own routes from the plugin's intent record
+(same secret) before the read-only checks run. It never fires a
 route, because a synthetic POST at a seat's route is a real agent run with a real budget. The
 network side is a TCP connect to the gateway (is anything listening?) and, when the token is
 allowed to, a read of the repo's hooks.

@@ -90,6 +90,7 @@ Every one of those is a *silent* failure, so this plugin makes each one loud or 
 | two runs, one clone | a seat is a capacity with a per-PR ledger; `concurrency: 2+` gives each PR its own clone, build dir and tmp dir, and an unisolatable run is queued rather than shared |
 | a run dies mid-way | the lock expires; a stalled head frees itself |
 | disk creep | a merged/closed PR runs the cleanup: worktrees, build dirs, logs, locks, counters |
+| another registry writer erased or rewrote a route | the watchdog restores it from the plugin's own intent record, same secret, and says so; `doctor` flags it; `doctor --repair` restores it now |
 | "did the loop ever run?" | every branch of every gate either fires or logs *why not*; the watchdog reads GitHub state directly instead of trusting anyone's summary |
 
 ## Install
@@ -246,6 +247,7 @@ Not proven, and worth knowing before you trust it:
 | [docs/configuration.md](docs/configuration.md) | every loop-config key, the observer block, adjudication, plugin settings, state files, env overrides |
 | [docs/architecture.md](docs/architecture.md) | the seats, isolation, escalation, the watchdog, `explain`, observer and preflight design |
 | [docs/issue-16-boundary.md](docs/issue-16-boundary.md) | the isolated route-to-agent boundary (issue #16), selftest guarantees, remaining blockers |
+| [docs/issue-1-route-self-heal.md](docs/issue-1-route-self-heal.md) | the webhook-registry race (issue #1): self-heal and what it doesn't close |
 | [docs/stacked-submission-boundary.md](docs/stacked-submission-boundary.md) | the stacked reviewer submission boundary (not enabled) |
 | [docs/README.md](docs/README.md) | the same index, inside `docs/` |
 
@@ -254,12 +256,12 @@ Not proven, and worth knowing before you trust it:
 ```
 plugin.yaml                manifest (no hidden capabilities: no hooks, no tools, no middleware)
 __init__.py                registers the CLI and the skill
-review_loop/               the library: config, state, gh, routes, prompts, gate runtime,
+review_loop/               the library: config, state, gh, routes (+ route_intent self-heal), prompts, gate runtime,
                            observer, CLI, the read-only `doctor` preflight and the isolated-path
                            `selftest`
 scripts/gate_reviewer.py   between a pull_request event and a review run
 scripts/gate_fixer.py      between a pull_request_review event and a fix run
-scripts/watchdog.py        cron: stall detection, stuck state, queue draining
+scripts/watchdog.py        cron: route self-heal, stall detection, stuck state, queue draining
 scripts/cleanup.py         merge/close: reclaim the PR's local disk
 scripts/observe.py         the observer route's adapter: republish the loop's notice, wake nobody
 skill/SKILL.md             the protocol the seats load
