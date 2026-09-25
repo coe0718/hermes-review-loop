@@ -144,6 +144,11 @@ class RunBroker:
 
     def _dispatch(self, raw: bytes) -> object:
         request = json.loads(raw)
+        # The adjudicator has exactly one operation, and only the adjudicator has it. Decide
+        # that before any other branch so neither side can reach the other's write paths.
+        if self.scope.role == "adjudicator" or (isinstance(request, dict)
+                                                and request.get("operation") == "ruling"):
+            return self._ruling(raw, request)
         if isinstance(request, dict) and request.get("operation") == "push":
             if set(request) != {"operation", "manifest"} or self.scope.role != "fixer":
                 raise ProtocolError("operation out of scope")
@@ -254,6 +259,93 @@ class RunBroker:
         return result
 
 
+    def _ruling(self, raw: bytes, request: object) -> object:
+        """Record the one ruling, then tell the operator, then (optionally) the PR.
+
+        The response is ok as soon as the ruling is durable in the host run ledger; the notice
+        and the comment are host deliveries of an already recorded fact, so their failures are
+        recorded there too and never turned into a sandbox-visible error or retry.
+        """
+        if (self.scope.role != "adjudicator" or not isinstance(request, dict)
+                or set(request) != {"operation", "verdict", "body"}
+                or request["operation"] != "ruling"):
+            raise ProtocolError("operation out of scope")
+        if len(raw) > MAX_REQUEST:
+            raise ProtocolError("request too large")
+        verdict, body = request["verdict"], request["body"]
+        from .run_supervisor import RULINGS, Supervisor
+        if (verdict not in RULINGS or not isinstance(body, str) or not body.strip()
+                or len(body.encode()) > MAX_BODY):
+            raise ProtocolError("invalid ruling fields")
+        if self._used:
+            raise ProtocolError("run capability already used")
+        if not self.scope.run_id or not self.scope.ledger_db:
+            raise ProtocolError("host run ledger unavailable")
+        # Consume BEFORE the ledger write: a lost response cannot lead to a second ruling.
+        self._used = True
+        supervisor = Supervisor(self.scope.ledger_db)
+        recorded = supervisor.record_ruling(self.scope.run_id, self.scope.repo,
+                                            self.scope.number, self.scope.head, verdict, body)
+        self.completed = True
+        try:
+            _deliver_ruling(self._loop, self.scope, supervisor, recorded["turn_key"], verdict, body)
+        except Exception:
+            # Already durable, and the operator outbox reports it regardless.
+            pass
+        return {"accepted": True}
+
+
+def _deliver_ruling(launch_loop: dict, scope: RunScope, supervisor, turn_key: str,
+                    verdict: str, body: str) -> None:
+    """Observer notice (best effort), then the PR comment only for a configured identity."""
+    from . import observer, state as state_mod
+    # Delivery follows the host's current configuration, not the launch snapshot: an identity
+    # the operator removed since launch must not comment. A vanished or re-pointed loop gets
+    # neither delivery; the outbox (run ledger) still carries the ruling.
+    try:
+        loop = config.by_repo(scope.repo)
+    except Exception:
+        loop = None
+    if (loop is None or loop.get("id") != launch_loop.get("id")
+            or loop.get("state_dir") != launch_loop.get("state_dir")):
+        supervisor.ruling_status(scope.run_id, observer="skipped", comment="denied",
+                                 comment_error="loop configuration changed")
+        return
+    rounds = turn_key.split(":", 1)[1] if turn_key.startswith("breach:") else "?"
+    # The feed carries the fact (verdict, counts), never the model's reason text — that goes
+    # to the operator outbox and, when configured, the PR. See observer.notify's contract.
+    sent = observer.notify(loop, state_mod.state_for(loop), "ruling", scope.number, scope.head,
+                           identity=turn_key, outcome=f"{verdict} · {rounds}/{loop['cap']} verdicts",
+                           next_turn="you — the adjudicator never merges")
+    supervisor.ruling_status(scope.run_id, observer="sent" if sent else "unsent")
+    if not config.adjudicator_login(loop):
+        supervisor.ruling_status(scope.run_id, comment="none")
+        return
+    try:
+        login = broker.authorize_ruling_comment(loop, repo=scope.repo, number=scope.number,
+                                                head=scope.head, branch=scope.branch)
+    except broker.BrokerDenied as exc:
+        supervisor.ruling_status(scope.run_id, comment="denied", comment_error=str(exc)[:200])
+        return
+    except Exception as exc:
+        supervisor.ruling_status(scope.run_id, comment="denied",
+                                 comment_error=f"authorization failed: {type(exc).__name__}")
+        return
+    # Durable intent before the POST: a crash after it is reported as uncertain, never replayed.
+    supervisor.ruling_status(scope.run_id, comment="posting")
+    try:
+        comment_id = broker.post_ruling_comment(
+            loop, repo=scope.repo, number=scope.number, head=scope.head, branch=scope.branch,
+            login=login, text=broker.ruling_comment_body(verdict, body, head=scope.head,
+                                                          turn_key=turn_key, run_id=scope.run_id,
+                                                          cap=loop["cap"]))
+    except Exception as exc:
+        supervisor.ruling_status(scope.run_id, comment="uncertain",
+                                 comment_error=f"POST outcome unknown: {type(exc).__name__}")
+        return
+    supervisor.ruling_status(scope.run_id, comment="posted", comment_id=comment_id)
+
+
 def serve_in_thread(server: RunBroker) -> threading.Thread:
     """Start an entered server; caller owns its lifetime and must join on shutdown."""
     thread = threading.Thread(target=server.serve, daemon=True)
@@ -273,7 +365,7 @@ def request(operation: str, *, verdict: str = "", body: str = "",
     """Credentialless in-namespace caller; never accepts a target repo or token."""
     if operation == "push":
         payload = {"operation": operation, "manifest": manifest}
-    elif operation in ("review", "request_review"):
+    elif operation in ("review", "request_review", "ruling"):
         payload = {"operation": operation, "verdict": verdict, "body": body}
     else:
         raise ProtocolError("unsupported operation")
@@ -295,7 +387,7 @@ def main() -> None:
     """Small CLI for a sandboxed Hermes terminal tool call."""
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("operation", choices=("review", "request_review", "push"))
+    parser.add_argument("operation", choices=("review", "request_review", "push", "ruling"))
     parser.add_argument("--verdict", default="")
     parser.add_argument("--body-file")
     parser.add_argument("--manifest-file")
@@ -308,6 +400,9 @@ def main() -> None:
             parser.error("manifest too large")
         result = request("push", manifest=json.loads(path.read_text()))
     else:
+        if args.operation == "ruling" and (args.verdict not in ("ACCEPT", "REJECT", "RESPEC")
+                                           or not args.body_file):
+            parser.error("ruling requires --verdict ACCEPT|REJECT|RESPEC and --body-file")
         if args.manifest_file or (args.operation == "review" and not args.body_file):
             parser.error("invalid review arguments")
         body = Path(args.body_file).read_text() if args.body_file else ""

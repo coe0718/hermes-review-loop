@@ -446,6 +446,30 @@ class LoopState:
             self._breach_save(data)
             return marker
 
+    def breach_start(self, number: int, head: str, rounds: int) -> dict | None:
+        """Mark the breach at this head as being ruled on by an isolated adjudicator turn.
+
+        The run ledger's unique turn index is what makes a ruling at-most-once; this marks the
+        marker so the watchdog stops retrying delivery and ``explain`` says a ruling is out.
+        Unlike ``breach_claim`` it does not need a live delivery token: the enqueue may have
+        been durable even when its delivery attempt reported failure (a spawn error), and that
+        attempt's token is gone by the time the worker runs. A marker already claimed by
+        anyone else — including a legacy gateway route — refuses.
+        """
+        key = f"{self.loop['repo']}#{number}"
+        with self._breach_lock():
+            data = self._load(self.breach, {}) or {}
+            marker = data.get(key)
+            if (not isinstance(marker, dict) or marker.get("pr") != number
+                    or marker.get("head") != head or marker.get("rounds") != rounds
+                    or marker.get("status") not in ("delivery-pending", "awaiting-adjudication")):
+                return None
+            data[key] = {k: v for k, v in marker.items()
+                         if k not in {"delivery_token", "delivery_at"}}
+            data[key]["status"] = "adjudicating"
+            self._breach_save(data)
+            return marker
+
     def breach_all(self) -> dict:
         return self._load(self.breach, {}) or {}
 

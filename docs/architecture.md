@@ -2,7 +2,8 @@
 
 > **Current status:** the diagrams below describe the intended operational loop,
 > not a safely running one. Gates presently queue eligible PR events and return
-> `[SILENT]` before gateway dispatch; breach wake is blocked as well. This is a
+> `[SILENT]` before gateway dispatch; a breach enqueues an isolated adjudicator
+> turn instead of waking the legacy gateway route. This is a
 > deliberate safety hold pending an enforced, credentialless whole-agent runner.
 > `review_loop/broker.py` contains trusted REST authorization primitives and
 > `review_loop/broker_ipc.py` a scoped Unix-socket service; an offline worker
@@ -173,16 +174,25 @@ turns; the third `changes_requested` escalates.
 ## Escalation
 
 When the cap is spent, the gate verifies the live PR head, writes a durable `delivery-pending`
-breach marker, and POSTs at the adjudicator route under a cross-process lock. A successful 2xx
-promotes it to `awaiting-adjudication`; a failed delivery remains pending for a later event or
-watchdog sweep to retry. The route is bound to the adjudicator's own profile, not the seat that
-went quiet. One accepted wake per head: repeated events cannot spawn a second ruling, and a late
-event for an older head cannot replace the current marker. After an ambiguous transport timeout,
-a retry may deliver another POST, but the adjudicator gate atomically claims only one run per head.
+breach marker, and — under the breach lock's reservation — enqueues an isolated `adjudicator` turn
+in the host run ledger (turn key `breach:<rounds>`). A durable, armed enqueue promotes the marker to
+`awaiting-adjudication`; any failure leaves it pending for a later event or watchdog sweep to retry.
+One accepted wake per head: repeated events and retries dedup on the ledger's unique
+repo/PR/head/seat/turn index, and a late event for an older head cannot replace the current marker.
+The legacy gateway breach route stays silent.
 
-The adjudicator is told to read both positions, rule with a reason, post the ruling on the PR, and
-**not** merge or push. The operator is the veto, not the reviewer — overriding a ruling should cost
-one message, not a re-read of the whole thread.
+The worker claims the turn only after re-reading GitHub (open, not draft, same base and head, author
+a configured fixer, cap still spent, no approval at the head, a matching marker); a moved, closed,
+retargeted or approved PR cancels it, an unreadable one waits. Right before launch it re-verifies,
+marks the breach `adjudicating`, and runs the agent credentialless with a read-only export of the
+head, a host-rendered prompt and the reviewer verdicts and fixer comments as data.
+
+The adjudicator is told to read both positions and rule — ACCEPT, REJECT or RESPEC — with a reason,
+and **not** merge, push or review (it has no way to). Its one broker `ruling` is recorded in the run
+ledger first; then the host sends an observer `ruling` notice, queues the full ruling in the
+operator outbox, and posts it as a PR comment only for a configured, distinct adjudicator identity.
+The operator is the veto, not the reviewer — overriding a ruling should cost one message, not a
+re-read of the whole thread.
 
 ## The watchdog's four shapes
 

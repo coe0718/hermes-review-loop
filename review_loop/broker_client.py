@@ -18,7 +18,7 @@ def call(operation: str, *, verdict: str = '', body: str = '', manifest=None,
          socket_path: str | None = None) -> dict:
     if operation == 'push':
         payload = {'operation': 'push', 'manifest': manifest}
-    elif operation in ('review', 'request_review'):
+    elif operation in ('review', 'request_review', 'ruling'):
         payload = {'operation': operation, 'verdict': verdict, 'body': body}
     else:
         raise ValueError('unsupported operation')
@@ -46,7 +46,7 @@ def call(operation: str, *, verdict: str = '', body: str = '', manifest=None,
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument('operation', choices=('review', 'request_review', 'push'))
+    parser.add_argument('operation', choices=('review', 'request_review', 'push', 'ruling'))
     parser.add_argument('--verdict', default='')
     parser.add_argument('--body-file')
     parser.add_argument('--manifest-file')
@@ -59,11 +59,14 @@ def main() -> None:
             parser.error('manifest too large')
         operation = lambda: call('push', manifest=json.loads(path.read_text()))
     else:
+        if args.operation == 'ruling' and (args.verdict not in ('ACCEPT', 'REJECT', 'RESPEC')
+                                           or not args.body_file or args.manifest_file):
+            parser.error('ruling requires --verdict ACCEPT|REJECT|RESPEC and --body-file')
         if args.manifest_file or (args.operation == 'review' and not args.body_file):
             parser.error('invalid review arguments')
         body = Path(args.body_file).read_text() if args.body_file else ''
         if len(body.encode()) > 12 * 1024:
-            parser.error('review body too large')
+            parser.error('body too large')
         operation = lambda: call(args.operation, verdict=args.verdict, body=body)
     try:
         result = operation()

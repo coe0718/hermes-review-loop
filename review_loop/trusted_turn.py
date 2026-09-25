@@ -142,11 +142,36 @@ def _export_committed_source(source_fd: int, destination: Path) -> None:
     shutil.copyfile(Path(__file__).with_name('inference_proxy.py'), client / 'inference_proxy.py')
 
 
+# Each role is told only about its own broker command. Advertising another role's command would
+# invite a denied write at best, and it is the kind of prompt drift that later reads as permission.
+_COMMON = ('You have no GitHub credentials or network. Never claim a write succeeded without '
+           'an ok response. A write can take minutes; if it times out, its outcome is unknown: '
+           'do not retry it, say so.')
+TOOLS = {
+    'reviewer': ('For your one authorized write use `python -m review_loop.broker_client review '
+                 '--verdict APPROVE --body-file /work/review.txt` (or REQUEST_CHANGES/COMMENT). '
+                 'A reviewer gets exactly one write. '),
+    'fixer': ('To publish use `python -m review_loop.broker_client push '
+              '--manifest-file /work/manifest.json`, then `python -m review_loop.broker_client '
+              'request_review`. A fixer gets one push followed by one review request. '),
+    'adjudicator': ('`/work` is read-only; write files under `/tmp`. To deliver your ruling use '
+                    '`python -m review_loop.broker_client ruling --verdict ACCEPT '
+                    '--body-file /tmp/ruling.txt` (or REJECT/RESPEC). An adjudicator gets '
+                    'exactly one ruling and cannot review, push or merge. '),
+}
+
+
+def tool_instructions(role: str) -> str:
+    if role not in TOOLS:
+        raise TurnDenied('unsupported role')
+    return TOOLS[role] + _COMMON
+
+
 def run_turn(loop: dict, scope: broker_ipc.RunScope, *, source: Path, venv: Path,
              runtime: Path, rust: Path, upstream: str, key: str, model: str,
              prompt: str, timeout: int = 600, work_root: Path | None = None) -> int:
     """Stage a live PR head, start host capabilities, execute Hermes within bwrap."""
-    if scope.repo != loop.get('repo') or scope.role not in ('reviewer', 'fixer'):
+    if scope.repo != loop.get('repo') or scope.role not in TOOLS:
         raise TurnDenied('scope mismatch')
     if not model or not prompt or timeout < 1 or not key:
         raise TurnDenied('missing model, prompt or credential')
@@ -169,15 +194,7 @@ def run_turn(loop: dict, scope: broker_ipc.RunScope, *, source: Path, venv: Path
             'memory:\n  memory_enabled: false\n')
         (home / 'config.yaml').chmod(0o600)
         query = root / 'query.txt'
-        query.write_text(prompt + '\n\nYou have no GitHub credentials or network. '
-            'For authorized writes use `python -m review_loop.broker_client review '
-            '--verdict APPROVE --body-file /work/review.txt` (or REQUEST_CHANGES/COMMENT); '
-            'fixer: use `python -m review_loop.broker_client push '
-            '--manifest-file /work/manifest.json`, then `python -m review_loop.broker_client '
-            'request_review`. A reviewer gets one write; a fixer gets one push '
-            'followed by one review request. Never claim a write succeeded without '
-            'an ok response. A write can take minutes; if it times out, its outcome is '
-            'unknown: do not retry it, say so.\n')
+        query.write_text(prompt + '\n\n' + tool_instructions(scope.role) + '\n')
         checkout = trusted_fetch.stage(loop, repo=scope.repo, number=scope.number,
                                        head=scope.head, ref=scope.branch, role=scope.role,
                                        sandbox_root=root / 'export')
@@ -204,7 +221,10 @@ def run_turn(loop: dict, scope: broker_ipc.RunScope, *, source: Path, venv: Path
                     home=home, checkout=checkout, rust=rust, query=query, entry=command,
                     inference_socket_dir=inference.directory,
                     broker_socket_dir=broker.socket_path.parent,
-                    client_code=client.parent, timeout=timeout)
+                    client_code=client.parent, timeout=timeout,
+                    # A ruling is judgement, not a change: the adjudicator's tree is mounted
+                    # read-only so nothing it runs can dress up the head it rules on.
+                    checkout_writable=scope.role != 'adjudicator')
                 if result.returncode == 0 and not broker.completed:
                     raise TurnDenied('agent exited without a confirmed scoped write')
                 return result.returncode

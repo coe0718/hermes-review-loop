@@ -3,6 +3,7 @@
 
 Examples: broker_client.py review APPROVE "Reviewed exact head";
           broker_client.py request_review
+          broker_client.py ruling ACCEPT "Remaining findings do not block"
 No repo, PR, head, branch, URL, identity, token or socket path CLI options exist.
 """
 import argparse
@@ -43,12 +44,15 @@ def request(operation: str, verdict: str = "", body: str = "") -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", choices=("review", "request_review"))
+    parser.add_argument("operation", choices=("review", "request_review", "ruling"))
     parser.add_argument("verdict", nargs="?", default="")
     parser.add_argument("body", nargs="?", default="")
     args = parser.parse_args()
     if args.operation == "review" and (not args.verdict or not args.body):
         parser.error("review requires verdict and body")
+    if args.operation == "ruling" and (args.verdict not in ("ACCEPT", "REJECT", "RESPEC")
+                                       or not args.body):
+        parser.error("ruling requires ACCEPT|REJECT|RESPEC and a reason")
     if args.operation == "request_review" and (args.verdict or args.body):
         parser.error("request_review takes no extra fields")
     try:

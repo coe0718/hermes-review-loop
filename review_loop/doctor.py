@@ -214,6 +214,50 @@ def check_credential(loop: dict, seat: str) -> Check:
                  f"GH_TOKEN=<pat> in {env} — a seat with neither cannot push or post a verdict")
 
 
+def check_adjudicator_identity(loop: dict) -> Check | None:
+    """The optional identity a ruling is also posted as; ``None`` when the loop has none.
+
+    Without one, rulings go to the operator feed and the host ledger only — that is a valid
+    configuration, not a failure, so nothing is reported. With one, it must be a fourth account:
+    its own login and its own token file, never the reader's or a seat's. (Distinct *principals*
+    need a network read; the broker verifies those via ``/user`` before every comment.)
+    """
+    login = config.adjudicator_login(loop)
+    if not login:
+        return None
+    seats = loop.get("seats") or {}
+    others = {"read_token": loop.get("read_token"),
+              "reviewer": (seats.get("reviewer") or {}).get("login"),
+              "fixer": (seats.get("fixer") or {}).get("login")}
+    for role, other in others.items():
+        if isinstance(other, str) and other and other.casefold() == login.casefold():
+            return Check("credential:adjudicator", MISMATCH,
+                         f"{login} is also the {role} — a ruling would post as that identity",
+                         "set seats.adjudicator.login to its own account, or remove it for "
+                         "operator-only rulings")
+    path = gh.token_path(loop, login)
+    if path is None:
+        return Check("credential:adjudicator", ABSENT, f"no tokens entry for {login!r}",
+                     f"add --token {login}=/path/to/pat, or remove seats.adjudicator.login for "
+                     "operator-only rulings")
+    if not path.is_file() or path.stat().st_size == 0:
+        return Check("credential:adjudicator", ABSENT, f"{login} → no nonempty token file",
+                     f"write the PAT for {login} (chmod 600)")
+    for role, other in others.items():
+        theirs = gh.token_path(loop, other) if isinstance(other, str) and other else None
+        try:
+            shared = theirs is not None and theirs.exists() and path.samefile(theirs)
+        except OSError:
+            shared = True
+        if shared:
+            return Check("credential:adjudicator", MISMATCH,
+                         f"{login} reads the same token file as the {role}",
+                         f"give {login} its own PAT file: a shared file is one account")
+    return Check("credential:adjudicator", VERIFIED,
+                 f"{login} → its own token file; rulings are also posted as a PR comment "
+                 "(principal checked by the broker before each comment)")
+
+
 def check_token(login: str, raw: str) -> Check:
     """One named credential file. The PAT's *bytes* are never printed, hashed or compared."""
     path = pathlib.Path(str(raw)).expanduser()
@@ -740,6 +784,9 @@ def check_loop(loop: dict, offline: bool = False) -> list[Check]:
         checks.append(check_credential(loop, seat))
     if str((loop.get("adjudicator") or {}).get("route") or ""):
         checks.append(check_adjudicator_profile(loop))
+    identity = check_adjudicator_identity(loop)
+    if identity:
+        checks.append(identity)
     checks.extend(check_tokens(loop))
     checks.append(check_read_token(loop))
     checks.extend(check_routes(loop))
