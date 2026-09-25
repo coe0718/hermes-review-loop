@@ -694,9 +694,9 @@ def group_budget() -> None:
     check("third verdict spent → no fourth review", kind, "SILENT")
     check("  no review run queued at cap", load_state("pending.json"), {})
     check("  no ledger run at cap", no_ledger_run(), True)
-    check("  breach marker remains pending while adjudicator is blocked",
+    check("  breach marker stays pending without a private worker runtime",
           load_state("breach.json").get(f"{REPO}#7", {}).get("status"), "delivery-pending")
-    check("  adjudicator is blocked", RECEIVED, [])
+    check("  no gateway adjudicator POST", RECEIVED, [])
 
     # one wake per head
     before = len(RECEIVED)
@@ -719,9 +719,9 @@ def group_budget() -> None:
     check("verdict that hits the cap → no fix run", kind, "SILENT")
     check("  no fix run queued at cap", load_state("pending.json"), {})
     check("  no ledger run at cap", no_ledger_run(), True)
-    check("  breach marker remains pending while adjudicator is blocked",
+    check("  breach marker stays pending without a private worker runtime",
           load_state("breach.json").get(f"{REPO}#7", {}).get("status"), "delivery-pending")
-    check("  adjudicator is blocked", RECEIVED, [])
+    check("  no gateway adjudicator POST", RECEIVED, [])
 
     reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, rid=5)]}})
     kind, out, _ = run("gate_fixer.py", review_payload(rid=5))
@@ -730,10 +730,11 @@ def group_budget() -> None:
     check("  no gateway dispatch", no_ledger_run(), True)
 
 def group_adjudicator() -> None:
-    """Keep #21 breach guards without dispatching a credential-owning agent."""
-    from review_loop import cli, config, prompts
+    """Keep #21 breach guards; wake only an isolated turn, never the gateway route."""
+    from review_loop import cli, config, gate, prompts, state as state_mod
+    from review_loop.run_supervisor import Supervisor
 
-    section("adjudicator — guarded marker, no legacy gateway dispatch")
+    section("adjudicator — guarded marker, isolated turn, no legacy gateway dispatch")
     reviews = [review(REVIEWER, head=ch * 40, rid=i) for i, ch in enumerate("cde", 1)]
     reset(prs={"7": {**pr(7, head=HEAD_B), "reviews": reviews}})
     cli._install_routes(config.load_id("widgets"))
@@ -742,8 +743,10 @@ def group_adjudicator() -> None:
     check("adjudicator retains ruling prompt", route["prompt"] == prompts.ADJUDICATOR, True)
     check("cap blocks fourth review", run("gate_reviewer.py", pr_payload(head=HEAD_B))[0], "SILENT")
     marker = load_state("breach.json")[f"{REPO}#7"]
-    check("blocked wake stays delivery-pending", marker["status"], "delivery-pending")
-    check("blocked wake does not POST to gateway", len(RECEIVED), 0)
+    check("no private runtime: wake fails closed, marker stays delivery-pending",
+          marker["status"], "delivery-pending")
+    check("no private runtime: no adjudicator ledger run", no_ledger_run(), True)
+    check("wake never POSTs to the gateway", len(RECEIVED), 0)
     run("gate_reviewer.py", pr_payload(head=HEAD_B))
     check("repeat head does not POST", len(RECEIVED), 0)
     set_prs({"7": {**pr(7, head=HEAD_A), "reviews": reviews}})
@@ -751,12 +754,67 @@ def group_adjudicator() -> None:
     check("stale event cannot regress marker", load_state("breach.json")[f"{REPO}#7"]["head"], HEAD_B)
     set_prs({"7": {**pr(7, head=HEAD_B), "reviews": reviews}})
     run("watchdog.py", None, "--loop", "widgets")
-    check("watchdog cannot deliver blocked route", len(RECEIVED), 0)
+    check("watchdog cannot deliver without a runtime", len(RECEIVED), 0)
     check("watchdog leaves marker retryable", load_state("breach.json")[f"{REPO}#7"]["status"],
           "delivery-pending")
+
+    # With a private runtime file the wake is a durable isolated enqueue. The detached worker
+    # is not started here (it would read real GitHub); the ledger row is the contract.
+    runtime = HOME / "review-loop-runtime.json"
+    runtime.write_text("{}")
+    runtime.chmod(0o600)
+    db = HOME / "state" / "review-loop-runs.sqlite"
+
+    def adjudicator_rows() -> list:
+        if not db.exists():
+            return []
+        with sqlite3.connect(db) as con:
+            return con.execute("SELECT head,turn_key,state FROM runs WHERE seat='adjudicator' "
+                               "ORDER BY created").fetchall()
+
+    try:
+        loop = config.load_id("widgets")
+        st = state_mod.state_for(loop)
+        with mock.patch.object(Supervisor, "_spawn", side_effect=OSError("spawn refused")):
+            gate.breach(loop, st, 7, HEAD_B, 3, "review cap reached")
+        check("spawn failure after a durable row keeps the marker retryable",
+              st.breach_get(7)["status"], "delivery-pending")
+        check("  ...and the row waits pending for a re-arm",
+              adjudicator_rows(), [(HEAD_B, "breach:3", "pending")])
+        with mock.patch.object(Supervisor, "_spawn") as spawn:
+            gate.breach(loop, st, 7, HEAD_B, 3, "review cap reached")
+            check("watchdog-style retry re-arms the same turn", spawn.called, True)
+        check("durable enqueue promotes marker to awaiting-adjudication",
+              st.breach_get(7)["status"], "awaiting-adjudication")
+        check("one isolated adjudicator turn per breach", adjudicator_rows(),
+              [(HEAD_B, "breach:3", "pending")])
+        with mock.patch.object(Supervisor, "_spawn"):
+            gate.breach(loop, st, 7, HEAD_B, 3, "review cap reached")
+            marker = st.breach_get(7)
+            marker["status"] = "delivery-pending"          # an acknowledgement lost in transit
+            state_file("breach.json").write_text(json.dumps({f"{REPO}#7": marker}))
+            gate.breach(loop, st, 7, HEAD_B, 3, "review cap reached")
+        check("redelivery dedups on the ledger's unique turn", len(adjudicator_rows()), 1)
+        check("  ...and still acknowledges the marker", st.breach_get(7)["status"],
+              "awaiting-adjudication")
+        check("no gateway POST on an isolated wake", len(RECEIVED), 0)
+        head_c = "f" * 40
+        set_prs({"7": {**pr(7, head=head_c), "reviews": reviews}})
+        with mock.patch.object(Supervisor, "_spawn"):
+            gate.breach(loop, st, 7, head_c, 3, "review cap reached")
+        check("a re-breach at a new head is a new turn", [r[0] for r in adjudicator_rows()],
+              [HEAD_B, head_c])
+        with mock.patch.object(Supervisor, "_spawn"):
+            gate.breach(loop, st, 7, HEAD_B, 3, "review cap reached")   # live head is still C
+        check("a late event for the old head cannot re-arm it", st.breach_get(7)["head"], head_c)
+        check("  ...nor enqueue another turn", len(adjudicator_rows()), 2)
+    finally:
+        runtime.unlink(missing_ok=True)
+
     # A stale pre-hold acknowledged marker and signed wake must not bypass the hold.
-    marker = load_state("breach.json")[f"{REPO}#7"]
-    marker["status"] = "awaiting-adjudication"
+    set_prs({"7": {**pr(7, head=HEAD_B), "reviews": reviews}})
+    marker = {"pr": 7, "head": HEAD_B, "rounds": 3, "cap": 3, "reason": "legacy",
+              "status": "awaiting-adjudication"}
     state_file("breach.json").write_text(json.dumps({f"{REPO}#7": marker}))
     wake = {**pr_payload(head=HEAD_B), "action": "review_loop_breach", "number": 7,
             "_loop": {"role": "adjudicator", "pr": 7, "head": HEAD_B}}
