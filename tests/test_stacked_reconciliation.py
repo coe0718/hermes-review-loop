@@ -36,6 +36,11 @@ class ReconciliationTest(unittest.TestCase):
                      "ttl_min": 60, "grace_min": 5, "marker_grace_min": 5,
                      "cooldown_h": 1, "reviewer_seat": "reviewer", "inflight_ttl_min": 60}
         self.st = LoopState(self.loop)
+        # A retarget now enqueues a fresh isolated reviewer turn: keep its host ledger and
+        # runtime lookup inside this fixture, never under the operator's ~/.hermes.
+        env = mock.patch.dict("os.environ", {"HERMES_HOME": str(pathlib.Path(self.temp.name) / "hermes")})
+        env.start()
+        self.addCleanup(env.stop)
         self.parent = pr(182, "parent", B, "main", A)
         self.child = pr(184, "child", C, "parent", B)
         self.parent["user"] = self.child["user"] = {"login": "fixer"}
@@ -43,11 +48,12 @@ class ReconciliationTest(unittest.TestCase):
         self.notices = []
         self.posts = []
 
-    def sweep(self, listing):
+    def sweep(self, listing, baseline=([], "")):
         by_number = {p["number"]: p for p in listing} if isinstance(listing, list) else {}
         with mock.patch.object(watchdog, "TEST", True), mock.patch.object(watchdog.gh, "open_prs", return_value=listing), \
              mock.patch.object(watchdog.gh, "pr", side_effect=lambda _loop, n: by_number.get(n)), \
              mock.patch.object(watchdog.gh, "reviews", return_value=[]), \
+             mock.patch.object(watchdog.gh, "reviews_read", return_value=baseline), \
              mock.patch.object(watchdog.gh, "fetch", return_value=(
                  {"ref": "refs/heads/main", "object": {"type": "commit",
                   "sha": next((p["base"]["sha"] for p in listing
@@ -184,8 +190,7 @@ class ReconciliationTest(unittest.TestCase):
         self.child["draft"] = True
         self.child["base"].update(ref="main", sha=A)
         old_review = self.old_review(review_id=71)
-        with mock.patch.object(watchdog.gh, "reviews_read", return_value=([old_review], "")):
-            lines = self.sweep([self.parent, self.child])
+        lines = self.sweep([self.parent, self.child], baseline=([old_review], ""))
         hold = transition.hold(self.st, 184, C)
         self.assertIsNotNone(hold, lines)
         self.assertEqual(hold["old_review_ids"], [71])
@@ -315,9 +320,16 @@ class ReconciliationTest(unittest.TestCase):
         self.sweep([self.parent, self.child])
         self.child["requested_reviewers"] = [{"login": "vex"}]
         output, seat = self.human_request(self.child, [])
-        self.assertIn("[SILENT]", output)
-        seat.assert_not_called()
+        # The request is not a receipt and never a second fresh turn: it can only re-drive
+        # the transition's own reviewer turn, which the ledger dedups on its turn key.
+        self.assert_only_fresh_turn(seat, output)
         self.assertIsNotNone(transition.hold(self.st, 184, C))
+
+    def assert_only_fresh_turn(self, seat, output=""):
+        self.assertEqual(seat.call_count, 1, output)
+        args, kwargs = seat.call_args
+        self.assertEqual(args[2:5], ("reviewer", 184, C))
+        self.assertEqual(kwargs["turn_key"], transition.turn_key(transition.hold(self.st, 184, C)))
 
     def human_request(self, snapshot, reviews):
         """Exercise the real reviewer route with a fake, strict GitHub read."""
@@ -358,9 +370,10 @@ class ReconciliationTest(unittest.TestCase):
         self.assertFalse(any("#184 stacked" in line for line in self.sweep([self.parent, self.child])))
         self.assertNotIn("acme/widgets#184", self.st.queue_items("reviewer"))
         self.assertEqual(self.posts, [], "a retarget/edited observation cannot wake a reviewer")
+        # An unreceipted verdict at the held head counts for nothing: the request re-drives
+        # only the transition's own fresh turn.
         output, seat = self.human_request(self.child, [self.old_review()])
-        seat.assert_not_called()
-        self.assertIn("[SILENT]", output)
+        self.assert_only_fresh_turn(seat, output)
         self.assertEqual(self.posts, [])
         # A delayed request from the parent-base generation is not that fresh request.
         output, seat = self.human_request(old_snapshot, [self.old_review()])
@@ -378,8 +391,7 @@ class ReconciliationTest(unittest.TestCase):
         self.child["base"].update(ref="main", sha=A)
         self.sweep([self.parent, self.child])
         output, seat = self.human_request(self.child, [self.old_review("CHANGES_REQUESTED")])
-        seat.assert_not_called()
-        self.assertIn("[SILENT]", output)
+        self.assert_only_fresh_turn(seat, output)  # never a fixer order from the old verdict
         self.assertEqual(self.st.queue_all(), {})
 
     def test_new_head_after_retarget_is_a_new_human_turn_not_an_auto_wake(self):
@@ -392,12 +404,21 @@ class ReconciliationTest(unittest.TestCase):
         output, seat = self.human_request(self.child, [self.old_review()])
         self.assertEqual(seat.call_count, 1, output)
 
-    def test_same_sha_retarget_without_old_reviews_still_requires_human_review(self):
+    def test_same_sha_retarget_request_only_drives_the_fresh_turn(self):
         self.sweep([self.parent, self.child])
         self.child["base"].update(ref="main", sha=A)
         self.sweep([self.parent, self.child])
         output, seat = self.human_request(self.child, [])
-        seat.assert_not_called()  # a fixer request is not a fresh human verdict
+        self.assert_only_fresh_turn(seat, output)  # a request is not a verdict or a receipt
+        self.assertEqual(self.posts, [])
+
+    def test_same_sha_retarget_with_unreadable_baseline_never_wakes_reviewer(self):
+        self.sweep([self.parent, self.child])
+        self.child["base"].update(ref="main", sha=A)
+        self.sweep([self.parent, self.child], baseline=(None, "HTTP 502"))
+        self.assertTrue(transition.baseline_missing(transition.hold(self.st, 184, C)))
+        output, seat = self.human_request(self.child, [])
+        seat.assert_not_called()
         self.assertIn("[SILENT]", output)
         self.assertEqual(self.posts, [])
 

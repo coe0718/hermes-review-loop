@@ -2035,6 +2035,15 @@ def group_watchdog() -> None:
     run("watchdog.py", None, "--loop", "widgets", extra_env={"REVIEW_LOOP_TEST": ""})
     check("ready transition keeps same-head hold", load_state("stack-transitions.json").get("9", {}).get("head"), HEAD_A)
     check("ready transition does not wake stale work", len(RECEIVED) - before, 0)
+    # Owner policy (#23): the ready, retargeted child gets ONE fresh isolated reviewer turn.
+    # This harness has no private runtime, so the enqueue fails visibly and stays retryable.
+    fresh = load_state("stack-transitions.json").get("9", {}).get("fresh_review") or {}
+    check("ready retarget attempts the fresh reviewer turn", fresh.get("state"), "retry")
+    check("  under the transition's own turn key",
+          str(fresh.get("turn_key", "")).startswith("retarget:parent:"), True)
+    _, out, _ = run("watchdog.py", None, "--loop", "widgets", extra_env={"REVIEW_LOOP_TEST": ""})
+    check("  a failed fresh enqueue is reported and retried next sweep",
+          "fresh review after retarget not enqueued" in out, True)
 
     # shape 1: the reviewer never posted a verdict
     reset(prs={"7": pr(7, head=HEAD_A)})
