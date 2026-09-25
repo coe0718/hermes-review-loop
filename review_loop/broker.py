@@ -106,6 +106,11 @@ def authorize(loop: dict, *, repo: str, number: int, head: str, role: str,
     return login
 
 
+# A reviewer write must move the loop: an approval cues the merge, changes-requested wakes the
+# fixer. A COMMENT is neither, so it would spend the reviewer's one write and stall the PR.
+REVIEW_VERDICTS = ("APPROVE", "REQUEST_CHANGES")
+
+
 def perform(loop: dict, *, repo: str, number: int, head: str, role: str,
             branch: str, operation: str, verdict: str = "", body: str = "",
             require_verdict: bool = True) -> object:
@@ -119,7 +124,7 @@ def perform(loop: dict, *, repo: str, number: int, head: str, role: str,
     login = authorize(loop, repo=repo, number=number, head=head, role=role,
                       branch=branch, operation=operation, require_verdict=require_verdict)
     if operation == "review":
-        if verdict not in ("APPROVE", "REQUEST_CHANGES", "COMMENT") or not body.strip():
+        if verdict not in REVIEW_VERDICTS or not body.strip():
             raise BrokerDenied("invalid review verdict or empty body")
         path = f"/repos/{repo}/pulls/{number}/reviews"
         payload = {"commit_id": head, "event": verdict, "body": body}

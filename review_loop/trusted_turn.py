@@ -149,8 +149,9 @@ _COMMON = ('You have no GitHub credentials or network. Never claim a write succe
            'do not retry it, say so.')
 TOOLS = {
     'reviewer': ('For your one authorized write use `python -m review_loop.broker_client review '
-                 '--verdict APPROVE --body-file /work/review.txt` (or REQUEST_CHANGES/COMMENT). '
-                 'A reviewer gets exactly one write. '),
+                 '--verdict APPROVE --body-file /work/review.txt` (or --verdict REQUEST_CHANGES). '
+                 'The verdict must be exactly APPROVE or REQUEST_CHANGES; anything else is refused '
+                 'without spending the write. A reviewer gets exactly one write. '),
     'fixer': ('To publish use `python -m review_loop.broker_client push '
               '--manifest-file /work/manifest.json`, then `python -m review_loop.broker_client '
               'request_review`. A fixer gets one push followed by one review request. '),

@@ -64,6 +64,8 @@ def main() -> None:
             parser.error('ruling requires --verdict ACCEPT|REJECT|RESPEC and --body-file')
         if args.manifest_file or (args.operation == 'review' and not args.body_file):
             parser.error('invalid review arguments')
+        if args.operation == 'review' and args.verdict not in ('APPROVE', 'REQUEST_CHANGES'):
+            parser.error('review requires --verdict APPROVE|REQUEST_CHANGES (COMMENT is not a verdict)')
         body = Path(args.body_file).read_text() if args.body_file else ''
         if len(body.encode()) > 12 * 1024:
             parser.error('body too large')

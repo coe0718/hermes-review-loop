@@ -238,6 +238,11 @@ class RunBroker:
             raise ProtocolError("invalid review fields")
         if self._used and not (operation == "request_review" and self._pushed_head):
             raise ProtocolError("run capability already used")
+        if operation == "review" and (verdict not in broker.REVIEW_VERDICTS or not body.strip()):
+            # Refused before the capability is consumed, so the reviewer can resubmit a real
+            # verdict in the same turn. A COMMENT would neither wake the fixer nor cue a merge.
+            raise ProtocolError("review verdict must be APPROVE or REQUEST_CHANGES with a non-empty "
+                                "body (COMMENT is not a verdict); nothing was written, resubmit")
         # Consume BEFORE an external write: a lost response cannot lead to a replay.
         self._used = True
         after_push = operation == "request_review" and bool(self._pushed_head)
@@ -405,6 +410,8 @@ def main() -> None:
             parser.error("ruling requires --verdict ACCEPT|REJECT|RESPEC and --body-file")
         if args.manifest_file or (args.operation == "review" and not args.body_file):
             parser.error("invalid review arguments")
+        if args.operation == "review" and args.verdict not in broker.REVIEW_VERDICTS:
+            parser.error("review requires --verdict APPROVE|REQUEST_CHANGES (COMMENT is not a verdict)")
         body = Path(args.body_file).read_text() if args.body_file else ""
         if len(body.encode()) > MAX_BODY:
             parser.error("review body too large")

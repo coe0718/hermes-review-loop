@@ -81,8 +81,8 @@ class ReceiptLedger:
 def submit(loop, scope, ledger, verdict, body):
     """Claim before POST, read exact returned ID, then re-resolve generation."""
     from . import broker
-    expected = {'APPROVE': 'APPROVED', 'REQUEST_CHANGES': 'CHANGES_REQUESTED',
-                'COMMENT': 'COMMENTED'}
+    expected = {'APPROVE': 'APPROVED', 'REQUEST_CHANGES': 'CHANGES_REQUESTED'}
+    # Verdicts only (broker.REVIEW_VERDICTS): a COMMENT would spend the one write and stall the PR.
     if verdict not in expected or not isinstance(body, str) or not body.strip():
         raise ReceiptDenied('invalid verdict')
     login = broker.authorize(loop, repo=scope.repo, number=scope.number, head=scope.head,
