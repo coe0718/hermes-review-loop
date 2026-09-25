@@ -94,6 +94,54 @@ class TurnStaging(unittest.TestCase):
             self.assertIn("vendor/reviewer-model", seen["argv"])
 
 
+class ProviderPathUpstream(unittest.TestCase):
+    """OpenRouter-style upstreams live at /api/v1/chat/completions; the sandbox path stays fixed."""
+
+    def test_host_chosen_upstream_path_and_its_limits(self):
+        import http.server
+        import threading
+        from review_loop import inference_proxy
+        seen = []
+
+        class Upstream(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def do_POST(self):
+                seen.append((self.path, self.headers.get("Authorization")))
+                self.rfile.read(int(self.headers["Content-Length"]))
+                data = b'{"choices": []}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                url = f"http://127.0.0.1:{server.server_port}/api/v1/chat/completions"
+                with inference_proxy.InferenceCapability(pathlib.Path(tmp) / "c", url, REVIEWER_KEY,
+                                                         model="m", quota=2) as cap:
+                    for path, status in (("/api/v1/chat/completions", 400),
+                                         (inference_proxy.PATH, 200)):
+                        conn = inference_proxy._UnixHTTP(str(cap.socket_path))
+                        conn.request("POST", path, body=b"{}")
+                        self.assertEqual(conn.getresponse().status, status)
+                        conn.close()
+                for bad in ("https://h/v1/completions", "https://h/v1/../chat/completions",
+                            "https://h//chat/completions", "https://h/v1/chat/completions?x=1"):
+                    with self.subTest(bad=bad), self.assertRaises(ValueError):
+                        inference_proxy._NoRedirectConnection(bad)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+        self.assertEqual(seen, [("/api/v1/chat/completions", "Bearer " + REVIEWER_KEY)])
+
+
 def _bwrap_works() -> bool:
     if not shutil.which("bwrap") or not os.path.exists("/usr/bin/python3"):
         return False

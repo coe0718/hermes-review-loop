@@ -232,7 +232,7 @@ def bridge(entry: list[str], socket_path: str = '/opt/inference/model.sock') -> 
             conn = _UnixHTTP(socket_path)
             try:
                 # Never forward Hermes's dummy Authorization or caller-selected headers.
-                conn.request('POST', self.url.path, body=body, headers={'Content-Type': 'application/json'})
+                conn.request('POST', PATH, body=body, headers={'Content-Type': 'application/json'})
                 response = conn.getresponse()
                 data = response.read(MAX_RESPONSE + 1)
                 if len(data) > MAX_RESPONSE:
