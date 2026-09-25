@@ -486,12 +486,32 @@ class LoopState:
 
     def transition_set(self, number: int, entry: dict) -> dict:
         """Separate durable ledger: whole-watchdog snapshots cannot erase holds."""
+        return self._transition_write(number, lambda prior: None
+                                      if isinstance(prior, dict) and prior.get("head") == entry["head"]
+                                      else entry)
+
+    def transition_update(self, number: int, head: str, fields: dict) -> dict | None:
+        """Merge bookkeeping into the hold for exactly this head; never create or move one.
+
+        The boundary facts themselves (head, from_base, at, old_review_ids) are not
+        writable here: only a new ``record`` for a new head may replace them.
+        """
+        protected = {"head", "from_base", "observed_stacked_head", "at", "old_review_ids"}
+        if protected & set(fields):
+            raise ValueError("transition boundary facts are immutable")
+        result = self._transition_write(
+            number, lambda prior: {**prior, **fields}
+            if isinstance(prior, dict) and prior.get("head") == head else None)
+        return result if isinstance(result, dict) and result.get("head") == head else None
+
+    def _transition_write(self, number: int, change) -> dict:
         self.dir.mkdir(parents=True, exist_ok=True)
         with (self.dir / "stack-transitions.lock").open("a+") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             data = self._load(self.transitions_file, {}) or {}
             prior = data.get(str(number))
-            if isinstance(prior, dict) and prior.get("head") == entry["head"]:
+            entry = change(prior)
+            if entry is None:
                 return prior
             data[str(number)] = entry
             fd, name = tempfile.mkstemp(dir=self.dir, prefix=".stack-transitions-")
