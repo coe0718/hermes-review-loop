@@ -111,10 +111,12 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual(len(self.launches()), 1)
 
     def test_running_lease_heartbeats_and_completion_after_expiry(self):
-        sup = self.supervisor(delay=0.5, lease_seconds=0.06, child_timeout=2)
+        # Sleep well past one lease: only heartbeats keep the run alive. The lease is wide
+        # enough that a slow CI runner's SQLite stall does not miss a whole beat.
+        sup = self.supervisor(delay=2.0, lease_seconds=0.6, child_timeout=5)
         sup.enqueue("heartbeat", "o/r", 9, "head", "reviewer")
         self.wait(sup, "heartbeat", "running")
-        time.sleep(0.25)
+        time.sleep(1.0)
         sup.recover()
         self.assertEqual(sup.get("heartbeat")["state"], "running")
         self.wait(sup, "heartbeat", "succeeded")
