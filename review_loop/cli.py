@@ -19,7 +19,7 @@ import time
 import tempfile
 from urllib.parse import urlsplit
 
-from . import config, doctor, gate, gh, observer, prompts, routes, state as state_mod
+from . import config, doctor, gate, gh, observer, prompts, route_intent, routes, state as state_mod
 
 SHIM_NAME = "review-loop-watchdog.py"
 
@@ -68,18 +68,7 @@ def _routes_of(loop: dict) -> dict:
     A hand-edited loop may route its reviewer anywhere; every path that fires, verifies or
     rebinds a route must read that answer rather than re-derive the convention.
     """
-    names: dict = {}
-    for role in ("reviewer", "fixer"):
-        name = str(((loop.get("seats") or {}).get(role) or {}).get("route") or "")
-        if name:
-            names[role] = name
-    adjudicator = str((loop.get("adjudicator") or {}).get("route") or "")
-    if adjudicator:
-        names["adjudicator"] = adjudicator
-    observer_route = str((loop.get("observer") or {}).get("route") or "")
-    if observer_route:
-        names["observer"] = observer_route
-    return names
+    return route_intent.routes_of(loop)
 
 
 # Which gate script each role's route must run. Ownership is checked against this before a route
@@ -760,6 +749,9 @@ def cmd_init(args) -> int:
     # `init` starts from clean rather than from a loop nobody can see.
     try:
         written_routes = list(_install_routes(loop).values())
+        # The plugin's private copy of what it just wrote (secret included) is part of the same
+        # transaction: self-heal restores from it, so it must never describe routes that failed.
+        route_intent.record_live(loop, written_routes, replace=True)
     except Exception as exc:
         try:
             routes.restore_entries(previous_routes)
@@ -783,6 +775,10 @@ def cmd_init(args) -> int:
             routes.restore_entries(previous_routes)
         except Exception as rollback_exc:
             failed.append(f"routes: {rollback_exc}")
+        try:
+            route_intent.forget(loop, written_routes)
+        except Exception as rollback_exc:
+            failed.append(f"route intent: {rollback_exc}")
         try:
             if previous_config is None:
                 path.unlink(missing_ok=True)
@@ -919,16 +915,27 @@ def cmd_set(args) -> int:
             return 2
         try:
             host = config.webhook_host(updated.get("host"), required=True)
-            routes.new_route(name, profile=after["profile"], prompt=prompts.OBSERVER,
-                             events=["pull_request"], script="observe.py",
-                             deliver=after["deliver"], deliver_only=True, host=host,
-                             description=f"{updated['repo']} — read-only observer feed")
+            written = routes.new_route(name, profile=after["profile"], prompt=prompts.OBSERVER,
+                                       events=["pull_request"], script="observe.py",
+                                       deliver=after["deliver"], deliver_only=True, host=host,
+                                       description=f"{updated['repo']} — read-only observer feed")
         except (OSError, ValueError, config.ConfigError) as exc:
             print(f"observer route could not be reconciled; loop config unchanged: {exc}")
+            return 2
+        try:
+            route_intent.record(updated, {name: written})
+        except (OSError, ValueError) as exc:
+            # Without the record, self-heal would put the *old* route back: undo the route too.
+            try:
+                routes.restore_entries({name: existing})
+            except (OSError, ValueError) as rollback_exc:
+                print(f"ROLLBACK FAILED: {rollback_exc} — inspect route {name!r} manually")
+            print(f"observer route intent could not be recorded; loop config unchanged: {exc}")
             return 2
     path = _write_config(updated)
     if destination_changed and before.get("route") and before["route"] != after.get("route"):
         try:
+            route_intent.forget(updated, [before["route"]])
             routes.remove_route(before["route"])
         except (OSError, ValueError) as exc:
             print(f"warning: old observer route {before['route']!r} remains; remove it manually: {exc}")
@@ -1079,6 +1086,8 @@ def cmd_apply(args) -> int:
             attempted_hooks.append((hook_id, old))
             _patch_hook_url(loop, hook_id, new)
         path = _write_config(updated) if changes or identity else config_path
+        if rebound:
+            route_intent.record_live(updated, [name for _, name in rebound])
     except Exception as exc:
         failed = []
         for hook_id, old in reversed(attempted_hooks):
@@ -1324,6 +1333,12 @@ def cmd_doctor(args) -> int:
         return 0
     failed = 0
     for loop in loops:
+        if getattr(args, "repair", False):
+            # The one write doctor can make, and only when asked: put this loop's own routes back
+            # from the plugin's intent record (same secret). Everything after it stays read-only.
+            lines = route_intent.heal(loop)
+            print("\n".join(lines) if lines else
+                  f"[{loop['id']}] repair: routes match the plugin's intent record — nothing restored")
         failed += doctor.report(loop, doctor.check_loop(loop, offline=args.offline),
                                 strict=args.strict)
     return 1 if failed else 0
@@ -1504,6 +1519,13 @@ def cmd_cleanup(args) -> int:
 
 def cmd_uninstall(args) -> int:
     loop = config.load_id(args.loop)
+    # Forget first: a route the operator removed must not be put back by the next watchdog
+    # sweep's self-heal (which only ever restores routes still in the intent record).
+    try:
+        route_intent.forget(loop, _routes_of(loop).values())
+    except OSError as exc:
+        print(f"refused: route intent record could not be updated, routes left in place: {exc}")
+        return 2
     for name in _routes_of(loop).values():
         if name and routes.remove_route(name):
             print(f"route removed: {name}")
@@ -1640,6 +1662,9 @@ def register_cli(ctx, settings: dict | None = None) -> None:
                                help="skip the two network probes (gateway reachability, repo hooks)")
         preflight.add_argument("--strict", action="store_true",
                                help="treat a check that could not be decided as a failure")
+        preflight.add_argument("--repair", action="store_true",
+                               help="restore this loop's own routes from the plugin's intent record "
+                                    "(same secret) before checking; the only write doctor makes")
         preflight.set_defaults(func=cmd_doctor)
 
         check = sub.add_parser("selftest", help="Verify the live isolated path step by step "

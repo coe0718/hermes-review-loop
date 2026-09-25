@@ -234,7 +234,8 @@ direction.
 A loop that stopped being driven looks exactly like a loop with nothing to do, and no single file
 answers "why". Half the answer is in GitHub (the head, the verdicts *at that head*, whether an
 approval exists) and half is on disk (who holds the PR, what is queued, what is marked in flight,
-what the watchdog last saw). `hermes review-loop explain --pr N` reads both and prints one report.
+what the watchdog last saw). `hermes review-loop explain --pr N` reads both and prints one report (example output:
+[Operating a loop](operations.md#why-isnt-this-pr-moving)).
 
 It is **the gates' own logic, walked differently**, and that is the design constraint that matters:
 
@@ -290,7 +291,8 @@ no webhook was fired.
 
 The loop is unattended, which is the point — but "nobody is watching" and "nothing is visible" are
 different things. A loop may carry one **observer**: a chat destination that receives a short notice
-each time the loop changes state, without joining the loop.
+each time the loop changes state, without joining the loop. (Operator guide:
+[observer.md](observer.md); keys: [configuration](configuration.md#the-observer-feed).)
 
 A notice is emitted *at* the transition, by whoever made it — the reviewer gate on a handoff, the
 fixer gate on a verdict, `breach()` when the cap is spent, the reviewer gate on a close, and the
@@ -357,6 +359,7 @@ state (locks, queue, in-flight marks, breach marker). Rails, because this delete
 `hermes review-loop doctor --loop <id>` walks the installation read-only and answers one question:
 **can this loop wake a seat and post a verdict?** It is the installation-level counterpart of the
 watchdog — the watchdog asks "is this PR stalled?", the preflight asks "is this loop wired at all?"
+Example transcripts are in [Operating a loop](operations.md#preflight-doctor).
 
 | check | what it proves |
 |---|---|
@@ -365,7 +368,7 @@ watchdog — the watchdog asks "is this PR stalled?", the preflight asks "is thi
 | `credential:<seat>` | a nonempty token file is mapped for that seat's login through `gh.token_path`; profile `GH_TOKEN` alone is not used by the gates |
 | `token:<login>` | every credential file named in the config exists, is non-empty, and is not readable by group or other users |
 | `read_token` | the login the gates read GitHub as is one of those mappings |
-| `route:<name>` | the gateway's registry holds the route, it wakes *this* seat's profile, it carries a secret and a prompt, it runs the right gate script for the right event, and it resolves to this loop's own gateway origin |
+| `route:<name>` | the gateway's registry holds the route, it wakes *this* seat's profile, it carries a secret and a prompt, it runs the right gate script for the right event, and it resolves to this loop's own gateway origin — and, when the plugin has an intent record for it, still matches that record (a rotated secret looks well-formed but no longer matches GitHub's hook) |
 | `scripts` | the plugin's `watchdog.py`, both gates and `cleanup.py` are on disk |
 | `cron:shim` | `~/.hermes/scripts/review-loop-watchdog.py` exists **and is pinned to the plugin install that is here now** — an upgrade that moves the directory leaves the scheduler running an old path |
 | `cron:job` | the scheduler's own store holds this loop's watchdog job and it is not paused |
@@ -389,7 +392,9 @@ hook that exists. Failures exit 1 and each one carries the single command that f
 `--strict` makes an `unknown` a failure too, for installs that require a fully proved preflight.
 
 Read-only is a hard rule here, twice over. The preflight writes no config, route, state or hook —
-a check that repairs what it looks at cannot be trusted to describe what is wrong — and it never
+a check that repairs what it looks at cannot be trusted to describe what is wrong (the one
+exception is opt-in: `doctor --repair` runs the watchdog's route self-heal *before* the checks,
+and prints what it restored) — and it never
 fires a route, because a synthetic POST at a seat's route **is** a real agent run with a real
 budget. The entire network side of the preflight is a TCP connect to the gateway and, when the
 token is permitted, a read of the repo's hooks. There is deliberately no test-fire mode: the way
@@ -402,3 +407,29 @@ middleware and skills — and it **cannot** own webhook routes, GitHub hooks or 
 why `init` writes those through the operator-visible config surfaces instead of inventing a second
 registry. The consequence is good: nothing about the install is hidden, `uninstall` is the inverse
 of `init`, and a broken loop can always be inspected with the tools the gateway already has.
+
+## The shared route registry (issue #1)
+
+`webhook_subscriptions.json` has writers the plugin does not control: Hermes's own CLI and
+dashboard rewrite it without the plugin's `flock`. Until upstream gives every writer one locked
+transaction (NousResearch/hermes-agent#120964), the plugin defends its own routes:
+
+1. **Optimistic concurrency** (`routes._transact`). Under the plugin lock, each read records the
+   file's `(st_ino, st_mtime_ns, st_size, sha256)`; immediately before `os.replace` the file is
+   re-read and re-hashed, and on any difference the edit is re-applied to the fresh bytes (bounded
+   at `CONFLICT_RETRIES`, then `RegistryConflictError`, nothing published). Edits are pure
+   functions of the parsed registry, so a retry never mints a second secret.
+2. **Intent record** (`route_intent`, `<state_dir>/route-intent.json`, 0600, atomic). `init`,
+   `apply` and `set` record what they wrote as the last step of their transaction (a failure rolls
+   the route back rather than leaving a record the registry does not match); `uninstall` and an
+   observer rename forget first, so self-heal never fights an operator who changed things
+   through the plugin. Routes a loop installed before the record existed are *adopted* on the
+   next sweep if their gate script and prompt prove they are this loop's.
+3. **Self-heal** (`route_intent.heal`, from every armed watchdog sweep, before the PR listing).
+   For each of *this loop's* route names in the record: missing → restored; watched fields
+   differ and the live entry still runs a review-loop gate → restored with the recorded secret;
+   live entry now runs someone else's script → reported, never overwritten. A malformed registry
+   or record → alert, nothing written. Restores go through the same optimistic write, so a
+   native change racing the heal survives it.
+
+The remaining window is stated in [issue-1-route-self-heal.md](issue-1-route-self-heal.md).
