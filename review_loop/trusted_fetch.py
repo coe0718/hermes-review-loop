@@ -83,7 +83,8 @@ def _identity(loop: dict, repo: str, number: int, head: str, ref: str, role: str
         raise FetchDenied("repository mismatch")
     if type(number) is not int or number <= 0 or not isinstance(head, str) or not _SHA.fullmatch(head):
         raise FetchDenied("invalid PR identity")
-    if role not in ("reviewer", "fixer") or not isinstance(ref, str) or not ref or ref.startswith("-"):
+    # The adjudicator reads the same exact-head export; its mount is read-only (contained.py).
+    if role not in ("reviewer", "fixer", "adjudicator") or not isinstance(ref, str) or not ref or ref.startswith("-"):
         raise FetchDenied("invalid role or ref")
     seats = loop.get("seats") or {}
     reader = loop.get("read_token")

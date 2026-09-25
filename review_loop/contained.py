@@ -18,7 +18,8 @@ def command(*, code: Path, venv: Path, runtime: Path, home: Path,
             checkout: Path, rust: Path, query: Path, entry: list[str],
             network: bool = False, inference_socket_dir: Path | None = None,
             broker_socket_dir: Path | None = None,
-            client_code: Path | None = None) -> list[str]:
+            client_code: Path | None = None,
+            checkout_writable: bool = True) -> list[str]:
     """Build an allowlisted mount namespace for the *entire* process tree.
 
     code must be a separately staged, audited, credentialless source snapshot;
@@ -61,7 +62,7 @@ def command(*, code: Path, venv: Path, runtime: Path, home: Path,
             "--ro-bind", str(code), "/opt/code",
             "--ro-bind", str(rust), "/opt/rust",
             "--bind", str(home), "/home/agent",
-            "--bind", str(checkout), "/work",
+            "--bind" if checkout_writable else "--ro-bind", str(checkout), "/work",
             "--ro-bind", str(query), "/opt/query"]
     if inference_socket_dir is not None:
         mounts += ["--dir", "/opt/inference", "--ro-bind", str(Path(inference_socket_dir)), "/opt/inference"]
@@ -73,7 +74,7 @@ def command(*, code: Path, venv: Path, runtime: Path, home: Path,
     return mounts + [
             "--setenv", "HOME", "/home/agent", "--setenv", "HERMES_HOME", "/home/agent",
             "--setenv", "PYTHONPATH", "/opt/code:/opt/client" if client_code else "/opt/code", "--setenv", "CARGO_HOME", "/tmp/cargo",
-            "--setenv", "RUSTUP_HOME", "/tmp/rustup", "--setenv", "CARGO_TARGET_DIR", "/work/target",
+            "--setenv", "RUSTUP_HOME", "/tmp/rustup", "--setenv", "CARGO_TARGET_DIR", "/work/target" if checkout_writable else "/tmp/target",
             "--setenv", "TMPDIR", "/tmp", "--setenv", "PATH", "/opt/venv/bin:/opt/rust/bin:/usr/bin:/bin",
             "--setenv", "GIT_CONFIG_GLOBAL", "/dev/null", "--setenv", "GIT_CONFIG_SYSTEM", "/dev/null",
             "--setenv", "GIT_TERMINAL_PROMPT", "0", "--chdir", "/work", "--", *entry]
