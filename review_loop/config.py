@@ -24,7 +24,7 @@ File shape (all keys except ``repo`` have defaults)::
       "adjudicator": {"route": "attest-loop-breach", "profile": "default"},
       "observer": {"route": "attest-observe", "profile": "tuck", "deliver": "telegram",
                    "events": ["opened", "handoff", "verdict", "approved", "escalation",
-                              "stall", "closed"],
+                              "ruling", "stall", "closed"],
                    "digest_min": 0, "mute": false},
       "skill": "attest-pr-review",
       "read_token": "tuck-coe",
@@ -318,11 +318,75 @@ def seat_concurrency(loop: dict, seat: str) -> int:
     """
     seat_cfg = (loop.get("seats") or {}).get(seat) or {}
     value = seat_cfg.get("concurrency")
-    if value is None or value == "":
+    if (value is None or value == "") and seat != "adjudicator":
+        # The loop default is documented as the default for the two *working* seats. A ruling
+        # is rare and read-only; it never inherits a parallelism the operator chose for reviews.
         value = loop.get("concurrency", 1)
     if value is None or value == "":
         value = 1
     return int(value)
+
+
+def adjudicator_login(loop: dict) -> str:
+    """The optional GitHub identity the adjudicator comments as, or ``""`` for operator-only.
+
+    Unlike the two working seats the adjudicator needs no GitHub identity at all: a ruling is
+    always delivered to the operator and recorded in the host ledger. Only when this is set is
+    the ruling *also* posted on the PR, as this login and never as a seat or the reader.
+    """
+    return str((((loop.get("seats") or {}).get("adjudicator")) or {}).get("login") or "")
+
+
+def _adjudicator_seat(raw, loop: dict, where: str) -> dict:
+    """Validate ``seats.adjudicator`` — only a login (with its own token) and a concurrency.
+
+    The broker re-checks every one of these properties against live credentials before any
+    write; this is the early, file-level refusal, so an unsafe shape never loads at all.
+    """
+    if raw is None or raw == {}:
+        return {}
+    if not isinstance(raw, dict) or not set(raw) <= {"login", "concurrency"}:
+        raise ConfigError(f"{where}: seats.adjudicator may only hold 'login' and 'concurrency'")
+    seat: dict = {}
+    if raw.get("concurrency") not in (None, ""):
+        seat["concurrency"] = int(raw["concurrency"])
+        if seat["concurrency"] < 1:
+            raise ConfigError(f"{where}: seats.adjudicator.concurrency must be >= 1 (1 = serialized)")
+    login = raw.get("login")
+    if login in (None, ""):
+        return seat
+    if not isinstance(login, str) or not login.strip() or login != login.strip():
+        raise ConfigError(f"{where}: seats.adjudicator.login must be a GitHub login")
+    others = {str(x).casefold() for x in (
+        loop.get("read_token"), loop.get("reviewer_seat"),
+        (loop["seats"].get("reviewer") or {}).get("login"),
+        (loop["seats"].get("fixer") or {}).get("login"),
+        *loop["reviewers"], *loop["fixers"]) if x}
+    if login.casefold() in others:
+        raise ConfigError(f"{where}: seats.adjudicator.login {login!r} is also the reader, a seat "
+                          "or an allowlisted reviewer/fixer — the ruling identity must be its own "
+                          "account")
+    tokens = loop.get("tokens") or {}
+    if not tokens.get(login):
+        raise ConfigError(f"{where}: seats.adjudicator.login {login!r} has no entry in 'tokens' — "
+                          "an adjudicator identity without its own credential cannot comment")
+    mine = _path(tokens[login])
+    for other, raw_path in tokens.items():
+        if other == login or not raw_path:
+            continue
+        theirs = _path(raw_path)
+        same = os.path.realpath(mine) == os.path.realpath(theirs)
+        if not same and mine.exists() and theirs.exists():
+            try:
+                same = mine.samefile(theirs)
+            except OSError as exc:
+                raise ConfigError(f"{where}: cannot verify adjudicator token file identity: "
+                                  f"{exc}") from exc
+        if same:
+            raise ConfigError(f"{where}: the adjudicator and {other!r} read the same token file "
+                              "— the ruling identity needs its own credential")
+    seat["login"] = login
+    return seat
 
 
 def normalize_observer(raw) -> dict:
@@ -643,6 +707,7 @@ def normalize(raw: dict, source: pathlib.Path | None = None) -> dict:
     if not loop["reviewers"]:
         raise ConfigError(f"{where}: 'reviewers' must list at least one GitHub login")
 
+    raw_seats = loop.get("seats") if isinstance(loop.get("seats"), dict) else {}
     seats = {}
     for seat in SEAT_KEYS:
         seat_cfg = dict((loop.get("seats") or {}).get(seat) or {})
@@ -681,6 +746,9 @@ def normalize(raw: dict, source: pathlib.Path | None = None) -> dict:
 
     loop["tokens"] = {k: str(v) for k, v in (loop.get("tokens") or {}).items()}
     loop["read_token"] = str(loop.get("read_token") or (next(iter(loop["tokens"]), "")))
+    adjudicator_seat = _adjudicator_seat(raw_seats.get("adjudicator"), loop, where)
+    if adjudicator_seat:
+        seats["adjudicator"] = adjudicator_seat
     loop["roots"] = [str(p) for p in (loop.get("roots") or [])]
     for root in loop["roots"]:
         reason = dangerous_root(root)
