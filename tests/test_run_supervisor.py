@@ -189,7 +189,9 @@ class ReviewerClaimConcurrency(unittest.TestCase):
             con.execute("UPDATE runs SET state='pending' WHERE delivery='review'")
         # Exercise the production generation gate without launching a worker.
         self.sup.production_config = Path(self.tmp.name) / 'unused-config'
-        self.loop = {'repo': 'o/r', 'base': 'main', 'read_token': 'read'}
+        # A configured loop always has a state_dir: the claim reads its retarget holds there.
+        self.loop = {'repo': 'o/r', 'base': 'main', 'read_token': 'read',
+                     'state_dir': str(Path(self.tmp.name) / 'state')}
 
     def pull(self, base_sha='b' * 40):
         return {'number': 1, 'state': 'open', 'draft': False,

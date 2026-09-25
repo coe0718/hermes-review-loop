@@ -62,7 +62,16 @@ COMMENT_STATES = ("pending", "none", "denied", "posting", "posted", "uncertain")
 _WORKERS: list[subprocess.Popen] = []
 
 
-def adjudication_state(loop: dict | None, row) -> tuple[str, dict]:
+def effective_reviews(loop: dict, row, reviews, ledger=None):
+    """The PR's reviews as a seat may use them: after a same-head retarget, only
+    host-receipted post-boundary reviews (``transition.effective_reviews``); ``None`` when
+    either the review list or the receipt ledger is unreadable."""
+    from . import state as state_mod, transition
+    return transition.effective_reviews(loop, state_mod.state_for(loop), row['pr'], row['head'],
+                                        reviews, ledger=ledger)
+
+
+def adjudication_state(loop: dict | None, row, ledger=None) -> tuple[str, dict]:
     """Live eligibility of a queued adjudicator turn: ``('ok'|'superseded'|'retry', facts)``.
 
     The ledger row and the breach marker are pointers, never authority: every fact that makes
@@ -94,7 +103,9 @@ def adjudication_state(loop: dict | None, row) -> tuple[str, dict]:
     author = ((pr.get('user') or {}).get('login') or '') if isinstance(pr.get('user'), dict) else ''
     if not author or author.lower() not in set(loop.get('fixers') or ()):
         return 'superseded', {}
-    reviews = gh.reviews(loop, row['pr'])
+    # A retarget hold counts only receipted post-boundary verdicts: an old approval neither
+    # supersedes the breach nor do old rounds make up its cap.
+    reviews = effective_reviews(loop, row, gh.reviews(loop, row['pr']), ledger)
     if not isinstance(reviews, list):
         return 'retry', {}
     latest = gate.latest_effective_review_at_head(reviews, loop, row['head'])
@@ -617,7 +628,7 @@ class Supervisor:
             if self.production_config and row['seat'] == 'adjudicator':
                 from . import config
                 try:
-                    status, _ = adjudication_state(config.by_repo(row['repo']), row)
+                    status, _ = adjudication_state(config.by_repo(row['repo']), row, self.db)
                     superseded, retry_read = status == 'superseded', status == 'retry'
                 except Exception:
                     retry_read = True
@@ -637,7 +648,8 @@ class Supervisor:
                         elif pr.get('state') != 'open' or pr.get('draft') is not False:
                             retry_read = True
                         else:
-                            reviews = gh.reviews(loop, row['pr'])
+                            reviews = effective_reviews(loop, row, gh.reviews(loop, row['pr']),
+                                                        self.db)
                             if not isinstance(reviews, list):
                                 retry_read = True
                             else:
@@ -865,7 +877,7 @@ class Supervisor:
             reviews, marker = None, None
             if row['seat'] == 'fixer':
                 from . import gate
-                reviews = gh.reviews(loop, row['pr'])
+                reviews = effective_reviews(loop, row, gh.reviews(loop, row['pr']), self.db)
                 latest = (gate.latest_effective_review_at_head(reviews, loop, row['head'])
                           if isinstance(reviews, list) else None)
                 if latest is None or gh.review_state(latest) != 'CHANGES_REQUESTED':
@@ -873,12 +885,14 @@ class Supervisor:
             elif row['seat'] == 'adjudicator':
                 # Same live checks as the claim, repeated right before launch: the claim's
                 # reads may be minutes old, and a ruling on a moved or approved head is noise.
-                status, facts = adjudication_state(loop, row)
+                status, facts = adjudication_state(loop, row, self.db)
                 if status != 'ok':
                     raise ValueError('adjudication no longer current')
                 reviews, marker = facts['reviews'], facts['marker']
             else:
-                reviews = gh.reviews(loop, row['pr'])
+                # A fresh review after a retarget starts from nothing: old verdicts are
+                # neither its round count nor its PR record.
+                reviews = effective_reviews(loop, row, gh.reviews(loop, row['pr']), self.db)
             scope = broker_ipc.RunScope(row["repo"], row["pr"], row["head"],
                                         row["seat"], head["ref"], row['id'],
                                         str(self.db), row['generation'])

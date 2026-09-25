@@ -53,14 +53,19 @@ def main() -> None:
         silence()
 
     if action == "edited":
-        # A base edit is an observation signal, never an unattended turn.
+        # A base edit is only a hint to re-read the live PR. A stacked child now on trunk at
+        # the same head starts a fresh review situation: the transition's one isolated
+        # reviewer turn, deduplicated by its turn key against redeliveries and the sweep.
         number = gate.number_of(payload, pr)
         live = gh.pr(loop, number)
         if (isinstance(live, dict) and live.get("number") == number and
                 live.get("state") == "open" and
                 (live.get("base") or {}).get("ref") == loop["base"]):
-            transition.record(loop, st, number, (live.get("head") or {}).get("sha"),
-                              loop["base"])
+            if transition.record(loop, st, number, (live.get("head") or {}).get("sha"),
+                                 loop["base"]):
+                status, detail = transition.start_fresh_review(loop, st, number, live=live)
+                log(f"#{number} retarget: fresh review {status} ({detail})")
+                silence(f"base retarget: fresh review {status} — {detail}")
         silence("base edit observed — no reviewer run")
     if action not in ACTIONS:
         silence(f"action {action!r} is not a review trigger")
@@ -103,19 +108,24 @@ def main() -> None:
     if (snapshot_base_sha and (pr.get("base") or {}).get("ref") != loop["base"]
             and snapshot_base_sha != (current.get("base") or {}).get("sha")):
         silence("review trigger is from an older base generation")
-    if transition.record(loop, st, number, head, loop["base"]):
-        # A review_requested webhook is not a generation-bound receipt. Even if
-        # requested_reviewers currently names the seat, the API gives no request
-        # timestamp or proof of which base the request targeted. Do not consume
-        # this event as a fresh post-retarget handoff.
-        silence("base retarget hold: push a new trunk head; no trusted same-head request receipt")
+    boundary = transition.record(loop, st, number, head, loop["base"])
+    if boundary and transition.baseline_missing(boundary):
+        silence(f"base retarget hold: {transition.MISSING_BASELINE}")
+    fresh_key = transition.turn_key(boundary) if boundary else ""
+    if boundary and not fresh_key:
+        silence("base retarget hold: transition time unreadable — cannot name its fresh turn")
 
-    reviews = gate.fetch_reviews(loop, number)
+    # After a same-head retarget, only host-receipted post-boundary reviews count: a request
+    # is neither a receipt nor a second fresh turn. It can only re-drive the transition's own
+    # turn (same turn key, so the ledger dedups it against the sweep and the edited hook).
+    reviews = transition.effective_reviews(loop, st, number, head, gate.fetch_reviews(loop, number))
+    if not isinstance(reviews, list):
+        silence("host review receipts unreadable — not guessing which reviews count")
     if gate.reviewed_at_head(reviews, loop, head):
         silence(f"head {head[:7]} already has a reviewer's verdict")
     dismissed = [int(r['id']) for r in gate.reviews_at_head(reviews, loop, head)
                  if gh.review_state(r) == 'DISMISSED' and type(r.get('id')) is int and r['id'] > 0]
-    turn_key = f'dismissed:{max(dismissed)}' if dismissed else ''
+    turn_key = f'dismissed:{max(dismissed)}' if dismissed else fresh_key
     if st.inflight(f"review:{number}:{head}"):
         silence(f"a review for head {head[:7]} is already out")
 

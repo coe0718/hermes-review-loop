@@ -117,3 +117,41 @@ def submit(loop, scope, ledger, verdict, body):
     broker._audit(loop, scope.repo, scope.number, scope.head, scope.branch,
                   'reviewer', 'review', login)
     return {'id': review_id}
+
+
+def confirmed_receipts(db, repo, number, head, base):
+    """Confirmed exact-ID receipts for one PR head on the root base, keyed by review ID.
+
+    Read-only: the host ledger is the only writer. Each receipt must belong to an isolated
+    *reviewer* run for this repo/PR/head whose pinned generation names the same head and the
+    configured root base; anything else (another seat, a different head, a stacked base, an
+    unparseable generation) is simply not a receipt for this situation. An absent ledger means
+    no receipt was ever confirmed (``{}``); an unreadable one is unknown and raises — callers
+    must not mistake a failed read for "no trusted review", nor for a trusted one.
+    """
+    import os
+    if not isinstance(head, str) or not SHA.fullmatch(head) or type(number) is not int:
+        return {}
+    if not db or not os.path.exists(db):
+        return {}
+    con = sqlite3.connect(f'file:{db}?mode=ro', uri=True, timeout=10)
+    try:
+        rows = con.execute(
+            "SELECT r.review_id, r.verdict, r.principal_id, r.generation FROM review_receipts r "
+            "JOIN runs u ON u.id = r.run_id WHERE r.state='confirmed' AND u.seat='reviewer' "
+            "AND u.repo=? AND u.pr=? AND u.head=? AND r.generation = u.generation",
+            (repo, number, head)).fetchall()
+    finally:
+        con.close()
+    found = {}
+    for review_id, verdict, principal_id, generation in rows:
+        try:
+            pinned = json.loads(generation)
+        except (TypeError, ValueError):
+            continue
+        if (not isinstance(pinned, dict) or pinned.get('head') != head
+                or pinned.get('base_ref') != base or pinned.get('parents') != []
+                or type(review_id) is not int or review_id <= 0):
+            continue
+        found[review_id] = {'verdict': verdict, 'principal_id': principal_id}
+    return found

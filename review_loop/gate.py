@@ -437,9 +437,19 @@ def explain_facts(loop: dict, number: int) -> dict:
     readiness = (situation.parent_readiness(loop, state_mod.state_for(loop), number, chain)
                  if isinstance(chain, situation.Resolution) and chain.status == "waiting"
                  else (False, "parent chain unverified"))
+    # A same-head retarget hold is judged by host receipts only; read them here, so that
+    # explain itself still reads nothing. A failed read is reported, never taken as "none".
+    receipts, receipts_error = None, ""
+    head = ((pr.get("head") or {}).get("sha") if isinstance(pr, dict) else None)
+    try:
+        if isinstance(head, str) and head and transition.hold(state_mod.state_for(loop), number, head):
+            receipts = transition.read_receipts(loop, number, head)
+    except Exception as exc:
+        receipts_error = f"{type(exc).__name__}: {exc}"
     return {"pr": pr, "pr_error": pr_error, "reviews": reviews, "reviews_error": reviews_error,
             "armed": armed, "armed_error": armed_error, "read_at": time.time(),
-            "chain": chain, "parent_readiness": readiness}
+            "chain": chain, "parent_readiness": readiness,
+            "receipts": receipts, "receipts_error": receipts_error}
 
 
 def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> dict:
@@ -491,10 +501,19 @@ def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> di
     reviewed = False
     changes: list[dict] = []
     boundary = transition.hold(st, number, head) if head and not stacked else None
+    if reviews is not None and boundary:
+        # A post-retarget review list is diagnostic, not an authorization: its commit_id
+        # cannot prove the base generation or a dispatched run. Only host-receipted
+        # post-boundary reviews count (the same predicate the gates use). Facts without a
+        # receipts read attest nothing; an unreadable ledger leaves the verdicts unknown.
+        receipts = facts.get("receipts", {})
+        reviews = transition.effective_reviews(loop, st, number, head, reviews,
+                                               receipts=receipts if isinstance(receipts, dict) else None)
+        if reviews is None:
+            reviews_error = ("host review-receipt ledger unreadable: "
+                             f"{facts.get('receipts_error') or 'no reason given'}")
+    fresh = (boundary.get("fresh_review") if isinstance(boundary, dict) else None) or {}
     if reviews is not None:
-        # A post-retarget review list is diagnostic, not an authorization: its
-        # commit_id cannot prove the base generation or a dispatched run.
-        reviews = [] if boundary else reviews
         spent = len(verdicts(reviews, loop))
         if head:
             latest = latest_effective_review_at_head(reviews, loop, head)
@@ -592,9 +611,13 @@ def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> di
             if stacked:
                 blockers.append(f"stacked PR: {chain_reason} — visible only; no reviewer or fixer "
                                 "run is authorized by parent readiness")
-            if boundary:
+            if boundary and transition.baseline_missing(boundary):
+                blockers.append(f"same-head base retarget held: {transition.MISSING_BASELINE}")
+            elif boundary:
                 blockers.append("same-head base retarget: pre-retarget reviews, rounds and approvals "
-                                "quarantined; no automatic reviewer or fixer run")
+                                "quarantined — fresh review situation; only a host-receipted "
+                                "post-boundary review counts (fresh reviewer turn: "
+                                f"{fresh.get('state') or 'not queued yet'})")
             if author and author not in set(loop["fixers"]):
                 blockers.append(f"the author {author} is not one of this loop's fixers "
                                 f"({', '.join(loop['fixers'])})")
@@ -664,11 +687,9 @@ def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> di
         kind = "wait" if isinstance(chain, situation.Resolution) and chain.status == "waiting" else "retry"
         action = (f"{chain_reason} — wait for a verified parent/base transition; "
                   "no automatic reviewer wake or gate authorization")
-    elif boundary and not approved:
+    elif boundary and transition.baseline_missing(boundary):
         kind = "wait"
-        action = ("same-head retarget: push a new child head and explicitly request review, "
-                  "or obtain a fresh explicit human review of the retargeted diff. "
-                  "Old approvals/verdicts cannot authorize a run; no automatic wake")
+        action = f"same-head retarget held permanently: {transition.MISSING_BASELINE}"
     elif author and author not in set(loop["fixers"]):
         kind = "none"
         action = (f"nothing — the reviewer gate only serves PRs opened by this loop's fixers "
@@ -678,6 +699,22 @@ def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> di
         action = (f"retry the review list for {repo}#{number} "
                   f"({reviews_error or 'unreadable'}) — whether head {short} already has a verdict "
                   f"is unknown, and the loop never guesses that")
+    elif boundary and not approved and not at_head and not reviewed:
+        if fresh.get("state") == "enqueued":
+            kind = "review-verdict"
+            action = (f"fresh review after retarget: reviewer queued ({fresh.get('turn_key')}) — "
+                      f"awaiting its receipted verdict at head {short}; old approvals/verdicts "
+                      "never count, and an unreceipted review stays diagnostic")
+        elif fresh.get("state") == "retry":
+            kind = "retry"
+            action = (f"fresh review after retarget: reviewer enqueue failed "
+                      f"({fresh.get('error') or 'no reason recorded'}) — the next armed watchdog "
+                      "sweep retries it")
+        else:
+            kind = "wait"
+            action = ("fresh review after retarget: the reviewer is not queued yet (still a "
+                      "draft, or not swept since the retarget) — the next armed watchdog sweep "
+                      "enqueues it; then awaiting its receipted verdict")
     elif approved:
         kind = "none"
         action = f"nothing — head {short} is approved; a human merges it"

@@ -98,11 +98,11 @@ def main() -> None:
                 and live_base_sha != snapshot_base_sha):
             silence("verdict base generation changed")
         boundary = transition.record(loop, st, number, (live.get("head") or {}).get("sha"), loop["base"])
-        if boundary:
-            # Review commit_id binds only the head. Even a post-boundary REST review
-            # cannot prove which base it examined or which request dispatched it.
-            # In particular a review on another head must never produce a merge cue.
-            silence("base retarget: no generation-bound review receipt; no automated handoff")
+        if boundary and transition.baseline_missing(boundary):
+            silence(f"base retarget hold: {transition.MISSING_BASELINE}")
+        # Otherwise a held head continues: review commit_id binds only the head, so below
+        # only a post-boundary review with a host receipt from the fresh isolated reviewer
+        # run (transition.effective_reviews) can be this work order.
 
     if state == "APPROVED":
         # An approval ends the reviewer's turn exactly as a rejection does, and nothing else would
@@ -125,6 +125,10 @@ def main() -> None:
         # The webhook is not evidence of the review's *current* verdict: GitHub can dismiss
         # the same review id after submitting it. A failed/partial live read is not approval.
         reviews = gh.reviews(loop, number) if live_open and current_head == approved_head else None
+        # After a same-head retarget only a host-receipted post-boundary approval is one; an
+        # old approval, or one GitHub merely lists after the boundary, is not.
+        reviews = (transition.effective_reviews(loop, st, number, current_head, reviews)
+                   if current_head else None)
         latest = (gate.latest_effective_review_at_head(reviews, loop, approved_head)
                   if isinstance(reviews, list) else None)
         live_approval = (latest is not None and latest.get("id") == review.get("id")
@@ -132,13 +136,16 @@ def main() -> None:
                          and gate.reviewer_login(latest) == gate.reviewer_login(review))
         # A review's commit_id binds the head only. The live PR must still describe the
         # same direct-trunk generation as the webhook snapshot; a same-head base retarget or
-        # advancement between reads makes the approval an unknown-diff verdict.
+        # advancement between reads makes the approval an unknown-diff verdict. A retarget
+        # hold no longer vetoes by itself: live_approval above already had to be a receipted
+        # post-boundary review, whose pinned generation is this head on the root base.
         first_base = pr.get("base") or {}
         final_base = (current.get("base") or {}) if isinstance(current, dict) and live_open else {}
+        boundary = transition.hold(st, number, current_head) if current_head else None
         same_base = (final_base.get("ref") == loop["base"]
                      and first_base.get("ref") == final_base.get("ref")
                      and first_base.get("sha") == final_base.get("sha")
-                     and not transition.hold(st, number, current_head))
+                     and not transition.baseline_missing(boundary))
         if live_open and current_head and approved_head and approved_head != current_head:
             outcome, next_turn = "on an older head — the PR moved since", "the reviewer, on this head"
         elif (live_open and current_head and approved_head == current_head
@@ -175,12 +182,17 @@ def main() -> None:
             or ((current.get("user") or {}).get("login") or "").lower() not in loop["fixers"]
             or (current.get("head") or {}).get("sha") != pr_head):
         silence("verdict PR is stale or current state is unverified")
-    reviews = gate.fetch_reviews(loop, number)
+    reviews = transition.effective_reviews(loop, st, number, pr_head,
+                                           gate.fetch_reviews(loop, number))
+    if not isinstance(reviews, list):
+        silence("host review receipts unreadable — not guessing which verdicts count")
     latest = gate.latest_effective_review_at_head(reviews, loop, pr_head)
     if (latest is None or latest.get("id") != review.get("id")
             or gh.review_state(latest) != "CHANGES_REQUESTED"
             or gate.reviewer_login(latest) != gate.reviewer_login(review)):
-        silence("changes-requested webhook is not the live latest effective verdict")
+        silence("changes-requested webhook is not the live latest effective verdict"
+                + (" (after a retarget only a host-receipted post-boundary verdict counts)"
+                   if transition.hold(st, number, pr_head) else ""))
     prior = len(gate.verdicts(reviews, loop, exclude_id=review.get("id")))
     if st.inflight(f"fix:{number}:{pr_head}"):
         silence(f"a fix run for head {pr_head[:7]} is already out")

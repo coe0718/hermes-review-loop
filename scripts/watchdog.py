@@ -115,14 +115,16 @@ def drain(loop: dict, st: state_mod.LoopState, seat: str, quiet: bool = False) -
         base = (pr.get("base") or {}).get("ref") or ""
         stacked = (st.watch().get("stacked_wait") or {}).get(str(number))
         if isinstance(stacked, dict) and stacked.get("base") != base:
-            if base == loop["base"]:
-                transition.record(loop, st, number, head, base)
+            if base == loop["base"] and transition.record(loop, st, number, head, base):
+                status, detail = transition.start_fresh_review(loop, st, number, live=pr)
+                log(f"drain: PR #{number} retarget: fresh review {status} ({detail})")
             st.queue_pop_head(seat, key, stacked.get("head"))
             log(f"drain: PR #{number} retargeted since stacked observation — stale request dropped")
             continue
-        if transition.hold(st, number, head):
+        boundary = transition.hold(st, number, head)
+        if boundary and transition.baseline_missing(boundary):
             st.queue_pop_head(seat, key, head)
-            log(f"drain: PR #{number} same-head retarget is quarantined — dropped")
+            log(f"drain: PR #{number} same-head retarget held — {transition.MISSING_BASELINE}")
             continue
         author = ((pr.get("user") or {}).get("login") or "").lower()
         if pr.get("draft") or base != loop["base"] or author not in set(loop["fixers"]):
@@ -130,9 +132,11 @@ def drain(loop: dict, st: state_mod.LoopState, seat: str, quiet: bool = False) -
             log(f"drain: PR #{number} is not a fixer PR on {loop['base']} — dropped")
             continue
 
-        reviews = gh.reviews(loop, number)
+        # A held head's queue entry is post-boundary (record() dropped the old ones); its
+        # checks still see only host-receipted post-boundary reviews.
+        reviews = transition.effective_reviews(loop, st, number, head, gh.reviews(loop, number))
         if not isinstance(reviews, list):
-            log(f"drain: cannot read a valid review list for #{number} — left queued")
+            log(f"drain: cannot read a valid review list or receipts for #{number} — left queued")
             continue
         short = {"number": number, "draft": False, "base": {"ref": base},
                  "user": {"login": author}, "head": {"sha": head, "ref": (pr.get("head") or {}).get("ref")},
@@ -242,12 +246,20 @@ def reconcile_stacked(loop: dict, st: state_mod.LoopState, watch: dict,
                     entry = transition.record(loop, st, number, (pr.get("head") or {}).get("sha"),
                                               base, watch=watch)
                     if entry:
+                        # Owner policy (#23): the parent merged and the child is on trunk
+                        # now, so start a fresh review situation — one isolated reviewer
+                        # turn. Nothing from before the boundary carries over.
+                        status, detail = transition.start_fresh_review(loop, st, number, live=live)
+                        next_turn = {"enqueued": "reviewer queued (fresh review)",
+                                     "retry": "fresh reviewer enqueue retries next sweep"}.get(
+                                         status, "you")
                         lines.append(f"#{number} retargeted to {base} at the same head — old "
-                                     "reviews and queued work quarantined; new head or fresh "
-                                     "explicit human review required; no automatic wake")
+                                     "reviews, rounds and queued work quarantined; fresh review: "
+                                     f"{status} ({detail})")
                         observer.notify(loop, st, "stall", number, entry["head"],
                                         identity=f"retarget:{entry['head']}",
-                                        outcome="old same-head reviews quarantined", next_turn="you")
+                                        outcome="old same-head reviews quarantined; fresh review "
+                                        f"{status}", next_turn=next_turn)
                 # A retarget is not permission to reinterpret a previous seat request
                 # for the same child SHA as a trunk request.
                 for seat in ("reviewer", "fixer"):
@@ -295,6 +307,38 @@ def reconcile_stacked(loop: dict, st: state_mod.LoopState, watch: dict,
                         outcome=f"stacked {resolution.status}: {resolution.reason}", next_turn="you")
     watch["stacked_wait"] = {k: v for k, v in pending.items() if k in listed}
 
+def retry_fresh_reviews(loop: dict, st: state_mod.LoopState, prs: list, lines: list[str],
+                        since: float = 0.0) -> None:
+    """Re-drive a transition's fresh reviewer turn that is not durably enqueued yet.
+
+    Covers a failed enqueue (missing runtime, ledger or spawn failure) and a child that was
+    still a draft when retargeted. Each attempt re-reads the live PR; the turn key keeps a
+    success idempotent, and a failure stays visible here until one succeeds.
+    """
+    for pr in prs:
+        if not isinstance(pr, dict) or pr.get("state") != "open" or pr.get("draft"):
+            continue
+        if (pr.get("base") or {}).get("ref") != loop["base"]:
+            continue
+        number = pr.get("number")
+        head = (pr.get("head") or {}).get("sha")
+        if type(number) is not int or not head:
+            continue
+        entry = transition.hold(st, number, head)
+        if entry is None or transition.baseline_missing(entry):
+            continue
+        fresh = entry.get("fresh_review")
+        if isinstance(fresh, dict) and (fresh.get("state") == "enqueued" or (
+                isinstance(fresh.get("at"), (int, float)) and fresh["at"] >= since)):
+            continue  # done, or already attempted (and reported) earlier in this sweep
+        status, detail = transition.start_fresh_review(loop, st, number)
+        if status == "retry":
+            lines.append(f"⚠️ #{number} fresh review after retarget not enqueued: {detail} "
+                         "— retrying next sweep")
+        elif status == "enqueued":
+            lines.append(f"#{number} fresh review after retarget enqueued ({detail})")
+
+
 def retry_pending_breaches(loop: dict, st: state_mod.LoopState, prs: list) -> None:
     """Retry listed eligible heads only after reviews verify the cap.
 
@@ -313,13 +357,13 @@ def retry_pending_breaches(loop: dict, st: state_mod.LoopState, prs: list) -> No
         head = (pr.get("head") or {}).get("sha")
         if type(number) is not int or not head:
             continue
-        if transition.hold(st, number, head):
-            continue  # same-head retarget cannot retry old cap authorization
         marker = markers.get(f"{loop['repo']}#{number}")
         if (not isinstance(marker, dict) or gate.breach_delivery_status(marker, head) != "delivery-pending"
                 or marker.get("head") != head):
             continue
-        reviews = gh.reviews(loop, number)
+        # record() erased the pre-retarget marker; a marker at a held head can only come from
+        # receipted post-boundary verdicts, and only those may re-verify its cap.
+        reviews = transition.effective_reviews(loop, st, number, head, gh.reviews(loop, number))
         if not isinstance(reviews, list):
             continue
         latest = gate.latest_effective_review_at_head(reviews, loop, head)
@@ -347,6 +391,7 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
         return lines
 
     reconcile_stacked(loop, st, watch, prs, lines)
+    retry_fresh_reviews(loop, st, prs, lines, since=now)
 
     # A commit's authored/committed date says nothing about when its SHA reached a PR.
     # Snapshot the heads on the first *successful* armed sweep, before any stall evaluation.
@@ -440,9 +485,12 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
         if not number or not head:
             continue
 
-        if transition.hold(st, number, head):
-            continue  # no old verdict may count as a current direct-trunk stall
-        reviews = gh.reviews(loop, number)
+        # A held head is judged only by host-receipted post-boundary reviews: an old verdict
+        # is not a current stall, and a missing fresh verdict is the reviewer's to post.
+        boundary = transition.hold(st, number, head)
+        if boundary and transition.baseline_missing(boundary):
+            continue  # permanently held; explain reports why, no seat can move it
+        reviews = transition.effective_reviews(loop, st, number, head, gh.reviews(loop, number))
         if not isinstance(reviews, list):
             continue                              # unknown beats wrong
         latest = gate.latest_effective_review_at_head(reviews, loop, head)
