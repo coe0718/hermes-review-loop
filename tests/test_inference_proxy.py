@@ -1,4 +1,5 @@
 """Real UDS mount, host-only dummy key and whole-process Hermes turn."""
+import http.client
 import http.server
 import json
 import os
@@ -137,8 +138,14 @@ class TransportTests(unittest.TestCase):
                 with InferenceCapability(root / 'cap', endpoint, 'HOST_ONLY_KEY', model='fixture-model', quota=1) as cap:
                     def send(path, body=b'{}', headers=None):
                         conn = _UnixHTTP(str(cap.socket_path))
-                        conn.request('POST', path, body=body, headers=headers or {})
-                        response = conn.getresponse()
+                        try:
+                            conn.request('POST', path, body=body, headers=headers or {})
+                            response = conn.getresponse()
+                        except (BrokenPipeError, ConnectionResetError):
+                            # A rejected request may be answered and closed before its body
+                            # is sent; the answer is still waiting on the socket.
+                            response = http.client.HTTPResponse(conn.sock)
+                            response.begin()
                         result = (response.status, response.read())
                         conn.close()
                         return result
