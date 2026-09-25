@@ -110,7 +110,8 @@ def doctor_runtime_fixture() -> list[pathlib.Path]:
                                    "runtime": str(TMP), "rust": str(TMP)}))
     runtime.chmod(0o600)
     added = [runtime]
-    model = "model:\n  default: test-model\n  provider: openrouter\n"
+    # JSON is valid YAML, and the reader falls back to json without PyYAML (CI has none).
+    model = json.dumps({"model": {"default": "test-model", "provider": "openrouter"}}) + "\n"
     for profile in (home / "profiles" / "reviewer-profile", home / "profiles" / "fixer-profile"):
         (profile / "config.yaml").write_text(model)
     if not (home / "config.yaml").exists():
