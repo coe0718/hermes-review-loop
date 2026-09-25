@@ -152,3 +152,97 @@ def _audit(loop: dict, repo: str, number: int, head: str, branch: str,
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def authorize_ruling_comment(loop: dict, *, repo: str, number: int, head: str,
+                             branch: str) -> str:
+    """Return the adjudicator's comment login, or deny; never touches the seats' write paths.
+
+    A sibling of :func:`authorize`, not a relaxation of it: the reviewer/fixer role and
+    operation table there is unchanged. Only an *optional* ``seats.adjudicator.login`` can
+    comment, and only if it is a fourth identity — distinct login, distinct token file and a
+    distinct ``/user`` principal from the reader and both seats — at a live PR that is still the
+    open, non-draft, same-repository, unapproved head the ruling was made on.
+    """
+    from . import config, gate
+    if not _REPO.fullmatch(repo) or repo != loop.get("repo"):
+        raise BrokerDenied("wrong repository")
+    if type(number) is not int or number <= 0 or not _SHA.fullmatch(head):
+        raise BrokerDenied("invalid PR number or head SHA")
+    login = config.adjudicator_login(loop)
+    if not login:
+        raise BrokerDenied("no adjudicator identity configured")
+    seats = loop.get("seats") or {}
+    reader = loop.get("read_token")
+    reviewer = (seats.get("reviewer") or {}).get("login")
+    fixer = (seats.get("fixer") or {}).get("login")
+    identities = (reader, reviewer, fixer, login)
+    if (not all(isinstance(i, str) and i for i in identities)
+            or len({i.casefold() for i in identities}) != 4):
+        raise BrokerDenied("read, reviewer, fixer and adjudicator must use distinct identities")
+    mapped = [gh.token_path(loop, identity) for identity in identities]
+    if any(path is None for path in mapped):
+        raise BrokerDenied("read, reviewer, fixer and adjudicator token mappings required")
+    if len({path.resolve() for path in mapped if path is not None}) != 4:
+        raise BrokerDenied("read, reviewer, fixer and adjudicator must use distinct token files")
+    principals = []
+    for identity in identities:
+        try:
+            if not gh.token(loop, identity):
+                raise BrokerDenied(f"empty token for {identity}")
+        except gh.GitHubError as exc:
+            raise BrokerDenied(f"missing token for {identity}") from exc
+        account = gh.api(loop, "/user", login=identity)
+        if (not isinstance(account, dict) or type(account.get("id")) is not int
+                or not isinstance(account.get("login"), str)
+                or account["login"].casefold() != identity.casefold()):
+            raise BrokerDenied("token principal cannot be verified")
+        principals.append(account["id"])
+    if len(set(principals)) != 4:
+        raise BrokerDenied("adjudicator token resolves to the same principal as another identity")
+    current = gh.api(loop, f"/repos/{repo}/pulls/{number}", login=reader)
+    if not isinstance(current, dict):
+        raise BrokerDenied("cannot verify live PR")
+    pr_head = current.get("head") or {}
+    pr_base = current.get("base") or {}
+    if (type(current.get("number")) is not int or current["number"] != number
+            or current.get("state") != "open" or current.get("draft") is not False):
+        raise BrokerDenied("PR identity, state or draft status changed")
+    if (pr_base.get("repo") or {}).get("full_name") != repo or pr_base.get("ref") != loop.get("base"):
+        raise BrokerDenied("PR base changed")
+    if pr_head.get("sha") != head:
+        raise BrokerDenied("stale PR head")
+    if pr_head.get("ref") != branch or (pr_head.get("repo") or {}).get("full_name") != repo:
+        raise BrokerDenied("PR head branch or repository changed")
+    user = current.get("user")
+    author = user.get("login") if isinstance(user, dict) else None
+    if not isinstance(author, str) or author.casefold() not in {
+            f.casefold() for f in loop.get("fixers") or () if isinstance(f, str)}:
+        raise BrokerDenied("PR author is not an authorized fixer")
+    reviews = gh.reviews(loop, number)
+    if not isinstance(reviews, list):
+        raise BrokerDenied("cannot verify the head is still unapproved")
+    latest = gate.latest_effective_review_at_head(reviews, loop, head)
+    if latest is not None and gh.review_state(latest) == "APPROVED":
+        raise BrokerDenied("head was approved after the breach")
+    return login
+
+
+def ruling_comment_body(verdict: str, body: str, *, head: str, turn_key: str, run_id: str,
+                        cap: object) -> str:
+    rounds = turn_key.split(":", 1)[1] if turn_key.startswith("breach:") else "?"
+    return (f"**Adjudicator ruling: {verdict}**\n\n"
+            f"Head `{head}` · verdicts counted: {rounds} of {cap} · run `{run_id}`\n\n"
+            f"{body.strip()}\n\n"
+            "_The adjudicator does not merge, push or review. The operator decides._")
+
+
+def post_ruling_comment(loop: dict, *, repo: str, number: int, head: str, branch: str,
+                        login: str, text: str) -> int:
+    """POST one issue comment as the adjudicator identity; return its id or raise."""
+    result = gh.api(loop, f"/repos/{repo}/issues/{number}/comments", method="POST",
+                    body={"body": text}, login=login)
+    if not isinstance(result, dict) or type(result.get("id")) is not int:
+        raise BrokerDenied("GitHub comment write did not return a successful response")
+    _audit(loop, repo, number, head, branch, "adjudicator", "ruling_comment", login)
+    return result["id"]

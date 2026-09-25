@@ -1518,7 +1518,7 @@ def register_cli(ctx, settings: dict | None = None) -> None:
                                "the feed never wakes an agent")
         init.add_argument("--observer-events", default="",
                           help="comma-separated transitions to send, from "
-                               "opened,handoff,verdict,approved,escalation,stall,closed "
+                               "opened,handoff,verdict,approved,escalation,ruling,stall,closed "
                                "(default: all)")
         init.add_argument("--observer-digest-min", type=int, default=0,
                           help="batch the feed into one message per this many minutes "
@@ -1580,7 +1580,7 @@ def register_cli(ctx, settings: dict | None = None) -> None:
                             help="where the gateway delivers the feed (telegram, discord, ...)")
         change.add_argument("--observer-events", default=None,
                             help="comma-separated transitions to send, from "
-                                 "opened,handoff,verdict,approved,escalation,stall,closed "
+                                 "opened,handoff,verdict,approved,escalation,ruling,stall,closed "
                                  "(blank = all)")
         change.add_argument("--observer-digest-min", type=int, default=None,
                             help="batch the feed into one message per N minutes (0 = per "

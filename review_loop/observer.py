@@ -43,7 +43,7 @@ from .util import log, now_iso
 
 # The transitions an observer may subscribe to. These names are the loop's vocabulary for what
 # happened; the same strings are what `--observer-events` accepts and what the ledger stores.
-EVENTS = ("opened", "handoff", "verdict", "approved", "escalation", "stall", "closed")
+EVENTS = ("opened", "handoff", "verdict", "approved", "escalation", "ruling", "stall", "closed")
 
 # The batched form: one message for many transitions (see ``observer.digest_min``).
 DIGEST_EVENT = "digest"
@@ -51,10 +51,11 @@ DIGEST_EVENT = "digest"
 # How a transition reads in a chat line. Derived from the event, never from the payload: an
 # observer that phrased things differently per call site would be a second, wrong source of truth.
 EMOJI = {"opened": "📬", "handoff": "🔧", "verdict": "🔍", "approved": "✅",
-         "escalation": "⚠️", "stall": "⏳", "closed": "🧹", "digest": "🗂"}
+         "escalation": "⚠️", "ruling": "⚖️", "stall": "⏳", "closed": "🧹", "digest": "🗂"}
 LABEL = {"opened": "opened — first look", "handoff": "fix pushed · review requested",
          "verdict": "review posted", "approved": "approved",
-         "escalation": "loop stopped — cap spent", "stall": "stalled",
+         "escalation": "loop stopped — cap spent", "ruling": "adjudicator ruled",
+         "stall": "stalled",
          "closed": "PR closed"}
 
 # A stale claim may have reached the gateway before its sender died. Never replay it:
