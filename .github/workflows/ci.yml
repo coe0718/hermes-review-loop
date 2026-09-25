@@ -26,3 +26,11 @@ jobs:
         run: python -m compileall -q review_loop scripts __init__.py
       - name: Loop tests (gates, budget, seats, watchdog, cleanup)
         run: python tests/run_tests.py
+      # The sandbox tests skip without bubblewrap; a green run must mean they ran. Ubuntu
+      # restricts unprivileged user namespaces by default, which bwrap needs.
+      - name: Install bubblewrap
+        run: |
+          sudo apt-get update -q && sudo apt-get install -yq bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: Boundary tests (broker, push, fetch, proxy, supervisor, sandbox)
+        run: python -m unittest discover -s tests -p 'test_*.py'

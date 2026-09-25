@@ -19,7 +19,8 @@ HEAD_B = "b" * 40
 
 def pr(head=HEAD_A, state="open"):
     return {"number": 7, "state": state, "head": {"sha": head},
-            "base": {"ref": "main"}, "user": {"login": "fixer"}}
+            "base": {"ref": "main", "sha": HEAD_B,
+                     "repo": {"full_name": "acme/widgets"}}, "user": {"login": "fixer"}}
 
 
 class NotificationFreshnessTest(unittest.TestCase):
@@ -39,6 +40,8 @@ class NotificationFreshnessTest(unittest.TestCase):
               mock.patch.object(module.gate, "context", return_value=(self.loop, self.state)),
               mock.patch.object(module.gh, "pr", return_value=current) as live,
               mock.patch.object(module.gh, "reviews", return_value=reviews),
+              mock.patch.object(module.gh, "api", return_value={
+                  "ref": "refs/heads/main", "object": {"type": "commit", "sha": HEAD_B}}),
               mock.patch.object(module.gate, "reclaim") as reclaim,
               mock.patch.object(module.gate, "drain_seat") as drain,
               mock.patch.object(module.observer, "notify") as notify):
@@ -73,10 +76,18 @@ class NotificationFreshnessTest(unittest.TestCase):
                         pr() | {"number": 8}, pr() | {"head": {}}):
             with self.subTest(current=current):
                 self.state.reset_mock()
+                self.state.release_if.return_value = False    # no claim at the approved head
                 live, _, drain, notify = self.invoke(gate_fixer, payload, current)
                 live.assert_called_once_with(self.loop, 7)
-                self.state.release_if.assert_called_once_with("reviewer", "acme/widgets#7")
-                drain.assert_called_once_with(self.loop, "reviewer")
+                # Only the claim made for the approved head may end; never another run's.
+                self.state.release_if.assert_called_once_with("reviewer", mock.ANY, HEAD_A)
+                drain.assert_not_called()
+            with self.subTest(current=current, claim_at_approved_head=True):
+                # That claim is freed even though the live read failed, and its queue drains.
+                self.state.reset_mock()
+                self.state.release_if.return_value = True
+                _, _, drain, _ = self.invoke(gate_fixer, payload, current)
+                drain.assert_called_once()
                 notify.assert_called_once()
                 self.assertNotEqual(notify.call_args.kwargs["next_turn"], "you merge")
 
@@ -101,6 +112,19 @@ class NotificationFreshnessTest(unittest.TestCase):
             with self.subTest(reviews=reviews):
                 _, _, _, notify = self.invoke(gate_fixer, payload, pr(), reviews)
                 self.assertNotEqual(notify.call_args.kwargs["next_turn"], "you merge")
+
+    def test_delayed_rejection_after_approval_neither_releases_nor_notifies(self):
+        rejection = {"id": 43, "state": "changes_requested", "commit_id": HEAD_A,
+                     "user": {"login": "reviewer"}, "submitted_at": "2026-01-01T00:00:00Z"}
+        approval = rejection | {"id": 44, "state": "APPROVED",
+                                "submitted_at": "2026-01-01T00:01:00Z"}
+        payload = {"action": "submitted", "number": 7, "pull_request": pr(),
+                   "review": rejection}
+        _, _, drain, notify = self.invoke(gate_fixer, payload, pr(), [approval, rejection])
+        self.state.release_if.assert_not_called()
+        drain.assert_not_called()
+        notify.assert_not_called()
+        self.state.breach_get.assert_not_called()
 
     def test_dismissed_and_stale_head_reviews_do_not_override_live_approval(self):
         approval = {"id": 43, "state": "approved", "commit_id": HEAD_A,

@@ -169,8 +169,12 @@ def target(name: str, host: str | None = None, *, expected: dict | None = None):
 
 
 def fire(name: str, event: str, payload: dict, tag: str, host: str | None = None,
-         *, expected: dict | None = None) -> bool:
-    """POST a signed payload at a route. Returns True only on an HTTP 2xx."""
+         *, expected: dict | None = None, on_attempt=None) -> bool:
+    """POST a signed payload; on_attempt marks the boundary before transport I/O.
+
+    A false result before that callback is known not delivered; a false result
+    after it may have reached the gateway and must not be blindly replayed.
+    """
     target_ = target(name, host, expected=expected)
     if not target_:
         return False
@@ -184,6 +188,8 @@ def fire(name: str, event: str, payload: dict, tag: str, host: str | None = None
         "User-Agent": "hermes-review-loop",
     })
     try:
+        if on_attempt is not None:
+            on_attempt()
         with urllib.request.urlopen(req, timeout=20) as resp:
             log(f"fired {name} for {tag} (HTTP {resp.status})")
             return 200 <= resp.status < 300

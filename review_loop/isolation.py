@@ -16,10 +16,9 @@ exactly what the cleanup already deletes at merge, so there is no new garbage an
 remember. A PR's second round reuses its own warm build directory, so the cold build is paid once
 per PR rather than once per round.
 
-**Why no secret lands in the tree.** The isolated clone's `origin` is the plain GitHub URL and
-`credential.helper` echoes the PAT out of its file, so what is written to disk is the *path* to a
-0600 key, never the key. The fixer can push from its own clone; a leaked artifacts directory
-leaks no credential.
+**No credential helper in the clone.** A path to a 0600 key is not safe when PR code
+runs as the credential-owning UID: it can invoke `git credential fill` or read the file.
+Workspaces are NOT a whole-agent security boundary; route gates remain blocked.
 
 **When it cannot be built**, ``ensure`` says so and returns ``None`` — it never half-builds a
 sandbox and never falls back to a shared clone behind the caller's back. Callers decide: above
@@ -64,22 +63,15 @@ def _git(*args: str, cwd=None, timeout: int = 300) -> subprocess.CompletedProces
                           text=True, timeout=timeout)
 
 
-def credential_helper(pat_path: pathlib.Path) -> str:
-    """A helper that reads the token from its file at use time, so the repo holds a path only."""
-    quoted = str(pat_path).replace("'", "'\\''")
-    return ("!f() { echo username=x-access-token; "
-            f"echo password=\"$(cat '{quoted}')\"; }}; f")
-
-
 def _configure(clone: pathlib.Path, loop: dict, login: str) -> None:
-    """Point origin at GitHub, install the credential helper, and give commits an identity."""
+    """Point origin at GitHub with no credential helper; set commit identity."""
     remote = f"https://github.com/{loop['repo']}.git"
     if _git("remote", "set-url", "origin", remote, cwd=clone).returncode != 0:
         _git("remote", "add", "origin", remote, cwd=clone)
-    pat = (loop.get("tokens") or {}).get(login) or (loop.get("tokens") or {}).get(
-        loop.get("read_token", ""))
-    if pat:
-        _git("config", "credential.helper", credential_helper(config._path(pat)), cwd=clone)
+    # Clear any helper inherited from the source clone. Never substitute the read
+    # token for a missing seat token; that would collapse the role boundary.
+    _git("config", "--unset-all", "credential.helper", cwd=clone)
+    _git("config", "credential.helper", "", cwd=clone)
     # There is no global git identity guarantee on a headless host, and a fixer that cannot commit
     # is a loop that dies one step after it starts.
     _git("config", "user.name", login or "review-loop", cwd=clone)
@@ -190,8 +182,8 @@ def describe(workspace: dict | None, loop: dict, number: int, seat: str = "revie
             f"  clone:  {workspace['clone']}\n"
             f"  export: {export}\n"
             f"  logs:   {workspace['root']}\n"
-            f"That clone is yours alone (its own origin, its own credential helper, its own "
-            f"detached checkout) — commit and push from there if you are the fixer. Never touch "
+            f"That clone has no seat credential and is checked out detached. Do not push "
+            f"from the clone. Never touch "
             f"the shared clone at {loop.get('clone') or '(none)'}, the other seat's workspace "
             f"under {p['root'].parent}, or the repository itself without committing to the PR "
             f"branch.")

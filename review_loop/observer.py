@@ -36,6 +36,7 @@ import pathlib
 import re
 import tempfile
 import time
+from urllib.parse import quote
 
 from . import gh, prompts, routes
 from .util import log, now_iso
@@ -306,6 +307,35 @@ def _without_next_turn(text: str) -> str:
     # A legacy cached digest has its URL later on the same line. Keep that link.
     return re.sub(r" · next: [^\n]*?(?= · https://|\n|$)", "", text)
 
+def base_identity(loop: dict, pr: object) -> str:
+    """The configured, same-repo base in PR metadata, or unknown."""
+    base = pr.get("base") if isinstance(pr, dict) else None
+    if not isinstance(base, dict) or base.get("ref") != loop.get("base"):
+        return ""
+    sha = base.get("sha")
+    repo = base.get("repo")
+    if (not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha)
+            or not isinstance(repo, dict) or repo.get("full_name") != loop.get("repo")):
+        return ""
+    return sha
+
+def verified_base_sha(loop: dict, pr: object) -> str:
+    """Read the exact configured base ref; PR metadata alone is not ref authority."""
+    sha = base_identity(loop, pr)
+    if not sha:
+        return ""
+    branch = loop["base"]
+    path = f"/repos/{loop['repo']}/git/ref/heads/{quote(branch, safe='/')}"
+    try:
+        ref = gh.api(loop, path)
+        obj = ref.get("object") if isinstance(ref, dict) else None
+        if (ref.get("ref") == f"refs/heads/{branch}" and isinstance(obj, dict)
+                and obj.get("type") == "commit" and obj.get("sha") == sha):
+            return sha
+    except Exception:
+        pass
+    return ""
+
 
 def block_for(loop: dict, event: str, number, head: str, text: str) -> dict:
     """The ``_observer`` block the route prompt renders (``{_observer.message}``).
@@ -366,7 +396,8 @@ def _receipt(st, key: str, delivered: bool, error: str = "", uncertain: bool = F
 
 
 def notify(loop: dict, st, event: str, number, head: str = "", *, identity: object = "",
-           outcome: str = "", next_turn: str = "", round_no=None, actor: str = "") -> bool:
+           outcome: str = "", next_turn: str = "", round_no=None, actor: str = "",
+           base_sha: str = "") -> bool:
     """Send one notice about one transition. Best effort, never fatal, never a gate.
 
     Returns ``True`` only when *this* call got a receipt. Every other outcome — no destination,
@@ -401,6 +432,7 @@ def notify(loop: dict, st, event: str, number, head: str = "", *, identity: obje
             data["entries"][key] = {"status": "queued" if queued else "pending",
                                     "event": event, "number": number, "head": head,
                                     "identity": str(identity or ""), "summary": summary,
+                                    "base_sha": base_sha,
                                     "message": text, "url": gh.pr_url(loop, number),
                                     "attempts": 0, "error": "", "at": now}
             if queued:
@@ -432,7 +464,19 @@ def _deliver(loop: dict, st, key: str, text: str, tag: str, event: str, number, 
         from . import gate
         latest = (gate.latest_effective_review_at_head(reviews, loop, head)
                   if isinstance(reviews, list) else None)
-        if not (latest and gh.review_state(latest) == "APPROVED"
+        # A fixer push may be quarantined after the gate checked the ledger,
+        # including during these live reads. Check immediately before delivery;
+        # on an unreadable ledger, omit the instruction rather than guessing.
+        try:
+            from . import config
+            from .run_supervisor import Supervisor
+            ledger = config.home() / "state" / "review-loop-runs.sqlite"
+            held = ledger.exists() and Supervisor(ledger).post_write_hold(loop["repo"], number)
+        except Exception:
+            held = True
+        if not (not held and entry.get("base_sha")
+                and entry["base_sha"] == verified_base_sha(loop, current)
+                and latest and gh.review_state(latest) == "APPROVED"
                 and str(latest.get("id")) == entry.get("identity")):
             text = _without_next_turn(text)
     delivered, error, uncertain = _post(loop, block_for(loop, event, number, head, text), tag)

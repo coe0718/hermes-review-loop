@@ -5,8 +5,10 @@ Runs with a plain interpreter and no network — no ``gh``, no pytest, no GitHub
 
 * GitHub is a stub executable (``REVIEW_LOOP_GH_STUB``) answering from a JSON "world" file, so
   the tests can put a fixer, a verdict and a review request exactly where they want them;
-* the webhook endpoint is a real local HTTP server, so the wake path is exercised end to end,
-  signature included — a drain that "fires" into a stub would prove nothing about the POST;
+* the webhook endpoint is a real local HTTP server, so watchdog wake paths still exercise
+  signature validation; eligible gate runs return [SILENT] and fail closed without runtime;
+* the isolated supervisor's SQLite ledger is tested with a trusted inert fixture command,
+  never an ambient GitHub bypass or a credential-owning gateway agent;
 * git is real: the cleanup tests build a throwaway clone with detached review worktrees and a
   branch worktree, because the difference between those two is the whole safety story.
 
@@ -28,6 +30,7 @@ import os
 import pathlib
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -102,7 +105,8 @@ def pr(number: int, head: str = HEAD_A, state: str = "open", draft: bool = False
     """
     return {"number": number, "state": state, "draft": draft, "merged_at": merged,
             "title": title, "html_url": f"https://github.com/{REPO}/pull/{number}",
-            "base": {"ref": base}, "user": {"login": author},
+            "base": {"ref": base, "sha": "c" * 40,
+                     "repo": {"full_name": REPO}}, "user": {"login": author},
             "head": {"sha": head, "ref": "fix-thing"},
             "requested_reviewers": [{"login": requested}] if requested else []}
 
@@ -139,6 +143,8 @@ elif path.endswith("/reviews?per_page=100"):
 elif "/commits/" in path:
     sha = path.rsplit("/", 1)[1]
     print(json.dumps({"commit": {"committer": {"date": world.get("commit_dates", {}).get(sha, "2026-01-01T00:00:00Z")}}}))
+elif path.endswith("/git/ref/heads/main"):
+    print(json.dumps({"ref": "refs/heads/main", "object": {"type": "commit", "sha": "c" * 40}}))
 elif "/pulls?" in path:
     print(json.dumps([p for p in world["prs"].values() if p.get("state") == "open"]))
 elif n_of(path) is not None:
@@ -246,7 +252,7 @@ def write_subs() -> dict:
         ("widgets-breach", "default", None, ["pull_request"]),
     ):
         subs[name] = {"description": name, "events": events, "secret": hashlib.sha256(name.encode()).hexdigest(),
-                      "prompt": "{_loop}", "skills": [], "deliver": "discord", "profile": profile,
+                      "prompt": "Review-loop event", "skills": [], "deliver": "discord", "profile": profile,
                       "created_at": PAST, "script": script, "host": HOST}
     SUBS.write_text(json.dumps(subs, indent=2))
     return subs
@@ -333,10 +339,11 @@ DATA: dict = {}
 
 
 def env() -> dict:
-    return {**os.environ, "REVIEW_LOOP_CONFIG_DIR": str(LOOPS_DIR),
+    # Isolate every child, even when the CI runner has no HERMES_HOME.
+    return {**os.environ, "HERMES_HOME": str(TMP / "hermes-home"),
+            "REVIEW_LOOP_CONFIG_DIR": str(LOOPS_DIR),
             "REVIEW_LOOP_SUBS": str(SUBS), "REVIEW_LOOP_GH_STUB": str(STUB),
-            "GH_WORLD": str(WORLD_FILE), "REVIEW_LOOP_TEST": "1",
-            "HERMES_HOME": str(TMP / "hermes-home")}
+            "GH_WORLD": str(WORLD_FILE), "REVIEW_LOOP_TEST": "1"}
 
 
 def run(script: str, payload: dict | None = None, *args: str,
@@ -348,11 +355,38 @@ def run(script: str, payload: dict | None = None, *args: str,
     out, err = proc.stdout.strip(), proc.stderr.strip()
     if out.startswith("[SILENT]"):
         kind = "SILENT"
-    elif out.startswith("{"):
-        kind = "FIRE"
     else:
         kind = out
     return kind, out, err
+
+
+def held(seat: str, number: int, head: str, reason: str = "isolated worker unavailable") -> bool:
+    """An eligible gate fails closed without a private runtime, never dispatching to gateway."""
+    entry = load_state("pending.json").get(seat, {}).get(f"{REPO}#{number}", {})
+    return entry.get("head") == head and reason in entry.get("reason", "")
+
+
+def no_ledger_run() -> bool:
+    db = TMP / "hermes-home" / "state" / "review-loop-runs.sqlite"
+    if not db.exists():
+        return True
+    with sqlite3.connect(db) as con:
+        return con.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+
+
+def check_eligible(name: str, script: str, payload: dict, seat: str,
+                   number: int = 7, head: str = HEAD_A) -> None:
+    kind, out, _ = run(script, payload)
+    check(name + " returns [SILENT]", (kind, out), ("SILENT", "[SILENT]"))
+    check(name + " held for isolated worker", held(seat, number, head), True)
+    check(name + " never enters gateway ledger", no_ledger_run(), True)
+
+
+def check_rejected(name: str, script: str, payload: dict) -> None:
+    kind, out, _ = run(script, payload)
+    check(name, (kind, out), ("SILENT", "[SILENT]"))
+    check(name + " leaves no pending run", load_state("pending.json"), {})
+    check(name + " leaves no ledger run", no_ledger_run(), True)
 
 
 # -- payloads --------------------------------------------------------------------
@@ -445,47 +479,42 @@ def group_reviewer_gate() -> None:
     section("reviewer gate — who gets to start a review")
 
     reset(prs={"7": pr(7)})
-    check("explicit request for this seat fires", run("gate_reviewer.py", pr_payload())[0], "FIRE")
+    check_eligible("explicit request for this seat", "gate_reviewer.py", pr_payload(), "reviewer")
 
     reset(prs={"7": pr(7)})
-    check("request naming another reviewer is silent",
-          run("gate_reviewer.py", pr_payload(requested="someone-else"))[0], "SILENT")
+    check_rejected("request naming another reviewer is silent", "gate_reviewer.py",
+                   pr_payload(requested="someone-else"))
 
     reset(prs={"7": pr(7)})
-    check("request from a stranger is silent",
-          run("gate_reviewer.py", pr_payload(sender="passer-by"))[0], "SILENT")
+    check_rejected("request from a stranger is silent", "gate_reviewer.py",
+                   pr_payload(sender="passer-by"))
 
     reset(prs={"7": pr(7)})
     # No hardcoded account outside the loop's own config may hand a PR to review.
-    check("request from an unconfigured org account is silent",
-          run("gate_reviewer.py", pr_payload(sender="patchhive"))[0], "SILENT")
+    check_rejected("request from an unconfigured org account is silent", "gate_reviewer.py",
+                   pr_payload(sender="patchhive"))
+    check_rejected("a plain push (synchronize) is silent", "gate_reviewer.py",
+                   pr_payload(action="synchronize"))
 
     reset(prs={"7": pr(7)})
-    check("a plain push (synchronize) is silent",
-          run("gate_reviewer.py", pr_payload(action="synchronize"))[0], "SILENT")
+    check_eligible("opened is eligible", "gate_reviewer.py", pr_payload(action="opened"), "reviewer")
 
     reset(prs={"7": pr(7)})
-    check("opened fires immediately", run("gate_reviewer.py", pr_payload(action="opened"))[0], "FIRE")
+    check_rejected("draft is silent", "gate_reviewer.py", pr_payload(draft=True))
 
     reset(prs={"7": pr(7)})
-    check("draft is silent", run("gate_reviewer.py", pr_payload(draft=True))[0], "SILENT")
-
-    reset(prs={"7": pr(7)})
-    check("wrong base branch is silent",
-          run("gate_reviewer.py", pr_payload(base="release"))[0], "SILENT")
+    check_rejected("wrong base branch is silent", "gate_reviewer.py", pr_payload(base="release"))
 
     reset(prs={"7": pr(7, author="outsider")})
-    check("a stranger's PR is silent",
-          run("gate_reviewer.py", pr_payload(author="outsider"))[0], "SILENT")
+    check_rejected("a stranger's PR is silent", "gate_reviewer.py", pr_payload(author="outsider"))
 
     reset(prs={"7": pr(7)})
-    check("another repository is silent",
-          run("gate_reviewer.py", {**pr_payload(), "repository": {"full_name": "other/repo"}})[0],
-          "SILENT")
+    check_rejected("another repository is silent", "gate_reviewer.py",
+                   {**pr_payload(), "repository": {"full_name": "other/repo"}})
 
     reset(prs={"7": pr(7)})
-    check("an unknown action is silent", run("gate_reviewer.py", pr_payload(action="labeled"))[0],
-          "SILENT")
+    check_rejected("an unknown action is silent", "gate_reviewer.py",
+                   pr_payload(action="labeled"))
 
     # A delayed request must not resurrect a closed, deleted, or advanced PR,
     # even if its webhook snapshot still describes a valid open head.
@@ -510,16 +539,14 @@ def group_reviewer_gate() -> None:
 
     # a head that already has a verdict from a reviewer
     reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER)]}})
-    check("head already reviewed → silent", run("gate_reviewer.py", pr_payload())[0], "SILENT")
+    check_rejected("head already reviewed → silent", "gate_reviewer.py", pr_payload())
 
     # Only a submitted verdict closes this head. COMMENTED is an ordinary review
     # comment, PENDING is not submitted, and DISMISSED has lost its verdict.
     for state in ("COMMENTED", "PENDING", "DISMISSED"):
         reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, state=state)]}})
-        kind, out, _ = run("gate_reviewer.py", pr_payload())
-        check(f"{state} at head does not suppress review_requested", kind, "FIRE")
-        if kind == "FIRE":
-            check(f"  {state} does not spend a round", json.loads(out)["_loop"]["round"], 1)
+        check_eligible(f"{state} at head does not suppress review_requested",
+                       "gate_reviewer.py", pr_payload(), "reviewer")
 
     for state in ("APPROVED", "CHANGES_REQUESTED"):
         reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, state=state)]}})
@@ -527,13 +554,13 @@ def group_reviewer_gate() -> None:
               run("gate_reviewer.py", pr_payload())[0], "SILENT")
 
     reset(prs={"7": {**pr(7), "reviews": [review("unconfigured", state="APPROVED")]}})
-    check("unconfigured reviewer's verdict does not suppress request",
-          run("gate_reviewer.py", pr_payload())[0], "FIRE")
+    check_eligible("unconfigured reviewer's verdict does not suppress request",
+                   "gate_reviewer.py", pr_payload(), "reviewer")
 
     # an approved head
     reset(prs={"7": {**pr(7, head=HEAD_B), "reviews": [review(REVIEWER, state="approved")]}})
-    check("new commit after a verdict fires",
-          run("gate_reviewer.py", pr_payload(head=HEAD_B))[0], "FIRE")
+    check_eligible("new commit after a verdict", "gate_reviewer.py",
+                   pr_payload(head=HEAD_B), "reviewer", head=HEAD_B)
 
     # the review list is unreadable: never guess a round count
     reset(prs={"7": pr(7)})
@@ -665,10 +692,11 @@ def group_budget() -> None:
                                                        review(REVIEWER, head="e" * 40, rid=3)]}})
     kind, out, err = run("gate_reviewer.py", pr_payload(head=HEAD_B))
     check("third verdict spent → no fourth review", kind, "SILENT")
-    check("  breach marker written",
-          load_state("breach.json").get(f"{REPO}#7", {}).get("status"), "awaiting-adjudication")
-    check("  adjudicator was woken", RECEIVED[-1]["path"] if RECEIVED else None,
-          "/webhooks/widgets-breach")
+    check("  no review run queued at cap", load_state("pending.json"), {})
+    check("  no ledger run at cap", no_ledger_run(), True)
+    check("  breach marker remains pending while adjudicator is blocked",
+          load_state("breach.json").get(f"{REPO}#7", {}).get("status"), "delivery-pending")
+    check("  adjudicator is blocked", RECEIVED, [])
 
     # one wake per head
     before = len(RECEIVED)
@@ -678,252 +706,79 @@ def group_budget() -> None:
     # under the cap: still a normal review
     reset(prs={"7": {**pr(7, head=HEAD_B), "reviews": [review(REVIEWER, head="c" * 40, rid=1)]}})
     kind, out, _ = run("gate_reviewer.py", pr_payload(head=HEAD_B))
-    check("one verdict in → second review fires", kind, "FIRE")
-    check("  round number is 2", json.loads(out)["_loop"]["round"], 2)
+    check("one verdict in → eligible but silent", (kind, out), ("SILENT", "[SILENT]"))
+    check("  held for isolated worker", held("reviewer", 7, HEAD_B), True)
+    check("  no gateway dispatch", no_ledger_run(), True)
 
     section("fixer gate — the cap stops the fix, not just the review")
     # the fixer gate counts the OTHER verdicts; 2 prior + this one = the cap → adjudication
-    reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, rid=3),
-                                          review(REVIEWER, rid=4),
-                                          review(REVIEWER, rid=5)]}})
-    kind, out, err = run("gate_fixer.py", review_payload(rid=5))
+    reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, rid=8),
+                                          review(REVIEWER, rid=9),
+                                          review(REVIEWER, rid=10)]}})
+    kind, out, err = run("gate_fixer.py", review_payload(rid=10))
     check("verdict that hits the cap → no fix run", kind, "SILENT")
-    check("  breach marker written",
-          load_state("breach.json").get(f"{REPO}#7", {}).get("status"), "awaiting-adjudication")
-    check("  adjudicator woken", RECEIVED[-1]["path"] if RECEIVED else None,
-          "/webhooks/widgets-breach")
+    check("  no fix run queued at cap", load_state("pending.json"), {})
+    check("  no ledger run at cap", no_ledger_run(), True)
+    check("  breach marker remains pending while adjudicator is blocked",
+          load_state("breach.json").get(f"{REPO}#7", {}).get("status"), "delivery-pending")
+    check("  adjudicator is blocked", RECEIVED, [])
 
     reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, rid=5)]}})
     kind, out, _ = run("gate_fixer.py", review_payload(rid=5))
-    check("first changes-requested → fix run", kind, "FIRE")
-    check("  round number is 1", json.loads(out)["_loop"]["round"], 1)
-    check("  verdict carried in _loop", json.loads(out)["_loop"]["verdict"], "changes_requested")
+    check("first changes-requested → eligible but silent", (kind, out), ("SILENT", "[SILENT]"))
+    check("  fix held for isolated worker", held("fixer", 7, HEAD_A), True)
+    check("  no gateway dispatch", no_ledger_run(), True)
 
 def group_adjudicator() -> None:
-    """Exercise installed route, signed breach POST, gateway filter, and rendered run."""
+    """Keep #21 breach guards without dispatching a credential-owning agent."""
     from review_loop import cli, config, prompts
 
-    section("adjudicator — signed breach becomes a ruling run, not a reviewer run")
-    reset(prs={"7": {**pr(7, head=HEAD_B), "reviews": [
-        review(REVIEWER, head=ch, rid=i) for i, ch in enumerate("cde", 1)]}})
-    loop = config.load_id("widgets")
-    cli._install_routes(loop)
-    subscriptions = json.loads(SUBS.read_text())
-    route = subscriptions["widgets-breach"]
-    check("installed adjudicator uses its own script", route["script"], "gate_adjudicator.py")
-    check("installed adjudicator uses ruling prompt", route["prompt"] == prompts.ADJUDICATOR, True)
-    check("installed adjudicator uses its own profile", route["profile"], "default")
-
-    kind, _, _ = run("gate_reviewer.py", pr_payload(head=HEAD_B))
-    check("cap still prevents fourth review", kind, "SILENT")
-    wake = RECEIVED[-1] if RECEIVED else {}
-    check("breach reaches configured adjudicator route", wake.get("path"), "/webhooks/widgets-breach")
-    body = (wake.get("body") or "").encode()
-    sig = "sha256=" + hmac.new(route["secret"].encode(), body, hashlib.sha256).hexdigest()
-    check("gateway authenticates signed POST", hmac.compare_digest(wake.get("sig", ""), sig), True)
-    check("gateway event matches subscription", wake.get("event") in route["events"], True)
-    payload = json.loads(body) if body else {}
-    forged = {**payload, "_loop": {**payload["_loop"], "reason": "forged ruling", "round": 100}}
-    outcome, out, _ = run(route["script"], forged)
-    check("gateway script starts adjudication despite untrusted descriptions", outcome, "FIRE")
-    if outcome == "FIRE":
-        check("reason comes from marker, not POST", "forged ruling" in json.loads(out)["_loop"]["reason"], False)
-        check("round comes from marker, not POST", json.loads(out)["_loop"]["round"], 3)
-    check("signed wake replay does not start a second ruling run",
-          run(route["script"], payload)[0], "SILENT")
-    check("marker records consumed head",
-          load_state("breach.json")[f"{REPO}#7"].get("status"), "adjudicating")
-    before = len(RECEIVED)
-    run("gate_reviewer.py", pr_payload(head=HEAD_B))
-    check("another cap event cannot re-arm consumed head", len(RECEIVED) - before, 0)
-    check("consumed marker survives duplicate cap event",
-          load_state("breach.json")[f"{REPO}#7"].get("status"), "adjudicating")
-    if outcome == "FIRE":
-        accepted = json.loads(out)
-        check("gate confirms adjudicator role", accepted["_loop"]["role"], "adjudicator")
-        check("gate confirms PR and head", (accepted["_loop"]["pr"], accepted["_loop"]["head"]),
-              (7, HEAD_B))
-        rendered = re.sub(r"\{([^{}]+)\}", lambda m: str(
-            (accepted.get("_loop") or {}).get(m[1].removeprefix("_loop."), m[0])), route["prompt"])
-        check("ruling prompt reaches agent, not reviewer prompt",
-              "PR #7 stopped and needs a ruling" in rendered and "Do **not** merge" in rendered,
-              True)
-        check("ruling prompt has no unresolved slots", "{_loop." in rendered, False)
-    check("reviewer gate refuses breach payload", run("gate_reviewer.py", payload)[0], "SILENT")
-    check("adjudicator refuses normal review request", run(route["script"], pr_payload())[0], "SILENT")
-    check("adjudicator refuses another repository",
-          run(route["script"], {**payload, "repository": {"full_name": "other/repo"}})[0], "SILENT")
-    check("adjudicator refuses mismatched marker head",
-          run(route["script"], {**payload, "_loop": {**payload.get("_loop", {}), "head": HEAD_A}})[0], "SILENT")
-    check("adjudicator refuses forged PR number",
-          run(route["script"], {**payload, "number": 9})[0], "SILENT")
-    check("adjudicator refuses unreadable GitHub state",
-          run(route["script"], payload, extra_env={"REVIEW_LOOP_GH_STUB": "/bin/false"})[0], "SILENT")
-    set_prs({"7": {**pr(7, head=HEAD_A), "reviews": DATA["world"]["prs"]["7"]["reviews"]}})
-    check("adjudicator refuses a moved head", run(route["script"], payload)[0], "SILENT")
-    set_prs({"7": {**pr(7, head=HEAD_B), "reviews": []}})
-    check("adjudicator refuses a cap no longer spent", run(route["script"], payload)[0], "SILENT")
-    state_file("breach.json").write_text("{}")
-    check("adjudicator refuses absent marker", run(route["script"], payload)[0], "SILENT")
-
-    # Invalid delivery cannot consume the claim; after facts recover a real
-    # signed wake fires once. Simultaneous redeliveries must have one winner.
-    from concurrent.futures import ThreadPoolExecutor
-    reset(prs={"7": {**pr(7, head=HEAD_B), "reviews": [
-        review(REVIEWER, head=ch, rid=i) for i, ch in enumerate("cde", 1)]}})
-    cli._install_routes(config.load_id("widgets"))
-    run("gate_reviewer.py", pr_payload(head=HEAD_B))
-    pending = json.loads(RECEIVED[-1]["body"])
-    set_prs({"7": {**pr(7, head=HEAD_A), "reviews": DATA["world"]["prs"]["7"]["reviews"]}})
-    check("stale wake leaves claim pending", run(route["script"], pending)[0], "SILENT")
-    check("stale wake does not consume marker",
-          load_state("breach.json")[f"{REPO}#7"]["status"], "awaiting-adjudication")
-    set_prs({"7": {**pr(7, head=HEAD_B), "reviews": DATA["world"]["prs"]["7"]["reviews"]}})
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        outcomes = list(pool.map(lambda _: run(route["script"], pending)[0], range(4)))
-    check("concurrent signed wakes start exactly one run", outcomes.count("FIRE"), 1)
-    check("concurrent wake claim remains consumed", run(route["script"], pending)[0], "SILENT")
-
-    # A new head after the ruling is a separate escalation, not suppressed by
-    # the old consumed marker.
-    new_head = "f" * 40
-    set_prs({"7": {**pr(7, head=new_head), "reviews": DATA["world"]["prs"]["7"]["reviews"]}})
-    before = len(RECEIVED)
-    run("gate_reviewer.py", pr_payload(head=new_head))
-    check("new head creates new adjudicator wake", len(RECEIVED) - before, 1)
-    check("new head is claimable", run(route["script"], json.loads(RECEIVED[-1]["body"]))[0], "FIRE")
-
-    # The review-verdict trigger must take the same authenticated route to the
-    # ruling run; the old suite checked only that its HTTP POST succeeded.
-    reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, rid=i) for i in (5, 6, 7)]}})
-    cli._install_routes(config.load_id("widgets"))
-    check("fixer gate refuses cap-spending verdict", run("gate_fixer.py", review_payload(rid=7))[0],
-          "SILENT")
-    wake = RECEIVED[-1]
-    route = json.loads(SUBS.read_text())["widgets-breach"]
-    check("fixer-triggered breach reaches ruling run", run(route["script"], json.loads(wake["body"]))[0],
-          "FIRE")
-
-    section("adjudicator — failed delivery retries and delayed heads cannot regress")
+    section("adjudicator — guarded marker, no legacy gateway dispatch")
     reviews = [review(REVIEWER, head=ch * 40, rid=i) for i, ch in enumerate("cde", 1)]
-    reset(prs={"7": {**pr(7, head=HEAD_A), "reviews": reviews}})
-    # Refuse the first POST at the transport layer; the marker must stay
-    # retryable rather than pretending the adjudicator received it.
-    cfg = json.loads((LOOPS_DIR / "widgets.json").read_text())
-    cfg["host"] = "http://127.0.0.1:9"
-    (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
-    check("failed POST leaves gate silent", run("gate_reviewer.py", pr_payload())[0], "SILENT")
-    check("failed POST leaves retryable marker",
-          load_state("breach.json")[f"{REPO}#7"].get("status"), "delivery-pending")
-    check("failed POST delivered nothing", len(RECEIVED), 0)
-    cfg["host"] = HOST
-    (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
-    before = len(RECEIVED)
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        list(pool.map(lambda _: run("gate_reviewer.py", pr_payload())[0], range(4)))
-    check("concurrent recovery delivers exactly once", len(RECEIVED) - before, 1)
-    check("recovered marker is claimable", run(route["script"],
-          json.loads(RECEIVED[-1]["body"]))[0], "FIRE")
-
-    # B is the current head and has been escalated. An A event arriving late
-    # cannot replace its marker or send a second POST for stale A.
+    reset(prs={"7": {**pr(7, head=HEAD_B), "reviews": reviews}})
+    cli._install_routes(config.load_id("widgets"))
+    route = json.loads(SUBS.read_text())["widgets-breach"]
+    check("adjudicator route retains its own gate", route["script"], "gate_adjudicator.py")
+    check("adjudicator retains ruling prompt", route["prompt"] == prompts.ADJUDICATOR, True)
+    check("cap blocks fourth review", run("gate_reviewer.py", pr_payload(head=HEAD_B))[0], "SILENT")
+    marker = load_state("breach.json")[f"{REPO}#7"]
+    check("blocked wake stays delivery-pending", marker["status"], "delivery-pending")
+    check("blocked wake does not POST to gateway", len(RECEIVED), 0)
+    run("gate_reviewer.py", pr_payload(head=HEAD_B))
+    check("repeat head does not POST", len(RECEIVED), 0)
+    set_prs({"7": {**pr(7, head=HEAD_A), "reviews": reviews}})
+    run("gate_reviewer.py", pr_payload(head=HEAD_B))
+    check("stale event cannot regress marker", load_state("breach.json")[f"{REPO}#7"]["head"], HEAD_B)
     set_prs({"7": {**pr(7, head=HEAD_B), "reviews": reviews}})
-    run("gate_reviewer.py", pr_payload(head=HEAD_B))
-    before = len(RECEIVED)
-    check("B marker installed", load_state("breach.json")[f"{REPO}#7"]["head"], HEAD_B)
-    run("gate_reviewer.py", pr_payload(head=HEAD_A))
-    check("delayed A cannot displace B", load_state("breach.json")[f"{REPO}#7"]["head"], HEAD_B)
-    check("delayed A cannot POST", len(RECEIVED) - before, 0)
-    check("B wake remains claimable", run(route["script"],
-          json.loads(RECEIVED[-1]["body"]))[0], "FIRE")
-
-    # The fixer gate takes its head from an old webhook; the live PR and review list are what
-    # it must agree with (each verdict is in GitHub's list, as it would be).
-    at_a = review(REVIEWER, head=HEAD_A, rid=4)
-    at_b = {**review(REVIEWER, head=HEAD_B, rid=5), "submitted_at": "2026-01-02T00:00:00Z"}
-    reset(prs={"7": {**pr(7, head=HEAD_A), "reviews": reviews + [at_a]}})
-    run("gate_fixer.py", review_payload(head=HEAD_A, rid=4))
-    set_prs({"7": {**pr(7, head=HEAD_B), "reviews": reviews + [at_a, at_b]}})
-    run("gate_fixer.py", review_payload(head=HEAD_B, rid=5))
-    before = len(RECEIVED)
-    run("gate_fixer.py", review_payload(head=HEAD_A, rid=4))
-    check("delayed fixer A cannot replace B",
-          load_state("breach.json")[f"{REPO}#7"]["head"], HEAD_B)
-    check("delayed fixer A does not deliver", len(RECEIVED) - before, 0)
-
-    # No new webhook is needed: the periodic sweep recovers a persisted
-    # pending marker after the endpoint comes back.
-    reset(prs={"7": {**pr(7, head=HEAD_B), "reviews": reviews}})
-    cfg = json.loads((LOOPS_DIR / "widgets.json").read_text())
-    cfg["host"] = "http://127.0.0.1:9"
-    (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
-    run("gate_reviewer.py", pr_payload(head=HEAD_B))
-    cfg["host"] = HOST
-    (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
-    out, _, _ = run("watchdog.py", None, "--loop", "widgets")
-    check("first armed sweep delivers pending breach without another webhook", len(RECEIVED), 1)
-    check("first armed sweep does not report a stall", "silent stall" in out, False)
-    check("sweep marks successful delivery",
-          load_state("breach.json")[f"{REPO}#7"]["status"], "awaiting-adjudication")
     run("watchdog.py", None, "--loop", "widgets")
-    check("subsequent sweep does not redeliver", len(RECEIVED), 1)
-
-    # Unknown reviews/listing cannot authorize delivery; neither can an
-    # approval, a cap that is no longer spent, or a moved head.
-    for label, candidate in (("unreadable reviews", {**pr(7, head=HEAD_B), "reviews": None}),
-                             ("below cap", {**pr(7, head=HEAD_B), "reviews": reviews[:2]}),
-                             ("approved", {**pr(7, head=HEAD_B), "reviews": reviews +
-                                           [review(REVIEWER, head=HEAD_B, rid=8, state="APPROVED")]}),
-                             ("moved head", {**pr(7, head=HEAD_A), "reviews": reviews})):
-        reset(prs={"7": {**pr(7, head=HEAD_B), "reviews": reviews}})
-        cfg = json.loads((LOOPS_DIR / "widgets.json").read_text())
-        cfg["host"] = "http://127.0.0.1:9"
-        (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
-        run("gate_reviewer.py", pr_payload(head=HEAD_B))
-        cfg["host"] = HOST
-        (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
-        set_prs({"7": candidate})
-        out, _, _ = run("watchdog.py", None, "--loop", "widgets")
-        check(f"{label} does not deliver pending", len(RECEIVED), 0)
-        check(f"{label} retains pending marker", load_state("breach.json")[f"{REPO}#7"]["status"],
-              "delivery-pending")
-        check(f"{label} first sweep has no false stall", "silent stall" in out, False)
-        if label == "unreadable reviews":
-            set_prs({"7": {**pr(7, head=HEAD_B), "reviews": reviews}})
-            run("watchdog.py", None, "--loop", "widgets")
-            check("review recovery retries pending POST", len(RECEIVED), 1)
-
-    reset(prs={"7": {**pr(7, head=HEAD_B), "reviews": reviews}})
-    cfg = json.loads((LOOPS_DIR / "widgets.json").read_text())
-    cfg["host"] = "http://127.0.0.1:9"
-    (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
-    run("gate_reviewer.py", pr_payload(head=HEAD_B))
-    cfg["host"] = HOST
-    (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
-    out, _, _ = run("watchdog.py", None, "--loop", "widgets",
-                    extra_env={"REVIEW_LOOP_GH_STUB": "/bin/false"})
-    check("failed listing leaves pending marker", load_state("breach.json")[f"{REPO}#7"]["status"],
+    check("watchdog cannot deliver blocked route", len(RECEIVED), 0)
+    check("watchdog leaves marker retryable", load_state("breach.json")[f"{REPO}#7"]["status"],
           "delivery-pending")
-    check("failed listing does not POST", len(RECEIVED), 0)
-    run("watchdog.py", None, "--loop", "widgets")
-    check("listing recovery retries pending POST", len(RECEIVED), 1)
+    # A stale pre-hold acknowledged marker and signed wake must not bypass the hold.
+    marker = load_state("breach.json")[f"{REPO}#7"]
+    marker["status"] = "awaiting-adjudication"
+    state_file("breach.json").write_text(json.dumps({f"{REPO}#7": marker}))
+    wake = {**pr_payload(head=HEAD_B), "action": "review_loop_breach", "number": 7,
+            "_loop": {"role": "adjudicator", "pr": 7, "head": HEAD_B}}
+    check("legacy acknowledged wake cannot dispatch gateway adjudicator",
+          run(route["script"], wake)[0], "SILENT")
+    check("legacy marker is not consumed", load_state("breach.json")[f"{REPO}#7"]["status"],
+          "awaiting-adjudication")
 
 
 def group_fixer_gate() -> None:
     section("fixer gate — only a verdict it must answer")
     reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, rid=5)]}})
-    check("approved → silent",
-          run("gate_fixer.py", review_payload(state="approved", rid=5))[0], "SILENT")
-    check("commented → silent",
-          run("gate_fixer.py", review_payload(state="commented", rid=5))[0], "SILENT")
-    check("verdict from a non-reviewer → silent",
-          run("gate_fixer.py", review_payload(login="passer-by", rid=5))[0], "SILENT")
-    check("verdict on an older head → silent",
-          run("gate_fixer.py", review_payload(commit="c" * 40, rid=5))[0], "SILENT")
-    check("dismissed review event → silent",
-          run("gate_fixer.py", {**review_payload(rid=5), "action": "dismissed"})[0], "SILENT")
-    check("uppercase state still accepted (REST spelling)",
-          run("gate_fixer.py", review_payload(state="CHANGES_REQUESTED", rid=5))[0], "FIRE")
+    check_rejected("approved → silent", "gate_fixer.py", review_payload(state="approved", rid=5))
+    check_rejected("commented → silent", "gate_fixer.py", review_payload(state="commented", rid=5))
+    check_rejected("verdict from a non-reviewer → silent", "gate_fixer.py",
+                   review_payload(login="passer-by", rid=5))
+    check_rejected("verdict on an older head → silent", "gate_fixer.py",
+                   review_payload(commit="c" * 40, rid=5))
+    check_rejected("dismissed review event → silent", "gate_fixer.py",
+                   {**review_payload(rid=5), "action": "dismissed"})
+    check_eligible("uppercase state still accepted (REST spelling)", "gate_fixer.py",
+                   review_payload(state="CHANGES_REQUESTED", rid=5), "fixer")
 
     reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, rid=5)]}})
     run("gate_fixer.py", review_payload(rid=5))
@@ -972,46 +827,18 @@ def group_fixer_gate() -> None:
 
 
 def group_seats() -> None:
-    section("seats — one run at a time, and only its own turn")
-    reset(prs={"7": pr(7)})
-    run("gate_reviewer.py", pr_payload(7))
-    check("review starts → reviewer seat locked", "widgets#7" in json.dumps(load_state("locks.json")), True)
-
-    # a second PR arriving while the reviewer works is queued, not run
-    set_prs({"7": pr(7), "9": pr(9, head=HEAD_B)})
-    kind, _, err = run("gate_reviewer.py", pr_payload(9, head=HEAD_B))
-    check("busy seat → queued, silent", kind, "SILENT")
-    check("  queue holds PR 9", "9" in load_state("pending.json").get("reviewer", {}).get(f"{REPO}#9", {}).get("url", ""), True)
-
-    # a stale slot frees itself (the ledger is seat → PR key → entry)
-    locks = load_state("locks.json")
-    locks["reviewer"][f"{REPO}#7"]["at"] = time.time() - 46 * 60
-    state_file("locks.json").write_text(json.dumps(locks))
-    check("slot older than the TTL → capacity again",
-          run("gate_reviewer.py", pr_payload(9, head=HEAD_B))[0], "FIRE")
-
-    # releasing a seat only ever releases ITS OWN turn
-    reset(prs={"7": pr(7)})
-    state_file("locks.json").write_text(json.dumps(
-        {"fixer": {f"{REPO}#999": {"at": time.time(), "head": HEAD_A, "why": "other PR"}}}))
-    run("gate_reviewer.py", pr_payload(7))
-    check("another PR's fixer slot survives", "999" in state_file("locks.json").read_text(), True)
-
-    # the reviewer slot and the in-flight mark are cleared so the next run reaches the release
-    locks = load_state("locks.json")
-    locks.pop("reviewer", None)
-    locks["fixer"] = {f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "why": "this PR"}}
-    state_file("locks.json").write_text(json.dumps(locks))
-    state_file("inflight.json").write_text("{}")
-    run("gate_reviewer.py", pr_payload(7))
-    check("this PR's fixer slot is released", "fixer" in load_state("locks.json"), False)
-
-    section("seats — the fixer side releases the reviewer")
+    section("seats — fail-closed route holds never become gateway runs")
+    reset(prs={"7": pr(7), "9": pr(9, head=HEAD_B)})
+    check_eligible("first reviewer turn", "gate_reviewer.py", pr_payload(7), "reviewer")
+    check_eligible("second reviewer turn", "gate_reviewer.py",
+                   pr_payload(9, head=HEAD_B), "reviewer", 9, HEAD_B)
+    check("both held without leaking a gateway slot",
+          sorted(load_state("pending.json").get("reviewer", {})),
+          [f"{REPO}#7", f"{REPO}#9"])
+    check("no legacy seat lock acquired", load_state("locks.json"), {})
     reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, rid=5)]}})
-    state_file("locks.json").write_text(json.dumps(
-        {"reviewer": {f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "why": "review"}}}))
-    run("gate_fixer.py", review_payload(rid=5))
-    check("verdict → reviewer slot released", "reviewer" in load_state("locks.json"), False)
+    check_eligible("fixer verdict", "gate_fixer.py", review_payload(rid=5), "fixer")
+    check("no reviewer lock acquired by eligible fix", load_state("locks.json"), {})
 
 
 def set_concurrency(value: int) -> None:
@@ -1027,181 +854,86 @@ def real_head() -> str:
 
 
 def group_parallel() -> None:
-    section("parallel — own clone per PR, N at a time")
-    reset(prs={"7": pr(7), "9": pr(9)})
+    section("parallel — durable supervisor capacity and deduplication")
+    from review_loop.run_supervisor import Supervisor
+
+    reset(prs={"7": pr(7), "9": pr(9), "11": pr(11)})
     set_concurrency(2)
-    head = real_head()          # isolation checks out a real commit, so the sha must exist
-    set_prs({"7": pr(7, head=head), "9": pr(9, head=head), "11": pr(11, head=head)})
+    # The route cannot obtain the private runtime and must hold the exact head,
+    # regardless of the configured concurrency. Never provision a live worker here.
+    for number in (7, 9, 11):
+        check_eligible(f"parallel gate PR #{number}", "gate_reviewer.py",
+                       pr_payload(number), "reviewer", number)
+    check("no legacy clone or slot created", load_state("locks.json"), {})
 
-    kind, out, err = run("gate_reviewer.py", pr_payload(7, head=head))
-    check("concurrency 2 → first PR starts", kind, "FIRE")
+    db = STATE_DIR / "fixture-runs.sqlite"
+    supervisor = Supervisor(db, fixture_mode=True, fixture_command=[sys.executable, "-c", "pass"],
+                            capacity={"reviewer": 2, "fixer": 1})
+    # Claim synchronously to make the capacity race deterministic; no subprocess or
+    # GitHub credentials are involved. The real route uses the same SQLite ledger.
+    supervisor._spawn = lambda: None
+    for number in (7, 9, 11):
+        check(f"enqueue PR #{number} always silent",
+              supervisor.enqueue(f"delivery-{number}", REPO, number, HEAD_A, "reviewer"), "[SILENT]")
+    first, second = supervisor._claim(), supervisor._claim()
+    check("two reviewer slots claimed", bool(first and second), True)
+    check("third PR waits at capacity", supervisor._claim(), None)
+    check("third remains pending", supervisor.get("delivery-11")["state"], "pending")
+    check("same delivery is deduplicated", supervisor.enqueue("delivery-7", REPO, 7, HEAD_A, "reviewer"), "[SILENT]")
+    check("same head under another delivery is deduplicated",
+          supervisor.enqueue("redelivery-7", REPO, 7, HEAD_A, "reviewer"), "[SILENT]")
+    with sqlite3.connect(db) as con:
+        check("one ledger row for duplicate head",
+              con.execute("SELECT COUNT(*) FROM runs WHERE pr=7 AND seat='reviewer'").fetchone()[0], 1)
+        # A new head and the opposite seat cannot occupy this same PR while it is claimed.
+        supervisor.enqueue("new-head-7", REPO, 7, HEAD_B, "reviewer")
+        supervisor.enqueue("fix-7", REPO, 7, HEAD_A, "fixer")
+    check("same PR new head waits", supervisor.get("new-head-7")["state"], "pending")
+    check("other seat same PR waits", supervisor.get("fix-7")["state"], "pending")
+    check("no third claim while occupied", supervisor._claim(), None)
+    # A finished turn releases precisely one slot. Another pending PR can then claim it.
+    with sqlite3.connect(db) as con:
+        con.execute("UPDATE runs SET state='succeeded' WHERE id=?", (first[0],))
+    third = supervisor._claim()
+    check("completed reviewer frees one slot", third is not None, True)
+    check("waiting PR #11 claimed", supervisor.get("delivery-11")["state"], "claimed")
+    check("still only two active reviewer slots", sum(supervisor.get(f"delivery-{n}")["state"] == "claimed"
+                                                      for n in (7, 9, 11)), 2)
 
-    locks = load_state("locks.json").get("reviewer", {})
-    check("  its slot is held", f"{REPO}#7" in locks, True)
-
-    payload = json.loads(out)
-    iso = payload["_loop"]["isolation"]
-    check("  the run is isolated", iso.get("isolated"), True)
-    iso_clone = pathlib.Path(iso["clone"])
-    check("  own clone, not the shared one", iso_clone != CLONE and str(STATE_DIR) in str(iso_clone), True)
-    check("  the clone is a real checkout", (iso_clone / ".git").exists(), True)
-    check("  checked out at the head under review",
-          subprocess.run(["git", "-C", str(iso_clone), "rev-parse", "HEAD"],
-                         capture_output=True, text=True).stdout.strip(), head)
-    check("  build dir is inside the sandbox", iso["env"].startswith("CARGO_TARGET_DIR="), True)
-    check("  its own target dir, not a shared one",
-          str(STATE_DIR) in iso["target"] and iso["target"].startswith(str(iso_clone.parents[0])), True)
-    check("  the prompt says where to work", iso_clone.name in iso["brief"], True)
-    check("  no token in the clone's config",
-          "token-reviewer" in (iso_clone / ".git" / "config").read_text(), False)
-
-    # a second PR now runs too, in its own sandbox
-    kind, out2, _ = run("gate_reviewer.py", pr_payload(9, head=head))
-    check("second PR starts in parallel", kind, "FIRE")
-    iso2 = json.loads(out2)["_loop"]["isolation"]["clone"]
-    check("  different sandbox from the first", iso2 != iso["clone"], True)
-    check("  two runs now counted", len(load_state("locks.json").get("reviewer", {})), 2)
-
-    # capacity is the wall: a third waits
-    kind, _, _ = run("gate_reviewer.py", pr_payload(11, head=head))
-    check("third PR waits for a slot", kind, "SILENT")
-    check("  queued, not lost", f"{REPO}#11" in load_state("pending.json").get("reviewer", {}), True)
-
-    # the same PR never gets two runs, even with a free slot
-    state_file("inflight.json").write_text("{}")
-    set_prs({"7": pr(7, head=HEAD_B), "9": pr(9, head=head), "11": pr(11, head=head)})
-    kind, _, err = run("gate_reviewer.py", pr_payload(7, head=HEAD_B))
-    check("same PR twice → refused", kind, "SILENT")
-    check("  and it says why", "already running" in err, True)
-    check("  no second slot taken", len(load_state("locks.json").get("reviewer", {})), 2)
-
-    # a finished turn frees a slot, and the queue drains into it (the drain POSTs at the seat's
-    # route — the gate then runs there, so the sandbox is that run's business, not the drain's)
-    state_file("locks.json").write_text(json.dumps(
-        {"reviewer": {f"{REPO}#9": {"at": time.time(), "head": head, "why": "review"}}}))
-    before = len(RECEIVED)
-    out, _, _ = run("watchdog.py", None, "--loop", "widgets", "--drain", "--seat", "reviewer")
-    check("freed slot → queued PR starts", "PR #11" in out, True)
-    check("  the wake really went out", len(RECEIVED) - before, 1)
-    check("  and the queue is cleared", load_state("pending.json").get("reviewer", {}), {})
-
-    # at capacity the drain declines rather than overcommitting
-    state_file("locks.json").write_text(json.dumps({"reviewer": {
-        f"{REPO}#7": {"at": time.time(), "head": head, "why": "review"},
-        f"{REPO}#9": {"at": time.time(), "head": head, "why": "review"}}}))
-    state_file("pending.json").write_text(json.dumps({"reviewer": {
-        f"{REPO}#11": {"at": time.time(), "head": head, "url": "u", "reason": "capacity"}}}))
-    before = len(RECEIVED)
-    out, _, _ = run("watchdog.py", None, "--loop", "widgets", "--drain", "--seat", "reviewer")
-    check("full seat → drain declines", "at capacity (2/2" in out, True)
-    check("  nothing fired", len(RECEIVED) - before, 0)
-
-    # an unisolatable run is queued, never started beside another
-    reset(prs={"7": pr(7), "9": pr(9, head=HEAD_B)})
-    set_concurrency(2)
-    state_file("locks.json").write_text(json.dumps({"reviewer": {}}))
-    kind, _, err = run("gate_reviewer.py", pr_payload(9, head=HEAD_B))
-    check("no sandbox + concurrency 2 → queued", kind, "SILENT")
-    check("  and it says isolation is why", "no isolated workspace" in err, True)
-    check("  no slot left held", load_state("locks.json").get("reviewer", {}), {})
-
-    section("parallel — each seat its own number, each seat its own sandbox")
+    section("parallel — per-seat capacity independent")
     reset(prs={"7": pr(7), "9": pr(9)})
-    set_concurrency(1)                     # loop default stays serialized...
+    set_concurrency(1)
     cfg = json.loads((LOOPS_DIR / "widgets.json").read_text())
-    cfg["seats"]["reviewer"]["concurrency"] = 2      # ...Vex gets 2, Drey keeps 1
+    cfg["seats"]["reviewer"]["concurrency"] = 2
     (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
-    head = real_head()
-    # A verdict at the older head so the fixer has something to answer, plus a newer head so the
-    # reviewer still has something to review: the same PR, two different turns.
-    subprocess.run(["git", "-C", str(CLONE), "commit", "--allow-empty", "-qm", "second"],
-                   capture_output=True, text=True)
-    newer = real_head()
-    set_prs({"7": {**pr(7, head=newer), "reviews": [review(REVIEWER, head=head, rid=5)]},
-             "9": {**pr(9, head=newer), "reviews": [review(REVIEWER, head=head, rid=6)]}})
-
-    kind_r7, out_r7, _ = run("gate_reviewer.py", pr_payload(7, head=newer))
-    check("reviewer 2 → first review runs", kind_r7, "FIRE")
-    check("reviewer 2 → second review runs too",
-          run("gate_reviewer.py", pr_payload(9, head=newer))[0], "FIRE")
-    # The verdicts the fixer answers are in GitHub's live list at the head they name.
-    set_prs({"7": {**pr(7, head=newer), "reviews": [review(REVIEWER, head=newer, rid=5)]},
-             "9": {**pr(9, head=newer), "reviews": [review(REVIEWER, head=newer, rid=6)]}})
-    kind_f7, out_f7, _ = run("gate_fixer.py", review_payload(7, head=newer, rid=5))
-    check("fixer 1 → its fix runs", kind_f7, "FIRE")
-    check("  the fix released that PR's review slot",
-          len(load_state("locks.json").get("reviewer", {})), 1)
-    kind_f9, _, err_f9 = run("gate_fixer.py", review_payload(9, head=newer, rid=6))
-    check("fixer 1 → a second fix queues", kind_f9, "SILENT")
-    check("  and it says capacity", "at capacity 1/1" in err_f9, True)
-
-    iso_r = json.loads(out_r7)["_loop"]["isolation"]
-    iso_f = json.loads(out_f7)["_loop"]["isolation"]
-    check("the two seats never share a sandbox", iso_r["clone"] != iso_f["clone"], True)
-    check("  the reviewer's is a reviewer workspace", f"/{7}/reviewer/" in iso_r["clone"], True)
-    check("  the fixer's is a fixer workspace", f"/{7}/fixer/" in iso_f["clone"], True)
-    check("  both are real clones",
-          (pathlib.Path(iso_r["clone"]) / ".git").exists()
-          and (pathlib.Path(iso_f["clone"]) / ".git").exists(), True)
-    check("  the payload reports its own seat", iso_f["seat"], "fixer")
-    check("  at the head under review",
-          subprocess.run(["git", "-C", iso_f["clone"], "rev-parse", "HEAD"],
-                         capture_output=True, text=True).stdout.strip(), newer)
+    from review_loop import config
+    loop = config.load_id("widgets")
+    check("reviewer capacity configured separately", config.seat_concurrency(loop, "reviewer"), 2)
+    check("fixer capacity remains one", config.seat_concurrency(loop, "fixer"), 1)
+    db = STATE_DIR / "split-runs.sqlite"
+    supervisor = Supervisor(db, fixture_mode=True, fixture_command=[sys.executable, "-c", "pass"],
+                            capacity={s: config.seat_concurrency(loop, s) for s in ("reviewer", "fixer")})
+    supervisor._spawn = lambda: None
+    for n in (7, 9, 11):
+        supervisor.enqueue(f"fix-{n}", REPO, n, HEAD_A, "fixer")
+    check("first fixer claims", supervisor._claim() is not None, True)
+    check("second fixer waits at its own capacity", supervisor._claim(), None)
+    check("other fix stays pending", supervisor.get("fix-9")["state"], "pending")
 
 
 def group_exclusive() -> None:
-    section("one seat per PR — Vex never reviews what Drey is fixing")
-    reset(prs={"7": pr(7)})
-    set_concurrency(2)          # capacity 2, so the only reason to queue is the other seat
-    head = real_head()
-    set_prs({"7": {**pr(7, head=head), "reviews": [review(REVIEWER, head=head, rid=5)]}})
-
-    check("the fixer takes PR #7 on the verdict",
-          run("gate_fixer.py", review_payload(7, head=head, rid=5))[0], "FIRE")
-    check("  and holds it", "acme/widgets#7" in load_state("locks.json").get("fixer", {}), True)
-
-    # A push and a review trigger that is *not* a handoff, while the fixer still works the PR.
-    subprocess.run(["git", "-C", str(CLONE), "commit", "--allow-empty", "-qm", "pushed"],
-                   capture_output=True, text=True)
-    newer = real_head()
-    set_prs({"7": {**pr(7, head=newer), "reviews": [review(REVIEWER, head=head, rid=5)]}})
-
-    kind, _, err = run("gate_reviewer.py", pr_payload(7, head=newer, action="ready_for_review"))
-    check("a non-handoff trigger while the fixer works it → queued", kind, "SILENT")
-    check("  and it says why", "the fixer seat is working this PR" in err, True)
-    check("  no reviewer slot was taken", load_state("locks.json").get("reviewer", {}), {})
-    check("  queued, not dropped",
-          "fixer seat is working" in load_state("pending.json")["reviewer"]["acme/widgets#7"]["reason"], True)
-    check("  the fixer still holds it", "acme/widgets#7" in load_state("locks.json").get("fixer", {}), True)
-
-    kind, out, _ = run("gate_reviewer.py", pr_payload(7, head=newer, action="review_requested"))
-    check("the fixer's request *is* the handoff → review starts", kind, "FIRE")
-    check("  and the fixer's slot is freed", "acme/widgets#7" in load_state("locks.json").get("fixer", {}), False)
-    check("  the stale queue entry is gone", load_state("pending.json").get("reviewer", {}), {})
-    check("  the payload names the newer head", json.loads(out)["_loop"]["head"], newer)
-
-    section("an approval frees the reviewer's slot — the queue keeps moving")
-    reset(prs={"7": pr(7), "9": pr(9), "11": pr(11)})
-    set_concurrency(2)                     # reviewer capacity 2, fixer capacity 2 (independently)
-    head = real_head()
-    set_prs({n: pr(n, head=head) for n in (7, 9, 11)})
-
-    check("review #7 starts", run("gate_reviewer.py", pr_payload(7, head=head, action="opened"))[0], "FIRE")
-    check("review #9 starts", run("gate_reviewer.py", pr_payload(9, head=head, action="opened"))[0], "FIRE")
-    kind, _, err = run("gate_reviewer.py", pr_payload(11, head=head, action="opened"))
-    check("review #11 queues (at capacity)", kind, "SILENT")
-    check("  it says capacity", "at capacity 2/2" in err, True)
-    check("  both slots are held", len(load_state("locks.json").get("reviewer", {})), 2)
-
-    before = len(RECEIVED)
-    kind, _, err = run("gate_fixer.py", review_payload(7, head=head, state="approved", rid=9))
-    check("an approval wakes no fix run", kind, "SILENT")
-    check("  it says the slot was freed", "reviewer's slot freed" in err, True)
-    check("  the reviewer is down to one hold", len(load_state("locks.json").get("reviewer", {})), 1)
-    check("  the queued PR was picked up", len(RECEIVED) - before, 1)
-    check("  and it was #11 that started", json.loads(RECEIVED[-1]["body"])["number"], 11)
-    check("  with a valid signature", verify_sig(RECEIVED[-1], "widgets-review"), True)
-    check("  the queue is empty again", load_state("pending.json").get("reviewer", {}), {})
+    section("one seat per PR — handoff remains fail-closed")
+    reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, rid=5)]}})
+    check_eligible("fixer receives verdict", "gate_fixer.py", review_payload(rid=5), "fixer")
+    check("fixer has no gateway lock", load_state("locks.json"), {})
+    set_prs({"7": {**pr(7, head=HEAD_B), "reviews": [review(REVIEWER, rid=5)]}})
+    check_eligible("new review request", "gate_reviewer.py",
+                   pr_payload(7, head=HEAD_B), "reviewer", head=HEAD_B)
+    check("new head held without dispatch",
+          held("reviewer", 7, HEAD_B), True)
+    check("old fixer head no longer queued after handoff",
+          load_state("pending.json").get("fixer", {}), {})
+    check("no legacy slot acquired", load_state("locks.json"), {})
 
 
 def manifest_schema() -> dict:
@@ -1465,14 +1197,17 @@ def group_seat_identity() -> None:
     check("  and where each seat's token is referenced",
           f"reviewer {REVIEWER} → {SEAT_PATS[0]}" in status, True)
 
-    # End to end: the route the gateway serves is the profile the form chose, so a review woken for
-    # this loop is woken *as Vex* — the URL itself carries it, and the drain is the path that fires
-    # at a route rather than letting the gateway be the one to do it.
+    # The #16 route holds eligible review work for an isolated worker instead of
+    # handing a FIRE payload to the gateway. The #17 profile mapping must remain intact.
     set_prs({"7": pr(7)})
     payload = {**pr_payload(7, requested=REVIEWER), "repository": {"full_name": "acme/seats"}}
     kind, out, err = run("gate_reviewer.py", payload)
-    check("the gate fires for the new loop", kind, "FIRE")
-    check("  and the payload names the seat it woke", json.loads(out)["_loop"]["role"], "reviewer")
+    check("the new loop gate stays silent", (kind, out), ("SILENT", "[SILENT]"))
+    seats_pending = HOME / "state" / "review-loops" / "seats" / "pending.json"
+    queued = json.loads(seats_pending.read_text()) if seats_pending.exists() else {}
+    check("  and holds the authorized reviewer head",
+          queued.get("reviewer", {}).get("acme/seats#7", {}).get("head"), HEAD_A)
+    check("  and never starts a gateway run", no_ledger_run(), True)
 
     loop_state = HOME / "state" / "review-loops" / "seats"
     loop_state.mkdir(parents=True, exist_ok=True)
@@ -1482,7 +1217,7 @@ def group_seat_identity() -> None:
                                         "reason": "capacity"}}}))
     before = len(RECEIVED)
     out, _, _ = run("watchdog.py", None, "--loop", "seats", "--drain", "--seat", "reviewer")
-    check("the drain starts the queued review", "started the queued run" in out, True)
+    check("HTTP-only drain does not claim queued review started", "started the queued run" in out, False)
     check("  and it wakes the reviewer at the profile the form chose",
           RECEIVED[-1]["path"] if len(RECEIVED) > before else None,
           "/p/vex/webhooks/seats-review")
@@ -2054,11 +1789,12 @@ def group_watchdog() -> None:
         {"reviewer": {f"{REPO}#7": {"at": time.time(), "head": HEAD_A,
                                     "url": f"https://github.com/{REPO}/pull/7", "reason": "busy"}}}))
     out, _, _ = run("watchdog.py", None, "--loop", "widgets", "--drain", "--seat", "reviewer")
-    check("queued review starts", "started the queued run" in out, True)
+    check("HTTP-only queued review remains unacknowledged", "started the queued run" in out, False)
     check("  it asked for the reviewer seat",
           json.loads(RECEIVED[-1]["body"])["requested_reviewer"]["login"], SEAT)
     check("  signature is valid for that route", verify_sig(RECEIVED[-1], "widgets-review"), True)
-    check("  queue is now empty", load_state("pending.json"), {})
+    check("  queue remains until the gate acknowledges enqueue",
+          f"{REPO}#7" in load_state("pending.json").get("reviewer", {}), True)
 
     # A queued A must not turn into a synthetic request for B. A fresh event can
     # subsequently enqueue B, but the stale request has no authority to wake it.
@@ -2116,7 +1852,8 @@ def group_watchdog() -> None:
         expected = state in ("COMMENTED", "PENDING", "DISMISSED")
         check(f"queued review with {state} {'fires' if expected else 'drops'}",
               len(RECEIVED) - before, 1 if expected else 0)
-        check(f"  {state} queue entry cleared", load_state("pending.json"), {})
+        check(f"  {state} queue {'held' if expected else 'cleared'}",
+              f"{REPO}#7" in load_state("pending.json").get("reviewer", {}), expected)
         if expected and len(RECEIVED) > before:
             check(f"  {state} wake targets requested head",
                   json.loads(RECEIVED[-1]["body"])["pull_request"]["head"]["sha"], HEAD_A)
@@ -2143,11 +1880,12 @@ def group_watchdog() -> None:
     check("zero-alert sweep wakes queued PR after lock expiry", len(RECEIVED) - before, 1)
     check("  the eligible PR was woken", json.loads(RECEIVED[-1]["body"])["number"] if RECEIVED else None, 7)
     check("  no stall warning is required", "silent stall" in out or "stuck state" in out, False)
-    check("  queue is cleared", load_state("pending.json"), {})
+    check("  HTTP-only queue remains unacknowledged",
+          f"{REPO}#7" in load_state("pending.json").get("reviewer", {}), True)
     check("  expired lock is cleared", load_state("locks.json"), {})
     before = len(RECEIVED)
     run("watchdog.py", None, "--loop", "widgets", extra_env={"REVIEW_LOOP_TEST": ""})
-    check("  repeated sweep does not wake twice", len(RECEIVED) - before, 0)
+    check("  uncertain route is not automatically replayed", len(RECEIVED) - before, 0)
 
     # A spare slot must not wake a PR already held by that seat.
     reset(prs={"7": pr(7)})
@@ -2173,7 +1911,8 @@ def group_watchdog() -> None:
     run("watchdog.py", None, "--loop", "widgets", extra_env={"REVIEW_LOOP_TEST": ""})
     check("zero-alert sweep drains eligible fixer", len(RECEIVED) - before, 1)
     check("  fixer route received the verdict", RECEIVED[-1]["event"], "pull_request_review")
-    check("  fixer queue cleared", load_state("pending.json"), {})
+    check("  fixer hold remains until gate acknowledgement",
+          f"{REPO}#7" in load_state("pending.json").get("fixer", {}), True)
 
     # shape 1: the reviewer never posted a verdict
     reset(prs={"7": pr(7, head=HEAD_A)})
@@ -2331,8 +2070,11 @@ def group_watchdog() -> None:
               load_state("pending.json").get("reviewer", {}), True)
         out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
         check(f"{label} next sweep does not prematurely alert", "silent stall" in out, False)
-        check(f"{label} rejects stale queued head", load_state("pending.json"), {})
-        check(f"{label} never wakes stale head", len(RECEIVED) - before, 1)
+        check(f"{label} retains uncertain first head but drops stale second head",
+              set(load_state("pending.json").get("reviewer", {})),
+              {f"{REPO}#7"})
+        check(f"{label} never replays uncertain first head or wakes stale second head",
+              len(RECEIVED) - before, 1)
 
     # Failed listing cannot establish a safe recovery baseline or drain.
     reset(prs={"7": pr(7)})
@@ -2654,12 +2396,9 @@ def group_explain() -> None:
               ("retry", True))
         check(f"dismissed third verdict / {status}: marker stays diagnostic",
               report["escalation"].startswith(f"{status} at head bbbbbbb"), True)
-        outcome, output, error = run("gate_reviewer.py",
-                                     pr_payload(head=HEAD_B),
-                                     extra_env={"REVIEW_LOOP_TEST": "1"})
-        check(f"dismissed third verdict / {status}: reviewer gate starts round three",
-              (outcome, json.loads(output).get("_loop", {}).get("round")
-               if outcome == "FIRE" else error), ("FIRE", 3))
+        check_eligible(f"dismissed third verdict / {status}: reviewer gate holds round three",
+                       "gate_reviewer.py", pr_payload(head=HEAD_B),
+                       "reviewer", head=HEAD_B)
 
     reset(prs={"7": {**pr(7, head=HEAD_B), "reviews": spent_reviews}})
     rc, out = explain()
@@ -2840,7 +2579,7 @@ def group_observer() -> None:
     # -- opt-in: with no observer configured, nothing about the loop changes ------
     reset(prs={"7": pr(7)})
     kind, out, err = run("gate_reviewer.py", pr_payload())
-    check("no observer → the review still runs", kind, "FIRE")
+    check("no observer → the review still runs", kind, "SILENT")
     check("  nothing is sent to a feed", observer_posts(), [])
     check("  and no ledger is written", state_file("observations.json").exists(), False)
 
@@ -2848,7 +2587,7 @@ def group_observer() -> None:
     reset(prs={"7": pr(7)})
     observer_route()
     kind, out, err = run("gate_reviewer.py", pr_payload())
-    check("handoff: the review runs", kind, "FIRE")
+    check("handoff: the review runs", kind, "SILENT")
     check("  exactly one notice", len(observer_posts()), 1)
     post = observer_posts()[0]
     check("  sent to the observer's own route", post["path"],
@@ -2861,7 +2600,7 @@ def group_observer() -> None:
     check("  seat, event, head, actor and next turn in one line",
           block["message"].splitlines()[0],
           f"🔧 [widgets] #7 `{HEAD_A[:7]}` fix pushed · review requested (dev-fixer) "
-          f"· round 1/3 · next: reviewer")
+          f"· round 1/3 · next: reviewer queued")
     check("  the link is on its own line", block["message"].splitlines()[1], block["url"])
     secret = json.loads(SUBS.read_text())["widgets-observe"]["secret"]
     check("  no token, no secret, no review body in the ping",
@@ -2874,7 +2613,7 @@ def group_observer() -> None:
     state_file("locks.json").write_text("{}")
     state_file("inflight.json").write_text("{}")
     kind, out, err = run("gate_reviewer.py", pr_payload())
-    check("redelivered handoff: the gate fires again", kind, "FIRE")
+    check("redelivered handoff: the gate fires again", kind, "SILENT")
     check("  and the feed says nothing new", len(observer_posts()), 1)
     check("  it says why", "already recorded" in err, True)
 
@@ -2888,14 +2627,14 @@ def group_observer() -> None:
     reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, rid=5)]}})
     observer_route()
     kind, out, err = run("gate_fixer.py", review_payload(rid=5))
-    check("verdict: the fix run starts", kind, "FIRE")
+    check("verdict: the fix run starts", kind, "SILENT")
     check("  exactly one notice", len(observer_posts()), 1)
     block = notice(observer_posts()[0])
     check("  event", block["event"], "verdict")
     check("  outcome, actor, round and next turn",
           block["message"].splitlines()[0],
           f"🔍 [widgets] #7 `{HEAD_A[:7]}` review posted — changes requested (rev-coach) "
-          f"· round 1/3 · next: fixer")
+          f"· round 1/3 · next: fixer queued")
     state_file("locks.json").write_text("{}")
     state_file("inflight.json").write_text("{}")
     run("gate_fixer.py", review_payload(rid=5))
@@ -2918,24 +2657,24 @@ def group_observer() -> None:
           "on an older head" in notice(observer_posts()[0])["message"], True)
 
     # -- escalation reports a durable pending marker before adjudicator delivery -----
-    reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, rid=3), review(REVIEWER, rid=4),
-                                          review(REVIEWER, rid=5)]}})
+    reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, rid=8), review(REVIEWER, rid=9),
+                                          review(REVIEWER, rid=10)]}})
     observer_route()
-    kind, out, err = run("gate_fixer.py", review_payload(rid=5))
+    kind, out, err = run("gate_fixer.py", review_payload(rid=10))
     check("cap spent: no fix run", kind, "SILENT")
-    check("  the feed sees the durable marker before adjudicator delivery",
+    check("  observer sees the pending marker but no unsafe adjudicator dispatch",
            [r["path"] for r in RECEIVED],
-           ["/p/tuck-profile/webhooks/widgets-observe", "/webhooks/widgets-breach"])
+           ["/p/tuck-profile/webhooks/widgets-observe"])
     block = notice(observer_posts()[0])
     check("  event", block["event"], "escalation")
     check("  the spent budget, and who owns it now",
           block["message"].splitlines()[0],
           f"⚠️ [widgets] #7 `{HEAD_A[:7]}` loop stopped — cap spent — 3/3 verdicts, "
           f"no approval · next: adjudicator delivery pending")
-    run("gate_fixer.py", review_payload(rid=5))
+    run("gate_fixer.py", review_payload(rid=10))
     check("  a redelivered cap event pings nobody twice",
           (len(observer_posts()), len([r for r in RECEIVED if r["path"].endswith("widgets-breach")])),
-          (1, 1))
+          (1, 0))
 
     # -- a stall the watchdog decided to report is a notice ------------------------
     reset(prs={"7": pr(7, head=HEAD_A)})
@@ -2967,14 +2706,14 @@ def group_observer() -> None:
     reset(prs={"7": pr(7)})
     observer_route(mute=True)
     kind, _, err = run("gate_reviewer.py", pr_payload())
-    check("muted: the review still runs", kind, "FIRE")
+    check("muted: the review still runs", kind, "SILENT")
     check("  nothing is sent", observer_posts(), [])
     check("  and nothing is queued up for later", state_file("observations.json").exists(), False)
 
     reset(prs={"7": pr(7)})
     observer_route(events=["escalation"])
     kind, _, err = run("gate_reviewer.py", pr_payload())
-    check("filtered out: the review still runs", kind, "FIRE")
+    check("filtered out: the review still runs", kind, "SILENT")
     check("  nothing is sent for it", observer_posts(), [])
     check("  it says why", "not in the feed" in err, True)
     check("  and it is not recorded as owed",
@@ -2983,9 +2722,9 @@ def group_observer() -> None:
     reset(prs={"7": pr(7)})
     observer_route(route="widgets-observe-missing", register=False)   # configured, never installed
     kind, _, err = run("gate_reviewer.py", pr_payload())
-    check("misconfigured: the review still runs", kind, "FIRE")
-    check("  the seat is held as usual",
-          f"{REPO}#7" in load_state("locks.json").get("reviewer", {}), True)
+    check("misconfigured: the review still runs", kind, "SILENT")
+    check("  the turn is held for isolation",
+          held("reviewer", 7, HEAD_A), True)
     entries = load_state("observations.json").get("entries", {})
     check("  the refused delivery is recorded", [e["status"] for e in entries.values()], ["failed"])
     check("  with the reason",
@@ -2999,41 +2738,39 @@ def group_observer() -> None:
     check("a route-less observer never refuses the loop",
           config_mod.load_id("widgets")["observer"]["misconfigured"],
           "observer.route is required to deliver anything")
-    check("  and the review still runs", run("gate_reviewer.py", pr_payload(7))[0], "FIRE")
+    check("  and the review still runs", run("gate_reviewer.py", pr_payload(7))[0], "SILENT")
 
-    # -- a destination that refuses the POST does not delay the next seat ----------
+    # -- failed observer transport cannot cause an unsafe agent wake ---------------
     reset(prs={"7": pr(7), "9": pr(9), "11": pr(11)})
     set_concurrency(2)
     head = real_head()
     set_prs({n: pr(n, head=head) for n in (7, 9, 11)})
     observer_route(route="widgets-observe-fail")             # the sink answers 5xx
-    check("review #7 starts", run("gate_reviewer.py", pr_payload(7, head=head, action="opened"))[0],
-          "FIRE")
-    check("review #9 starts", run("gate_reviewer.py", pr_payload(9, head=head, action="opened"))[0],
-          "FIRE")
-    check("review #11 queues at capacity",
-          run("gate_reviewer.py", pr_payload(11, head=head, action="opened"))[0], "SILENT")
+    for number in (7, 9, 11):
+        check(f"review #{number} is held from gateway dispatch",
+              run("gate_reviewer.py", pr_payload(number, head=head, action="opened"))[0],
+              "SILENT")
+        check(f"  reviewer #{number} is queued for isolation", held("reviewer", number, head), True)
     before = len(RECEIVED)
     kind, _, err = run("gate_fixer.py", review_payload(7, head=head, state="approved", rid=9))
-    check("an approval wakes no fix run", kind, "SILENT")
+    check("an unverified approval wakes no fix run", kind, "SILENT")
     woken = [r for r in RECEIVED[before:] if r["path"].endswith("/webhooks/widgets-review")]
     refused = [r for r in RECEIVED[before:] if "observe-fail" in r["path"]]
-    check("  the queued review still started", len(woken), 1)
-    check("  and it was #11", json.loads(woken[0]["body"])["number"], 11)
-    check("  with a valid signature", verify_sig(woken[0], "widgets-review"), True)
+    check("  observer failure does not dispatch a gateway review", woken, [])
     check("  while the notice was refused (5xx)", len(refused), 1)
     check("  the failure is recorded, not hidden",
           sorted({e["status"] for e in load_state("observations.json")["entries"].values()}),
           ["uncertain"])
-    check("  no lock was left behind",
-          sorted(load_state("locks.json").get("reviewer", {})), [f"{REPO}#9"])
-    check("  and no seat was consumed", load_state("pending.json").get("reviewer", {}), {})
+    check("  no legacy lock acquired", load_state("locks.json").get("reviewer", {}), {})
+    check("  all turns remain held for isolation",
+          sorted(load_state("pending.json").get("reviewer", {})),
+          sorted(f"{REPO}#{n}" for n in (7, 9, 11)))
 
     # -- what is owed is retried by the sweep, and lands once the route is fixed ---
     reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, rid=5)]}})
     observer_route(secret=False)                              # no secret: cannot be signed
     kind, _, err = run("gate_fixer.py", review_payload(rid=5))
-    check("an unsigned destination does not stop the fix", kind, "FIRE")
+    check("an unsigned destination does not stop the fix", kind, "SILENT")
     entries = load_state("observations.json")["entries"]
     check("  the notice is owed, with its reason",
           [(e["status"], e["attempts"], "no secret" in e["error"]) for e in entries.values()],
@@ -3053,9 +2790,9 @@ def group_observer() -> None:
     # -- the digest: many transitions, one compact message -------------------------
     reset(prs={"7": pr(7)})
     observer_route(digest_min=15)
-    check("the review runs", run("gate_reviewer.py", pr_payload(7, action="opened"))[0], "FIRE")
+    check("the review runs", run("gate_reviewer.py", pr_payload(7, action="opened"))[0], "SILENT")
     set_prs({"7": {**pr(7), "reviews": [review(REVIEWER, rid=5)]}})
-    check("the fix runs on the verdict", run("gate_fixer.py", review_payload(rid=5))[0], "FIRE")
+    check("the fix runs on the verdict", run("gate_fixer.py", review_payload(rid=5))[0], "SILENT")
     check("nothing is sent while the batch is open", observer_posts(), [])
     set_prs({})
     state_file("watchdog.json").write_text(json.dumps({"armed_since": time.time() - 86400}))
@@ -3105,7 +2842,7 @@ def group_observer_safety() -> None:
         delivered = observer.notify(loop, st, "opened", 7, HEAD_A)
     check("failed claim never reports delivery", delivered, False)
     check("failed claim never POSTs private link", observer_posts(), [])
-    check("failed claim does not block subsequent seat", run("gate_reviewer.py", pr_payload())[0], "FIRE")
+    check("failed claim does not block subsequent seat", run("gate_reviewer.py", pr_payload())[0], "SILENT")
 
     check("full head differentiates same-prefix commits",
           observer.key_for(loop, 7, HEAD_A[:12] + "0" * 28, "opened") !=
@@ -3120,7 +2857,7 @@ def group_observer_safety() -> None:
         subs["widgets-observe"][key] = changed
         SUBS.write_text(json.dumps(subs))
         kind, _, _ = run("gate_reviewer.py", pr_payload())
-        check(f"{key} mismatch does not block seat", kind, "FIRE")
+        check(f"{key} mismatch does not block seat", kind, "SILENT")
         check(f"{key} mismatch never leaks link / wakes model", observer_posts(), [])
         check(f"{key} mismatch is owed, not silently dropped",
               list(load_state("observations.json")["entries"].values())[0]["status"], "failed")
@@ -3727,7 +3464,8 @@ def group_cleanup() -> None:
         f"review:7x:{HEAD_A}": 789, f"other:7:{HEAD_A}": 321,
         f"review:7:{HEAD_A}:extra": 654})
     set_prs({"7": pr(7, head=HEAD_A)})
-    check("reopened same head can enter reviewer gate", run("gate_reviewer.py", pr_payload())[0], "FIRE")
+    check_eligible("reopened same head can enter reviewer gate", "gate_reviewer.py",
+                   pr_payload(), "reviewer")
 
     # an open PR is refused without --force
     reset(prs={"7": pr(7, state="open")})

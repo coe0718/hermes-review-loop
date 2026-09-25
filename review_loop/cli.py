@@ -565,10 +565,24 @@ def _install_schedule(loop: dict, schedule: str, deliver: str) -> list[str]:
 # -- verbs ----------------------------------------------------------------------
 
 
-def _write_config(loop: dict) -> pathlib.Path:
+def _write_config(loop: dict, *, policy_change: bool = False) -> pathlib.Path:
+    with config.push_policy_lock():
+        return _write_config_locked(loop, policy_change=policy_change)
+
+
+def _write_config_locked(loop: dict, *, policy_change: bool = False) -> pathlib.Path:
     directory = config.config_dir()
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{loop['id']}.json"
+    if path.is_symlink():
+        raise config.ConfigError('symlinked loop config refused')
+    if path.exists() and not policy_change:
+        # Set/apply snapshots never own this switch. Re-read under the same lock
+        # used by explicit enable/disable and by the broker's ref operation.
+        current = config.load_id(loop['id'])
+        if current['repo'] != loop['repo']:
+            raise config.ConfigError('repository changed during config update')
+        loop = {**loop, 'unattended_fixer_push': current['unattended_fixer_push']}
     payload = json.dumps({k: v for k, v in loop.items() if v not in ({}, [], "")},
                          indent=2, sort_keys=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{loop['id']}.", suffix=".tmp", dir=directory)
@@ -584,6 +598,21 @@ def _write_config(loop: dict) -> pathlib.Path:
 
 def _restore_config(path: pathlib.Path, data: bytes) -> None:
     """Publish a previous snapshot without exposing partially restored JSON."""
+    with config.push_policy_lock():
+        if path.is_symlink():
+            raise config.ConfigError('symlinked loop config refused')
+        if path.exists():
+            current = config.load_id(path.stem)
+            snapshot = json.loads(data)
+            if snapshot.get('repo', '').lower() != current['repo']:
+                raise config.ConfigError('repository changed during config rollback')
+            if snapshot.get('unattended_fixer_push', False) != current['unattended_fixer_push']:
+                snapshot['unattended_fixer_push'] = current['unattended_fixer_push']
+                data = json.dumps(snapshot, indent=2, sort_keys=True).encode()
+        _restore_config_locked(path, data)
+
+
+def _restore_config_locked(path: pathlib.Path, data: bytes) -> None:
     fd, temporary = tempfile.mkstemp(prefix=f".{path.stem}.", suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(fd, "wb") as stream:
@@ -1158,6 +1187,9 @@ def cmd_status(args) -> int:
             + ("" if config.seat_concurrency(loop, seat) > 1 else " (serialized)")
             for seat in ("reviewer", "fixer")))
         print(f"  clone:      {loop['clone'] or '(none)'}")
+        print("  fixer push: " + ("ENABLED — operator accepted PR-metadata/ref race"
+                                  if config.unattended_fixer_push_enabled(loop)
+                                  else "off (unattended pushes disabled)"))
         print(f"  state:      {st.dir}")
         print(f"  seats:      reviewer={loop['seats']['reviewer']['login']} "
               f"({loop['seats']['reviewer']['profile']}) · "
@@ -1298,6 +1330,72 @@ def cmd_arm(args) -> int:
     for loop in ([config.load_id(args.loop)] if args.loop else config.all_loops()):
         for line in _set_hooks(loop, not args.pause, args.admin_token):
             print(f"[{loop['id']}] {line}")
+    return 0
+
+def cmd_fixer_push(args) -> int:
+    """Change only this repository's unattended push permission by explicit operator action."""
+    try:
+        with config.push_policy_lock():
+            return _cmd_fixer_push_locked(args)
+    except (OSError, ValueError, config.ConfigError) as exc:
+        print(f"fixer push policy update not confirmed: {exc}")
+        return 2
+
+
+def _cmd_fixer_push_locked(args) -> int:
+    try:
+        loop = config.load_id(args.loop)
+        config.by_repo(loop['repo'])  # duplicate owners fail closed
+    except config.ConfigError as exc:
+        print(f"no such loop: {exc}")
+        return 2
+    if args.enable and not args.acknowledge_pr_race:
+        print("refused: host-operator policy only (not verified GitHub owner/admin consent). "
+              "Unattended fixer pushes have a residual PR-metadata/ref race: "
+              "closing, drafting or retargeting a PR between the last check and Git's "
+              "exact-SHA-lease push can still publish. Inspect the production boundary and "
+              "pass --acknowledge-pr-race to opt in for this repository.")
+        return 2
+    if args.enable:
+        try:
+            busy = _busy_seats(loop, {"fixer"})
+            from .run_supervisor import Supervisor, ACTIVE
+            ledger = config.home() / 'state' / 'review-loop-runs.sqlite'
+            if ledger.exists():
+                with Supervisor(ledger)._connect() as con:
+                    rows = con.execute(
+                        'SELECT pr,state FROM runs WHERE repo=? AND seat=? '
+                        'AND state IN (?,?,?,?) LIMIT 1',
+                        (loop['repo'], 'fixer', *ACTIVE)).fetchall()
+                busy.extend(f"fixer supervisor on PR {row['pr']} ({row['state']})"
+                            for row in rows)
+        except (OSError, ValueError) as exc:
+            print(f"refused: cannot check active fixer runs: {exc}")
+            return 2
+        if busy:
+            print("refused: fixer run in flight; wait for it to finish before arming pushes: "
+                  + "; ".join(busy))
+            return 2
+    enabled = bool(args.enable)
+    if config.unattended_fixer_push_enabled(loop) == enabled:
+        print(f"[{loop['id']}] unattended fixer push already {'enabled' if enabled else 'disabled'}")
+        return 0
+    updated = config.normalize({**loop, "unattended_fixer_push": enabled})
+    if args.dry_run:
+        print(f"[{loop['id']}] dry run — would {'enable' if enabled else 'disable'} "
+              "unattended fixer pushes; nothing written")
+        return 0
+    try:
+        path = _write_config_locked(updated, policy_change=True)
+        actual = config.load_id(loop["id"])
+        if actual["repo"] != loop["repo"] or config.unattended_fixer_push_enabled(actual) != enabled:
+            raise config.ConfigError("readback does not match the requested repository/policy")
+    except (OSError, ValueError, config.ConfigError) as exc:
+        print(f"fixer push policy update not confirmed: {exc}")
+        return 2
+    print(f"[{loop['id']}] {loop['repo']}: host-operator unattended fixer push "
+          f"{'enabled (not GitHub owner consent; residual PR-metadata/ref race acknowledged)' if enabled else 'disabled'} "
+          f"in {path}")
     return 0
 
 
@@ -1509,6 +1607,16 @@ def register_cli(ctx, settings: dict | None = None) -> None:
         arm.add_argument("--pause", action="store_true", help="pause instead of arming")
         arm.add_argument("--admin-token", default="")
         arm.set_defaults(func=cmd_arm)
+
+        fixer_push = sub.add_parser("fixer-push", help="Explicit per-repository unattended fixer push policy")
+        fixer_push.add_argument("--loop", required=True, help="exact loop id (never all loops)")
+        direction = fixer_push.add_mutually_exclusive_group(required=True)
+        direction.add_argument("--enable", action="store_true", help="opt this repository in")
+        direction.add_argument("--disable", action="store_true", help="turn unattended pushes off")
+        fixer_push.add_argument("--acknowledge-pr-race", action="store_true",
+                                help="accept the residual non-atomic PR-metadata/ref race; required for --enable")
+        fixer_push.add_argument("--dry-run", action="store_true", help="show action without writing")
+        fixer_push.set_defaults(func=cmd_fixer_push)
 
         drain = sub.add_parser("drain", help="Start a queued run once its seat is free")
         drain.add_argument("--loop", required=True)
