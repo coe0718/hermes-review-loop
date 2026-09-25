@@ -11,7 +11,8 @@ configuration error, not a run that guesses.
 Before arming a loop, `hermes review-loop doctor --loop <id>` checks that everything this file
 *names* actually exists — the seat profiles, the token files, the routes and their secrets, the
 GitHub hooks, the cron shim and job, the clone and the gateway — and writes nothing while doing it.
-See [Preflight](architecture.md#preflight-can-this-installation-run).
+See [Preflight](architecture.md#preflight-can-this-installation-run) and, for example output,
+[Operating a loop](operations.md#preflight-doctor).
 
 ## Required
 
@@ -61,6 +62,7 @@ An **observer** is a destination that hears about transitions without being part
 notice per event, delivered to a chat, with no agent on the route and no seat to hold. It is opt-in
 per loop — no `observer` block, no feed — and it is the one block in this file the loader is
 *lenient* about, because a feed that cannot deliver must never refuse a loop that can run.
+The operator walkthrough (what a notice looks like, turning it on) is [the observer guide](observer.md).
 
 | key | default | meaning |
 |---|---|---|
@@ -138,7 +140,8 @@ If the enqueue fails (no private runtime file, ledger or spawn error), the marke
 
 `plugin.yaml` declares a `config_schema`, so the desktop renders a form at **Capabilities → Plugins →
 review loop**. Those values are **defaults for a new loop**; pushing them onto an existing loop is
-explicit, because a form that quietly renumbers a running loop is a miserable thing to debug:
+explicit, because a form that quietly renumbers a running loop is a miserable thing to debug
+(the operator walkthrough is [Settings, in the desktop](settings.md)):
 
 ```bash
 hermes review-loop settings                      # what the form holds, [set] vs [default], per key

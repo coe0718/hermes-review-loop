@@ -571,7 +571,7 @@ def group_observer_cli() -> None:
     help_text = re.sub(r"\s+", "", buf.getvalue())
     check("the CLI names every event the feed can send",
           [name for name in observer.EVENTS if name not in help_text], [])
-    for doc in ("README.md", "docs/configuration.md"):
+    for doc in ("docs/observer.md", "docs/configuration.md"):
         text = (ROOT / doc).read_text()
         check(f"{doc.split('/')[-1]} names every event",
               [name for name in observer.EVENTS if name not in text], [])

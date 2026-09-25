@@ -234,7 +234,8 @@ direction.
 A loop that stopped being driven looks exactly like a loop with nothing to do, and no single file
 answers "why". Half the answer is in GitHub (the head, the verdicts *at that head*, whether an
 approval exists) and half is on disk (who holds the PR, what is queued, what is marked in flight,
-what the watchdog last saw). `hermes review-loop explain --pr N` reads both and prints one report.
+what the watchdog last saw). `hermes review-loop explain --pr N` reads both and prints one report (example output:
+[Operating a loop](operations.md#why-isnt-this-pr-moving)).
 
 It is **the gates' own logic, walked differently**, and that is the design constraint that matters:
 
@@ -290,7 +291,8 @@ no webhook was fired.
 
 The loop is unattended, which is the point — but "nobody is watching" and "nothing is visible" are
 different things. A loop may carry one **observer**: a chat destination that receives a short notice
-each time the loop changes state, without joining the loop.
+each time the loop changes state, without joining the loop. (Operator guide:
+[observer.md](observer.md); keys: [configuration](configuration.md#the-observer-feed).)
 
 A notice is emitted *at* the transition, by whoever made it — the reviewer gate on a handoff, the
 fixer gate on a verdict, `breach()` when the cap is spent, the reviewer gate on a close, and the
@@ -357,6 +359,7 @@ state (locks, queue, in-flight marks, breach marker). Rails, because this delete
 `hermes review-loop doctor --loop <id>` walks the installation read-only and answers one question:
 **can this loop wake a seat and post a verdict?** It is the installation-level counterpart of the
 watchdog — the watchdog asks "is this PR stalled?", the preflight asks "is this loop wired at all?"
+Example transcripts are in [Operating a loop](operations.md#preflight-doctor).
 
 | check | what it proves |
 |---|---|
