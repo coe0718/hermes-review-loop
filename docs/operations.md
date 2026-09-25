@@ -55,7 +55,8 @@ registry is visible, but crash durability is unconfirmed; do not assume the oper
 hermes review-loop list                 # what is configured
 hermes review-loop status --loop name   # seats, profiles, routes, live runs, queue, breaches
 hermes review-loop explain --loop name --pr 123   # why that PR is not moving, and what is next
-hermes review-loop doctor --loop name   # preflight the install: profiles, tokens, routes, hooks, cron
+hermes review-loop doctor --loop name   # preflight the install: profiles, seat models, tokens, routes, hooks, cron
+hermes review-loop models --seat reviewer --loop name   # what that seat's profile's provider offers (read-only)
 hermes review-loop settings             # the plugin-level defaults, and where each came from
 hermes review-loop init --repo owner/name --dry-run   # preview a loop: seats, routes, nothing written
 hermes review-loop apply --loop name    # push those defaults onto an existing loop (--dry-run)
@@ -205,24 +206,25 @@ Run these in order (replace `ID` and `N`; `N` should be an open, non-draft, same
 targeting the loop's base):
 
 ```bash
-# 0. the private runtime file the production worker reads (exactly these seven keys)
+# 0. the private runtime file the production worker reads (host paths; each seat's model comes
+#    from its Hermes profile — see configuration.md#runtime-file-and-seat-models-review-loop-runtimejson)
 (umask 077; touch ~/.hermes/review-loop-runtime.json); chmod 600 ~/.hermes/review-loop-runtime.json; $EDITOR ~/.hermes/review-loop-runtime.json
 hermes review-loop doctor   --loop ID                       # installation preflight
 hermes review-loop selftest --loop ID --no-model            # 1,2,4,6: runtime, bwrap, identities, ledger — free
-hermes review-loop selftest --loop ID --pr N                # + one tiny real completion + broker dry run
+hermes review-loop selftest --loop ID --pr N                # + one tiny completion per seat model + broker dry run
 hermes review-loop selftest --loop ID --pr N --live-turn    # + one real isolated reviewer turn, NOT posted
 python -m review_loop.run_supervisor status ~/.hermes/state/review-loop-runs.sqlite
 ```
 
 | step | what it proves |
 |---|---|
-| 1 runtime | the runtime file is a regular 0600 file you own, has exactly `source venv runtime rust upstream key_file model`, HTTPS upstream, a private non-empty key file, and the paths exist (the venv's interpreter link must stay inside `runtime`) |
-| 2 bubblewrap | unprivileged user namespaces work; a probe in the real sandbox layout (committed source snapshot, configured venv/runtime/Rust) cannot read a dummy host secret, the model key, the PATs, the runtime file, `~/.hermes/.env` or the loop config, and has no network or credential-like env |
-| 3 inference | one ~16-token completion through the host inference capability with the configured model (`--no-model` skips it) |
+| 1 runtime | the runtime file is a regular 0600 file you own with `source venv runtime rust` (plus optional `seats.<seat>` overrides and the legacy `model upstream key_file`, warned about), the paths exist (the venv's interpreter link must stay inside `runtime`), and any override has an HTTPS `…/chat/completions` upstream and a private non-empty key file; then one `seat:<seat>` line per seat — reviewer, fixer, and the adjudicator when it has a route — with the profile → provider / model the worker will use (never the key), or the reason that seat's turn would be held |
+| 2 bubblewrap | unprivileged user namespaces work; a probe in the real sandbox layout (committed source snapshot, configured venv/runtime/Rust) cannot read a dummy host secret, any model key file, each seat profile's `.env`/`auth.json`/`config.yaml`, the PATs, the runtime file, `~/.hermes/.env` or the loop config, and has no network or credential-like env |
+| 3 inference | one ~16-token completion through the host inference capability **per distinct seat resolution** (seats that share a profile's provider, model and key share one call), each with that resolution's own key (`--no-model` skips it) |
 | 4 identities | read, reviewer, fixer (and optional adjudicator) PATs resolve via `/user` to the expected logins and distinct principals; the repo is readable |
 | 5 authorization | with `--pr N`: the broker's reviewer-write checks (`broker.authorize`, reads only) and the host receipt generation |
 | 6 supervisor | the ledger migrates and `status` reads; the route would accept the runtime file; `doctor`'s state dir, cron shim/job and gateway checks; the observer route |
-| 7 live turn | with `--live-turn --pr N`: a real isolated reviewer turn (`--timeout`, default 120 s like the worker); the verdict and body the agent *would* submit are printed |
+| 7 live turn | with `--live-turn --pr N`: a real isolated reviewer turn with the reviewer seat's resolved model (`--timeout`, default 600 s); the verdict and body the agent *would* submit are printed |
 
 The live turn runs in the CLI process, not through the supervisor, so it adds no ledger row and
 raises no operator notice; confirming alerts still needs a real enqueued turn and a watchdog sweep.

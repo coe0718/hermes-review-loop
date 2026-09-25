@@ -3,6 +3,13 @@
 The caller supplies only OpenAI chat-completion bodies. The upstream URL and key
 are constructor arguments on the trusted side, never fields in the RPC request.
 This is a transport primitive, not a production supervisor or billing policy.
+
+Upstream contract: one fixed HTTP(S) URL whose path ends in ``/chat/completions`` (for example
+``https://api.deepseek.com/v1/chat/completions`` or ``https://openrouter.ai/api/v1/chat/completions``),
+with no userinfo, query or fragment, authenticated with ``Authorization: Bearer <key>``. That is
+the OpenAI chat-completions wire shape and nothing else: Anthropic Messages, Codex/Responses and
+OAuth-subscription endpoints are not reachable through this capability. The sandbox side always
+speaks to the fixed local path ``PATH``; the upstream path is chosen by the host only.
 """
 from __future__ import annotations
 
@@ -25,6 +32,7 @@ MAX_CALLS = 32
 MAX_CONNECTIONS = 8
 CLIENT_TIMEOUT = 3
 PATH = '/v1/chat/completions'
+UPSTREAM_SUFFIX = '/chat/completions'
 
 class _BoundedThreads(socketserver.ThreadingMixIn):
     daemon_threads = True
@@ -89,7 +97,10 @@ class _NoRedirectConnection:
     def __init__(self, upstream: str):
         url = urlsplit(upstream)
         if (url.scheme not in ('http', 'https') or not url.hostname or url.username or
-                url.password or url.query or url.fragment or url.path != PATH):
+                url.password or url.query or url.fragment or
+                not url.path.endswith(UPSTREAM_SUFFIX) or '//' in url.path or
+                any(part in ('.', '..') for part in url.path.split('/')) or
+                any(ord(char) < 33 or ord(char) == 127 for char in url.path)):
             raise ValueError('upstream must be a fixed chat-completions URL')
         self.url = url
 
@@ -97,7 +108,7 @@ class _NoRedirectConnection:
         cls = http.client.HTTPSConnection if self.url.scheme == 'https' else http.client.HTTPConnection
         conn = cls(self.url.hostname or '', self.url.port, timeout=30)
         try:
-            conn.request('POST', PATH, body=body, headers={
+            conn.request('POST', self.url.path, body=body, headers={
                 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + key,
                 'Accept': 'text/event-stream, application/json'})
             response = conn.getresponse()

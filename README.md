@@ -134,11 +134,11 @@ and reversible; see [what `init` writes](docs/operations.md#what-init-writes) an
 base):
 
 ```bash
-# 0. the private runtime file the production worker reads (exactly these seven keys)
+# 0. the private runtime file (host paths; each seat's model comes from its Hermes profile)
 (umask 077; touch ~/.hermes/review-loop-runtime.json); chmod 600 ~/.hermes/review-loop-runtime.json; $EDITOR ~/.hermes/review-loop-runtime.json
 hermes review-loop doctor   --loop ID                       # installation preflight
 hermes review-loop selftest --loop ID --no-model            # 1,2,4,6: runtime, bwrap, identities, ledger — free
-hermes review-loop selftest --loop ID --pr N                # + one tiny real completion + broker dry run
+hermes review-loop selftest --loop ID --pr N                # + one tiny completion per seat model + broker dry run
 hermes review-loop selftest --loop ID --pr N --live-turn    # + one real isolated reviewer turn, NOT posted
 python -m review_loop.run_supervisor status ~/.hermes/state/review-loop-runs.sqlite
 ```

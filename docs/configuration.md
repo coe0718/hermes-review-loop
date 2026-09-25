@@ -256,6 +256,51 @@ reads them (with the same predicates the gates use) to say why one PR is not mov
 read-only down to the byte: it uses the non-pruning readers, so asking twice leaves every file above
 exactly as it was.
 
+## Runtime file and seat models (`review-loop-runtime.json`)
+
+The isolated worker reads one private (0600) host file, `$HERMES_HOME/review-loop-runtime.json`.
+It names **host paths** — the model is not a runtime setting any more (issue #32):
+
+```json
+{"source": "/path/to/hermes-agent", "venv": "/path/to/hermes-agent/venv",
+ "runtime": "/path/to/python-runtime", "rust": "~/.rustup/toolchains/stable-x86_64-unknown-linux-gnu"}
+```
+
+**Each seat runs its own Hermes profile's model.** Before a turn, the host resolves the seat's
+profile (`seats.reviewer.profile`, `seats.fixer.profile`, `adjudicator.profile`) with Hermes's own
+resolution — the profile's `config.yaml` `model` block, its `.env`/secret sources and `auth.json`
+credential pool, exactly as `hermes -p <profile> chat` would — in a separate process per seat whose
+environment is built from scratch. The key it returns lives only in that turn's host inference
+proxy; the sandbox's `config.yaml` names the seat's model and points at the local bridge with a
+dummy key. Changing a seat's model = `hermes -p <profile> model`.
+`hermes review-loop models --profile NAME` (or `--seat reviewer --loop ID`) lists, read-only, what
+that profile's provider offers in the Hermes model catalog.
+
+**Supported providers.** Anything Hermes resolves to an **OpenAI chat-completions** endpoint over
+HTTPS with an API key: `custom:<name>` / named `custom_providers`, `openrouter`, `deepseek`, and any
+other API-key provider whose Hermes `api_mode` is `chat_completions`. The inference proxy forwards
+only that wire shape (`Bearer` key, fixed `…/chat/completions` URL). **Not supported**, refused by
+name before any credential is read or refreshed: OAuth/subscription providers (`openai-codex`,
+`nous`, `xai-oauth`, `qwen-oauth`, `minimax-oauth`, Copilot), Anthropic Messages, Bedrock, Vertex,
+Azure Foundry and MoA; a profile with no `model.provider` (auto-detect) is refused too.
+
+**Precedence, per seat:**
+
+1. `seats.<seat>` in the runtime file — `{"model", "upstream", "key_file"}` — an explicit
+   per-seat override (testing, or a profile whose provider the proxy cannot speak). `upstream` is the
+   full HTTPS `…/chat/completions` URL; `key_file` is a private one-line key file.
+2. the seat's Hermes profile — the default.
+3. the legacy top-level `model` / `upstream` / `key_file` (the pre-#32 seven-key file) — used
+   **only** for a seat whose profile cannot be resolved, so existing runtime files keep working.
+   `doctor` and `selftest` warn whenever it is present or in effect: every seat that falls back to
+   it shares one model and one key.
+
+Otherwise the turn is **held**: the run is marked `failed` before any GitHub read, with the reason
+in the ledger (`seat model unresolved: profile default (openai-codex): …`), and it never falls back
+to another seat's model or key. `doctor` shows each seat's profile → provider / model (read-only,
+no credential lookup); `selftest` resolves the credential and makes one tiny completion per
+distinct seat resolution.
+
 ## Environment overrides
 
 | variable | effect |

@@ -93,6 +93,33 @@ def install_doctor_fixture() -> dict:
     return config.load_id("widgets")
 
 
+def doctor_runtime_fixture() -> list[pathlib.Path]:
+    """A runtime file whose "Hermes" is this interpreter, and a provider in each seat profile.
+
+    Returns the paths it created, for the caller to remove: later groups rely on there being no
+    runtime file (eligible gates then hold, fail closed).
+    """
+    import sys
+    home = TMP / "hermes-home"
+    venv = TMP / "doctor-venv"
+    (venv / "bin").mkdir(parents=True, exist_ok=True)
+    if not (venv / "bin" / "python").exists():
+        (venv / "bin" / "python").symlink_to(sys.executable)
+    runtime = home / "review-loop-runtime.json"
+    runtime.write_text(json.dumps({"source": str(TMP), "venv": str(venv),
+                                   "runtime": str(TMP), "rust": str(TMP)}))
+    runtime.chmod(0o600)
+    added = [runtime]
+    # JSON is valid YAML, and the reader falls back to json without PyYAML (CI has none).
+    model = json.dumps({"model": {"default": "test-model", "provider": "openrouter"}}) + "\n"
+    for profile in (home / "profiles" / "reviewer-profile", home / "profiles" / "fixer-profile"):
+        (profile / "config.yaml").write_text(model)
+    if not (home / "config.yaml").exists():
+        (home / "config.yaml").write_text(model)
+        added.append(home / "config.yaml")
+    return added
+
+
 def edit_subs(mutate) -> dict:
     subs = json.loads(SUBS.read_text())
     mutate(subs)
@@ -125,11 +152,12 @@ def group_doctor() -> None:
           doctor.watchdog_job_name({"id": "x"}), cli.watchdog_job_name({"id": "x"}))
 
     install_doctor_fixture()
+    added = doctor_runtime_fixture()
     before_files = tree_digest(TMP)
     before_posts = len(RECEIVED)
     rc, out = run_doctor("--loop", "widgets")
     check("a correct install passes", rc, 0)
-    check("  every check verified", "widgets: 21 verified, 0 failed, 0 unknown (of 21 checks)" in out,
+    check("  every check verified", "widgets: 24 verified, 0 failed, 0 unknown (of 24 checks)" in out,
           True)
     check("  nothing is marked failed", "❌" in out, False)
     check("  the header says it is read-only",
@@ -138,9 +166,12 @@ def group_doctor() -> None:
                  "credential:fixer", "token:rev-coach", "token:dev-fixer", "read_token",
                  "route:widgets-review", "route:widgets-fix", "route:widgets-breach", "scripts",
                  "cron:shim", "cron:job", "clone", "state_dir", "roots", "gateway",
-                 "hook:widgets-review", "hook:widgets-fix"):
+                 "hook:widgets-review", "hook:widgets-fix",
+                 "model:reviewer", "model:fixer", "model:adjudicator"):
         check(f"  ✅ {name}", f"✅ {name}" in out, True)
     check("  it writes nothing", tree_digest(TMP), before_files)
+    for path in added:   # the model check reads profiles through the runtime's Hermes (#32)
+        path.unlink()
     check("  it fires no webhook", len(RECEIVED), before_posts)
     check("  no token value appears in the report", "token-reviewer" in out, False)
     check("  nor a route secret",
@@ -758,7 +789,10 @@ def group_doctor() -> None:
     check("  naming the loop", "[widgets] acme/widgets" in out, True)
 
     install_doctor_fixture()
+    added = doctor_runtime_fixture()
     rc, out = run_doctor("--loop", "widgets", "--offline")
+    for path in added:
+        path.unlink()
     check("--offline leaves two checks undecided", rc, 0)
     check("  and counts them", "0 failed, 2 unknown" in out, True)
     check("  the gateway is not probed", "⚠️ gateway" in out and "not probed" in out, True)

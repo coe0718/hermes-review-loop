@@ -191,6 +191,45 @@ def check_adjudicator_profile(loop: dict) -> Check:
                           "adjudicator")
 
 
+
+def runtime_settings() -> tuple[dict | None, Check | None]:
+    """The runtime file's settings for the model checks, or a check explaining why not."""
+    from . import seat_model
+    path = config.home() / "review-loop-runtime.json"
+    if not path.exists():
+        return None, None
+    try:
+        if not path.is_file() or path.is_symlink() or path.stat().st_mode & 0o077:
+            raise ValueError("must be a private (0600) regular file")
+        return seat_model.load_runtime(path), None
+    except (OSError, ValueError) as exc:
+        return None, Check("runtime", MISMATCH, f"{path}: {exc}",
+                           f"repair {path}; `hermes review-loop selftest` shows each problem")
+
+
+def check_seat_models(loop: dict) -> list[Check]:
+    """Each seat's model as the worker will pick it — profile, provider, model; never the key.
+
+    Read-only: the profile's ``config.yaml`` ``model`` block is read by the Hermes interpreter,
+    without resolving (or refreshing) any credential. ``selftest`` resolves the credential and
+    makes one tiny completion per seat.
+    """
+    from . import seat_model
+    settings, problem = runtime_settings()
+    checks = [problem] if problem else []
+    if settings is not None and seat_model.legacy_override(settings) is not None:
+        checks.append(Check("runtime:legacy-model", UNKNOWN,
+                            "review-loop-runtime.json still sets a top-level model/upstream/"
+                            "key_file: a LEGACY fallback used only for a seat whose profile "
+                            "cannot be resolved",
+                            "drop it once every seat's profile resolves, or move it under "
+                            "seats.<seat> as an explicit per-seat override"))
+    status_of = {"ok": VERIFIED, "warn": UNKNOWN, "fail": ABSENT}
+    for seat in seat_model.seats_for(loop):
+        status, detail, fix = seat_model.describe_seat(loop, seat, settings)
+        checks.append(Check(f"model:{seat}", status_of[status], detail, fix))
+    return checks
+
 def check_credential(loop: dict, seat: str) -> Check:
     """The gates use gh.token_path, not the profile's GH_TOKEN environment variable."""
     login = str(loop["seats"][seat].get("login") or "")
@@ -829,6 +868,7 @@ def check_loop(loop: dict, offline: bool = False) -> list[Check]:
         checks.append(check_credential(loop, seat))
     if str((loop.get("adjudicator") or {}).get("route") or ""):
         checks.append(check_adjudicator_profile(loop))
+    checks.extend(check_seat_models(loop))
     identity = check_adjudicator_identity(loop)
     if identity:
         checks.append(identity)

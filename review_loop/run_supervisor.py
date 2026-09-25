@@ -844,19 +844,14 @@ class Supervisor:
 
     def _run_production(self, run_id: str, owner: str) -> None:
         """Worker-only host control plane; never pass credentials to bwrap."""
-        from . import broker_ipc, config, gh, trusted_turn
+        from . import broker_ipc, config, gh, seat_model, trusted_turn
         rc, error = None, None
         try:
             assert self.production_config is not None
-            settings = json.loads(self.production_config.read_text())
-            required = {"source", "venv", "runtime", "rust", "upstream", "key_file", "model"}
-            if not isinstance(settings, dict) or set(settings) != required:
-                raise ValueError("invalid production configuration")
-            if not settings["upstream"].startswith("https://"):
-                raise ValueError("production inference requires HTTPS")
-            key_path = Path(settings["key_file"])
-            if not key_path.is_file() or key_path.stat().st_mode & 0o077:
-                raise ValueError("model key file must be private")
+            try:
+                settings = seat_model.load_runtime(self.production_config)
+            except ValueError:
+                raise ValueError("invalid production configuration") from None
             with self._connect() as con:
                 row = con.execute("SELECT * FROM runs WHERE id=? AND owner=?", (run_id, owner)).fetchone()
                 if row is None:
@@ -867,6 +862,14 @@ class Supervisor:
             loop = config.by_repo(row["repo"])
             if loop is None:
                 raise ValueError("loop not configured")
+            # The seat's own profile decides its model and account (#32). Resolved host-side,
+            # before any GitHub read: an unresolvable seat is held here with the reason, and never
+            # borrows another seat's model or key. The key lives only in this turn's proxy.
+            try:
+                inference = seat_model.resolve_seat(loop, row["seat"], settings)
+            except seat_model.SeatModelError as exc:
+                error = f"seat model unresolved: {exc}"[:600]
+                return
             reader = loop["read_token"]
             pr = gh.api(loop, f'/repos/{row["repo"]}/pulls/{row["pr"]}', login=reader)
             head = pr.get("head") if isinstance(pr, dict) else None
@@ -906,8 +909,8 @@ class Supervisor:
                     raise ValueError('breach marker already claimed or replaced')
             rc = trusted_turn.run_turn(loop, scope, source=Path(settings["source"]),
                   venv=Path(settings["venv"]), runtime=Path(settings["runtime"]),
-                  rust=Path(settings["rust"]), upstream=settings["upstream"],
-                  key=key_path.read_text().strip(), model=settings["model"],
+                  rust=Path(settings["rust"]), upstream=inference.upstream,
+                  key=inference.key, model=inference.model,
                   prompt=prompt, timeout=int(self.child_timeout),
                   work_root=Path(loop["state_dir"]) / "isolated-runs")
         except Exception as exc:
