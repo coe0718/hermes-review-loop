@@ -83,6 +83,28 @@ def artifacts_for(loop: dict, number: int) -> str:
     return str(config.artifacts_dir(loop, number))
 
 
+def enqueue_isolated(loop: dict, seat: str, number: int, head: str, *, turn_key: str = '') -> None:
+    """Commit one isolated turn to the host run ledger, then arm its detached worker.
+
+    Raises on anything short of a durable, armed enqueue — a missing/invalid private runtime,
+    a ledger failure, or a spawn failure after the row committed (the row stays pending and a
+    redelivery re-arms it). The unique repo/PR/head/seat/turn index deduplicates redelivery.
+    """
+    from .run_supervisor import SEATS, Supervisor
+
+    supervisor = Supervisor(
+        config.home() / "state" / "review-loop-runs.sqlite",
+        production_config=config.home() / "review-loop-runtime.json", hermes_home=config.home(),
+        # Every seat, always: a worker spawned by one seat's event claims any pending row, and
+        # must know every seat's capacity to do so.
+        capacity={s: config.seat_concurrency(loop, s) for s in SEATS},
+    )
+    supervisor.recover()
+    delivery = f"{loop['repo']}:{number}:{head}:{seat}"
+    supervisor.enqueue(delivery + (f':{turn_key}' if turn_key else ''),
+                       loop["repo"], number, head, seat, turn_key=turn_key)
+
+
 def block_pr_agent(loop: dict, st: state_mod.LoopState, seat: str,
                    number: int, head: str, on_queued=None, *, turn_key: str = '') -> None:
     """Durably enqueue an isolated turn; NEVER return a gateway-dispatch payload.
@@ -91,21 +113,10 @@ def block_pr_agent(loop: dict, st: state_mod.LoopState, seat: str,
     The ledger's unique repo/PR/head/seat/turn index deduplicates webhook redelivery
     before launching a detached worker. No checkout or agent runs in this script.
     """
-    from .run_supervisor import Supervisor
-
-    runtime = config.home() / "review-loop-runtime.json"
     key = seat_key(loop, number)
     queued = st.queue_items(seat).get(key)
     try:
-        supervisor = Supervisor(
-            config.home() / "state" / "review-loop-runs.sqlite",
-            production_config=runtime, hermes_home=config.home(),
-            capacity={s: config.seat_concurrency(loop, s) for s in ("reviewer", "fixer")},
-        )
-        supervisor.recover()
-        delivery = f"{loop['repo']}:{number}:{head}:{seat}"
-        supervisor.enqueue(delivery + (f':{turn_key}' if turn_key else ''),
-                           loop["repo"], number, head, seat, turn_key=turn_key)
+        enqueue_isolated(loop, seat, number, head, turn_key=turn_key)
         st.queue_pop_if(seat, key, queued)
         log(f"#{number} @ {head[:7]} {seat} enqueued for isolated worker")
     except Exception as exc:
@@ -801,16 +812,27 @@ def reclaim(loop: dict, number: int, state: str) -> None:
 
 
 def wake_adjudicator(loop: dict, number: int, head: str, rounds: int, reason: str) -> bool:
-    """Hand a stalled PR to the adjudicator seat — a route bound to its own profile.
+    """Hand a stalled PR to an isolated adjudicator turn — never the gateway route.
 
-    The rule the adjudicator is given: read the two positions, rule, and do not merge. The
-    pending marker written by the caller stays retryable if this POST fails.
+    The legacy breach route dispatched a credential-owning gateway agent and stays silenced
+    (``scripts/gate_adjudicator.py``). Instead this commits an adjudicator turn to the host run
+    ledger, keyed by ``breach:<rounds>`` at this head: a redelivered breach dedups on the
+    ledger's unique turn index, and a re-breach at a new head is a new turn. The worker
+    re-reads every fact before it runs, so the reason here is only a label.
+
+    Returns True only once the turn is durably enqueued and its worker armed, which moves the
+    marker to ``awaiting-adjudication``. Anything else returns False: the marker stays
+    ``delivery-pending`` and the watchdog's retry comes back through ``breach()`` — whose
+    live-head check under the breach lock keeps a stale head from being re-armed.
     """
-    # The adjudicator is also PR-facing. Its legacy route dispatches a normal
-    # credential-owning gateway agent; never wake it until isolated end-to-end.
-    # Return false so the #21 delivery-pending marker remains retryable.
-    log(f"adjudicator blocked for #{number} @ {head[:7]}: no whole-agent isolation")
-    return False
+    try:
+        enqueue_isolated(loop, "adjudicator", number, head, turn_key=f"breach:{int(rounds)}")
+    except Exception as exc:
+        log(f"adjudicator turn for #{number} @ {head[:7]} not enqueued: "
+            f"{type(exc).__name__}: {exc}")
+        return False
+    log(f"#{number} @ {head[:7]} adjudicator enqueued for isolated worker ({reason})")
+    return True
 
 
 def breach(loop: dict, st: state_mod.LoopState, number: int, head: str, rounds: int,
