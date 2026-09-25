@@ -284,6 +284,39 @@ that pushes and the token that reads are separate and revocable one at a time. A
 names tokens must name one per seat, and the file has to be there — checked before `init` or `apply`
 writes anything, because a missing PAT otherwise surfaces hours later as an unauthenticated read.
 
+### Verifying the isolated setup: `selftest`
+
+`doctor` checks the installation; `selftest` checks the **isolated turn path** (issue #16) against
+the real capabilities, one ✅/❌ line per check with the fix under each failure. It exits 1 on any
+failure. **It never writes to GitHub**: every GitHub call it makes goes through a GET-only guard,
+and the live turn's broker runs in a host-only no-write mode. No token or key is printed.
+
+Run these in order (replace `ID` and `N`; `N` should be an open, non-draft, same-repository PR
+targeting the loop's base):
+
+```bash
+# 0. the private runtime file the production worker reads (exactly these seven keys)
+(umask 077; touch ~/.hermes/review-loop-runtime.json); chmod 600 ~/.hermes/review-loop-runtime.json; $EDITOR ~/.hermes/review-loop-runtime.json
+hermes review-loop doctor   --loop ID                       # installation preflight
+hermes review-loop selftest --loop ID --no-model            # 1,2,4,6: runtime, bwrap, identities, ledger — free
+hermes review-loop selftest --loop ID --pr N                # + one tiny real completion + broker dry run
+hermes review-loop selftest --loop ID --pr N --live-turn    # + one real isolated reviewer turn, NOT posted
+python -m review_loop.run_supervisor status ~/.hermes/state/review-loop-runs.sqlite
+```
+
+| step | what it proves |
+|---|---|
+| 1 runtime | the runtime file is a regular 0600 file you own, has exactly `source venv runtime rust upstream key_file model`, HTTPS upstream, a private non-empty key file, and the paths exist (the venv's interpreter link must stay inside `runtime`) |
+| 2 bubblewrap | unprivileged user namespaces work; a probe in the real sandbox layout (committed source snapshot, configured venv/runtime/Rust) cannot read a dummy host secret, the model key, the PATs, the runtime file, `~/.hermes/.env` or the loop config, and has no network or credential-like env |
+| 3 inference | one ~16-token completion through the host inference capability with the configured model (`--no-model` skips it) |
+| 4 identities | read, reviewer, fixer (and optional adjudicator) PATs resolve via `/user` to the expected logins and distinct principals; the repo is readable |
+| 5 authorization | with `--pr N`: the broker's reviewer-write checks (`broker.authorize`, reads only) and the host receipt generation |
+| 6 supervisor | the ledger migrates and `status` reads; the route would accept the runtime file; `doctor`'s state dir, cron shim/job and gateway checks; the observer route |
+| 7 live turn | with `--live-turn --pr N`: a real isolated reviewer turn (`--timeout`, default 120 s like the worker); the verdict and body the agent *would* submit are printed |
+
+The live turn runs in the CLI process, not through the supervisor, so it adds no ledger row and
+raises no operator notice; confirming alerts still needs a real enqueued turn and a watchdog sweep.
+
 ### Why isn't this PR moving?
 
 `status` shows the loop's shape; `explain` answers the question you actually have at 2am, for one
@@ -632,7 +665,8 @@ Not proven, and worth knowing before you trust it:
 plugin.yaml                manifest (no hidden capabilities: no hooks, no tools, no middleware)
 __init__.py                registers the CLI and the skill
 review_loop/               the library: config, state, gh, routes, prompts, gate runtime,
-                           observer, CLI, and the read-only `doctor` preflight
+                           observer, CLI, the read-only `doctor` preflight and the isolated-path
+                           `selftest`
 scripts/gate_reviewer.py   between a pull_request event and a review run
 scripts/gate_fixer.py      between a pull_request_review event and a fix run
 scripts/watchdog.py        cron: stall detection, stuck state, queue draining
