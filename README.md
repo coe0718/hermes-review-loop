@@ -90,6 +90,7 @@ Every one of those is a *silent* failure, so this plugin makes each one loud or 
 | two runs, one clone | a seat is a capacity with a per-PR ledger; `concurrency: 2+` gives each PR its own clone, build dir and tmp dir, and an unisolatable run is queued rather than shared |
 | a run dies mid-way | the lock expires; a stalled head frees itself |
 | disk creep | a merged/closed PR runs the cleanup: worktrees, build dirs, logs, locks, counters |
+| another registry writer erased or rewrote a route | the watchdog restores it from the plugin's own intent record, same secret, and says so; `doctor` flags it; `doctor --repair` restores it now |
 | "did the loop ever run?" | every branch of every gate either fires or logs *why not*; the watchdog reads GitHub state directly instead of trusting anyone's summary |
 
 ## Install
@@ -138,8 +139,28 @@ That writes exactly four things, all of them visible and reversible:
 
 Route edits are serialized only among cooperating review-loop plugin processes, using a sibling
 lock file and atomic replacement. Native Hermes CLI and dashboard subscription edits do **not**
-take that lock, so concurrent native/plugin edits can still overwrite each other. Fully solving
-that race requires an upstream shared lock/protocol for every registry writer. If directory sync
+take that lock (issue #1; upstream fix pending in NousResearch/hermes-agent#120964), so the plugin
+mitigates the race from its side — it does not close it:
+
+* **Optimistic writes.** Each plugin edit records the registry's inode, mtime, size and content
+  hash when it reads, re-checks them immediately before `os.replace`, and re-reads and re-applies
+  its edit (up to 5 attempts, then `RegistryConflictError` with nothing published) if a native
+  write landed in between — so the plugin no longer overwrites a concurrent native change.
+* **Intent record + self-heal.** Every route the plugin installs or rebinds is also copied,
+  secret included, to `<state_dir>/route-intent.json` (0600, atomic). Every armed watchdog sweep
+  compares this loop's routes with it and restores any route a native writer erased or changed
+  (secret, script, prompt, events, profile, `deliver_only`, host) with the **same secret**, so
+  GitHub's hook keeps authenticating, and says what it restored in its cron output. Other routes
+  are never touched; a name now held by a non-review-loop script is reported, not overwritten; a
+  malformed registry is never overwritten. Change or remove routes through `set`/`apply`/
+  `uninstall` — they update the record — or self-heal will put a native edit back.
+* **What remains.** A few syscalls between the final identity check and the rename, and a native
+  writer that read *before* a plugin publish and writes *after* it, can still drop a plugin edit
+  (or a native one). The plugin's lost routes come back on the next armed sweep; a native edit
+  the plugin overwrote in that window does not. Between sweeps a broken route can miss
+  deliveries. See [docs/issue-1-route-self-heal.md](docs/issue-1-route-self-heal.md).
+
+If directory sync
 fails after replacement, the plugin raises `RegistryDurabilityError(published=True)`: the new
 registry is visible, but crash durability is unconfirmed; do not assume the operation rolled back.
 
@@ -198,7 +219,9 @@ reported as `absent`: "the API refused to tell me" and "there are no hooks" are 
 and printing the second when the first is true sends you hunting for a hook that exists (reading
 the repo's hooks needs `admin:repo_hook`, so a token without it shows ⚠️, not ❌).
 
-It writes nothing — no config, no route registry, no state, no GitHub hook — and it never fires a
+It writes nothing — no config, no route registry, no state, no GitHub hook — unless you pass
+`--repair`, whose one write is restoring this loop's own routes from the plugin's intent record
+(same secret) before the read-only checks run. It never fires a
 route, because a synthetic POST at a seat's route is a real agent run with a real budget. The
 network side is a TCP connect to the gateway (is anything listening?) and, when the token is
 allowed to, a read of the repo's hooks.
@@ -631,11 +654,11 @@ Not proven, and worth knowing before you trust it:
 ```
 plugin.yaml                manifest (no hidden capabilities: no hooks, no tools, no middleware)
 __init__.py                registers the CLI and the skill
-review_loop/               the library: config, state, gh, routes, prompts, gate runtime,
+review_loop/               the library: config, state, gh, routes (+ route_intent self-heal), prompts, gate runtime,
                            observer, CLI, and the read-only `doctor` preflight
 scripts/gate_reviewer.py   between a pull_request event and a review run
 scripts/gate_fixer.py      between a pull_request_review event and a fix run
-scripts/watchdog.py        cron: stall detection, stuck state, queue draining
+scripts/watchdog.py        cron: route self-heal, stall detection, stuck state, queue draining
 scripts/cleanup.py         merge/close: reclaim the PR's local disk
 scripts/observe.py         the observer route's adapter: republish the loop's notice, wake nobody
 skill/SKILL.md             the protocol the seats load
