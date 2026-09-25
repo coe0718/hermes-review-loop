@@ -1593,8 +1593,8 @@ def register_cli(ctx, settings: dict | None = None) -> None:
         check.add_argument("--live-turn", action="store_true",
                            help="with --pr: run one real isolated reviewer turn whose verdict is "
                                 "printed and never posted")
-        check.add_argument("--timeout", type=int, default=120,
-                           help="live turn budget in seconds (production worker default: 120)")
+        check.add_argument("--timeout", type=int, default=600,
+                           help="live turn budget in seconds (default 600; the production worker uses its own child_timeout)")
         check.set_defaults(func=cmd_selftest)
 
         change = sub.add_parser("set", help="Change a loop's settings in place")

@@ -42,7 +42,7 @@ from . import config, doctor, gh
 PASS, FAIL, WARN, SKIP = "pass", "fail", "warn", "skip"
 MARKS = {PASS: "✅", FAIL: "❌", WARN: "⚠️ ", SKIP: "⏭️ "}
 RUNTIME_KEYS = ("source", "venv", "runtime", "rust", "upstream", "key_file", "model")
-DEFAULT_TIMEOUT = 120  # the production supervisor's child_timeout default
+DEFAULT_TIMEOUT = 600  # a real review routinely outlasts a two-minute budget
 
 
 class WriteBlocked(RuntimeError):

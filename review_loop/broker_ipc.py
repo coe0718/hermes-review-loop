@@ -288,7 +288,8 @@ class RunBroker:
         ledger row, audit line or GitHub write is produced. The sandbox gets the same answer a
         real write would give, so the agent's behaviour is the one a live run would show.
         """
-        if verdict not in ("APPROVE", "REQUEST_CHANGES", "COMMENT") or not body.strip():
+        # Same verdicts a real reviewer write accepts: a COMMENT would stall the loop.
+        if verdict not in ("APPROVE", "REQUEST_CHANGES") or not body.strip():
             raise broker.BrokerDenied("invalid review verdict or empty body")
         entry = {"verdict": verdict, "body": body, "authorized": False, "denial": ""}
         self.recorded.append(entry)
