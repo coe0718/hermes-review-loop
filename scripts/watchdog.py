@@ -127,6 +127,8 @@ def drain(loop: dict, st: state_mod.LoopState, seat: str, quiet: bool = False) -
                  "title": pr.get("title", ""), "html_url": pr.get("html_url", "")}
 
         if seat == "fixer":
+            # Any changes-requested at this head is not enough: a later approval (or an
+            # undatable verdict) at the same head means there is no fix to order.
             latest = gate.latest_effective_review_at_head(reviews, loop, head)
             if latest is None:
                 log(f"drain: latest verdict at {head[:7]} of #{number} unknown — left queued")

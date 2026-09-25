@@ -89,6 +89,11 @@ GATE_SCRIPT = {"reviewer": "gate_reviewer.py", "fixer": "gate_fixer.py",
                "adjudicator": "gate_adjudicator.py", "observer": "observe.py"}
 
 
+# Each role's route prompt: together with the gate script, the proof that a route is ours.
+_ROUTE_PROMPT = {"reviewer": prompts.REVIEWER, "fixer": prompts.FIXER,
+                 "adjudicator": prompts.ADJUDICATOR, "observer": prompts.OBSERVER}
+
+
 def _verify_routes(loop: dict, roles) -> None:
     """Refuse to write a route that is not this loop's to write.
 
@@ -130,14 +135,11 @@ def _verify_routes(loop: dict, roles) -> None:
             raise config.ConfigError(f"route {name!r} exists but its ownership cannot be verified "
                                      "— pick another route name")
         script = entry.get("script")
-        if script != GATE_SCRIPT[role]:
+        if script != GATE_SCRIPT[role] and script not in config.LEGACY_GATE_SCRIPTS.get(role, ()):
             raise config.ConfigError(
                 f"route {name!r} runs {script!r}, not {GATE_SCRIPT[role]!r} — it belongs to "
                 "something else; pick another route name")
-        expected_prompt = {"reviewer": prompts.REVIEWER, "fixer": prompts.FIXER,
-                           "adjudicator": prompts.ADJUDICATOR,
-                           "observer": prompts.OBSERVER}[role]
-        if entry.get("prompt") != expected_prompt:
+        if entry.get("prompt") != _ROUTE_PROMPT[role]:
             raise config.ConfigError(
                 f"route {name!r} does not have this {role} gate's prompt — ownership cannot be "
                 "verified; pick another route name")
@@ -321,6 +323,24 @@ def _route_binds(loop: dict, touched: set[str]) -> dict:
         if current != target:
             binds[role] = (name, current, target)
     return binds
+
+
+def _stale_scripts(loop: dict) -> dict:
+    """role → (route name, installed script) for this loop's routes still on an older gate.
+
+    Only a script this plugin itself once installed for that role counts, and only with the
+    role's own prompt: anything else is not provably ours and ``_verify_routes`` refuses it.
+    """
+    stale: dict = {}
+    for role, name in _routes_of(loop).items():
+        entry = routes.route(name)
+        if not isinstance(entry, dict):
+            continue
+        script = entry.get("script")
+        if (script in config.LEGACY_GATE_SCRIPTS.get(role, ())
+                and entry.get("prompt") == _ROUTE_PROMPT[role]):
+            stale[role] = (name, script)
+    return stale
 
 
 def _busy_seats(loop: dict, roles: set[str]) -> list[str]:
@@ -963,7 +983,10 @@ def cmd_apply(args) -> int:
     # The installed registry can drift independently of the loop and the form. Repair those
     # routes through the same ownership, seat and in-flight preflight as an identity push.
     binds = _route_binds(updated, set(_routes_of(updated)))
-    rebinding = touched | set(binds)
+    # A route installed by an older release (the pre-#21 breach route on gate_reviewer.py) is
+    # repaired here too: `init` refuses an existing loop, so apply is the only reconcile path.
+    repairs = _stale_scripts(updated)
+    rebinding = touched | set(binds) | set(repairs)
     try:
         # Validate what this apply would *write*: a loop that predates the seat checks keeps
         # loading, but a seat this push moves must be one that can actually run.
@@ -988,7 +1011,7 @@ def cmd_apply(args) -> int:
     missing_routes = sorted(name for role, name in _routes_of(updated).items()
                             if role in touched and not routes.route(name))
 
-    if not changes and not identity and not binds:
+    if not changes and not identity and not binds and not repairs:
         print(f"[{loop['id']}] already matches the plugin settings")
         return 0
     if not args.dry_run and updated.get("host") != loop.get("host") and loop.get("observer"):
@@ -1005,6 +1028,9 @@ def cmd_apply(args) -> int:
         print(f"  {name}: {was} → {now}")
     for role, (name, current, target) in sorted(binds.items()):
         print(f"  route {name}: profile {current} → {target}   (the URL carries the profile)")
+    for role, (name, script) in sorted(repairs.items()):
+        print(f"  route {name}: script {script} → {GATE_SCRIPT[role]}   (installed by an older "
+              "release)")
     for name in missing_routes:
         print(f"  route {name}: not installed — `hermes review-loop init` creates routes; "
               "apply will not invent one behind your back")
@@ -1035,16 +1061,20 @@ def cmd_apply(args) -> int:
     except config.ConfigError as exc:
         print(f"refused: {exc}")
         return 2
-    previous = {name: routes.route(name) for name, _, _ in binds.values()}
+    previous = {name: routes.route(name)
+                for name in {bind[0] for bind in binds.values()} | {n for n, _ in repairs.values()}}
     config_path = config.config_dir() / f"{loop['id']}.json"
     previous_config = config_path.read_bytes()
     attempted_hooks = []
     try:
-        rebound = list(_install_routes(updated, roles=tuple(binds)).items()) if binds else []
+        rewrite = tuple(set(binds) | set(repairs))
+        rebound = list(_install_routes(updated, roles=rewrite).items()) if rewrite else []
         for role, name in rebound:
             entry = routes.route(name)
             if not entry or str(entry.get("profile") or "") != config.seat_profile(updated, role):
                 raise config.ConfigError(f"route {name} readback does not match requested profile")
+            if entry.get("script") != GATE_SCRIPT[role]:
+                raise config.ConfigError(f"route {name} readback does not run {GATE_SCRIPT[role]}")
         for hook_id, old, new in hook_moves:
             attempted_hooks.append((hook_id, old))
             _patch_hook_url(loop, hook_id, new)
@@ -1079,7 +1109,8 @@ def cmd_apply(args) -> int:
         return 2
     print(f"loop config updated: {path}")
     for role, name in rebound:
-        print(f"  route {name} rebound → profile {config.seat_profile(updated, role)}")
+        print(f"  route {name} rebound → profile {config.seat_profile(updated, role)}"
+              + (f", script {GATE_SCRIPT[role]}" if role in repairs else ""))
     for hook_id, _, new in hook_moves:
         print(f"  hook {hook_id} → {new}")
     return 0

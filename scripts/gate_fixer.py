@@ -5,7 +5,8 @@ Route this at the fixer's profile, on the ``pull_request_review`` event. It wake
 when a verdict it must answer lands:
 
 * ``submitted`` with state ``changes_requested``, authored by one of the loop's reviewers,
-  **at the current head** (a verdict on an older commit is already superseded);
+  **at the current head** (a verdict on an older commit is already superseded) — current as
+  GitHub says *now*, with this review still the latest effective verdict there;
 * ``commented`` and ``approved`` end here — approval is where the loop stops being useful;
 * the verdict that reaches the cap is **not** a work order. Handing the fixer a fourth fix
   no reviewer will read is how a loop burns a night; the PR goes to adjudication instead.
@@ -96,9 +97,13 @@ def main() -> None:
             outcome, next_turn = "", "you merge"
         else:
             outcome, next_turn = "current approval/head unverified — no merge handoff", "check current PR state"
-        if next_turn == "you merge":
-            if st.release_if("reviewer", key):
-                log(f"released reviewer seat for {key}")
+        # The approval ended the run that was claimed for the approved head, whether or not
+        # GitHub can be read back now; a verified handoff also ends any other claim.
+        released = (st.release_if("reviewer", key) if next_turn == "you merge"
+                    else st.release_if("reviewer", key, approved_head) if approved_head else False)
+        if released:
+            log(f"released reviewer seat for {key}")
+        if released or next_turn == "you merge":
             gate.drain_seat(loop, "reviewer")
         observer.notify(loop, st, "approved", number, approved_head,
                         identity=review.get("id"), actor=gate.reviewer_login(review),
@@ -112,6 +117,10 @@ def main() -> None:
     if review.get("commit_id") != pr_head:
         silence("verdict is on an older head — superseded")
 
+    # The payload's head is a snapshot from when the review was submitted; the PR may have moved,
+    # closed, or had this verdict superseded (a later approval, a dismissal) since. A fix run is a
+    # work order, so it needs the live PR at this head *and* this review as the latest effective
+    # verdict there — the same chronology rule the approval path uses for a merge handoff.
     current = gh.pr(loop, number)
     if (not isinstance(current, dict) or current.get("number") != number
             or current.get("state") != "open" or current.get("draft")

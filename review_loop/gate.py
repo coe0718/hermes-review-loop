@@ -861,29 +861,33 @@ def take_seat(loop: dict, st: state_mod.LoopState, seat: str, number: int, head:
     key = seat_key(loop, number)
     capacity = config.seat_concurrency(loop, seat)
 
-    if st.is_active(seat, key):
-        log(f"{seat} is already running {key} — refusing a second run at the same PR")
-        silence()
+    # Check and claim are one step under the loop's state lock: two gates reading "one slot
+    # free" and both acquiring would put the seat over its capacity. ``silence()`` raises, and
+    # the lock is released on the way out.
+    with st.locked():
+        if st.is_active(seat, key):
+            log(f"{seat} is already running {key} — refusing a second run at the same PR")
+            silence()
 
-    other = st.held_by_other(seat, key)
-    if other:
-        st.queue_add(seat, key, head, pr_url(loop, number),
-                     f"the {other} seat is working this PR")
-        log(f"{other} holds #{number} — queued {seat} rather than running both on one PR")
-        silence(f"the {other} seat is working this PR — queued until it hands off")
+        other = st.held_by_other(seat, key)
+        if other:
+            st.queue_add(seat, key, head, pr_url(loop, number),
+                         f"the {other} seat is working this PR")
+            log(f"{other} holds #{number} — queued {seat} rather than running both on one PR")
+            silence(f"the {other} seat is working this PR — queued until it hands off")
 
-    live = st.active(seat)
-    used, limit = seat_capacity(loop, st, seat)
-    if used >= limit:
-        held = ", ".join(f"{k} ({int(time.time() - v.get('at', time.time()))}s)"
-                         for k, v in sorted(live.items()))
-        st.queue_add(seat, key, head, pr_url(loop, number),
-                     f"{seat} at capacity {len(live)}/{capacity}: {held}")
-        log(f"{seat} at capacity {len(live)}/{capacity} ({held}) — queued #{number} @ {head[:7]}")
-        silence()
+        live = st.active(seat)
+        used, limit = seat_capacity(loop, st, seat)
+        if used >= limit:
+            held = ", ".join(f"{k} ({int(time.time() - v.get('at', time.time()))}s)"
+                             for k, v in sorted(live.items()))
+            st.queue_add(seat, key, head, pr_url(loop, number),
+                         f"{seat} at capacity {len(live)}/{capacity}: {held}")
+            log(f"{seat} at capacity {len(live)}/{capacity} ({held}) — queued #{number} @ {head[:7]}")
+            silence()
 
-    st.acquire(seat, key, head, why)
-    st.queue_pop(seat, key)        # a direct event can outrun the drain: the entry is stale now
+        st.acquire(seat, key, head, why)
+        st.queue_pop(seat, key)        # a direct event can outrun the drain: the entry is stale now
 
     workspace = isolation.ensure(loop, number, seat, head, login=login or "")
     if workspace is None and capacity > 1:

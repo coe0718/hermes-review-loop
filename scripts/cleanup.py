@@ -15,6 +15,8 @@ Two modes:
 Safety rails, because this deletes real directories:
 
 * only paths inside non-symlink configured roots or the artifacts directory are considered;
+* a plain root child must name this loop's repository as well as the PR (roots are shared
+  between loops, and ``pr7`` alone is PR 7 of any repository);
 * only detached worktrees registered to this clone are removable, and only inside those roots;
   other Git repositories and nested checkouts are protected;
 * a worktree with a **branch** checked out is never touched — that is somebody's working
@@ -69,6 +71,19 @@ NEVER_TOUCH = re.compile(r"(phase3|phase4-evidence|evidence|soak|release-verific
 def pr_from_path(path: str) -> int | None:
     hits = PR_IN_PATH.findall(str(path))
     return int(hits[-1]) if hits else None
+
+
+def names_repo(name: str, loop: dict) -> bool:
+    """Does a root child's name carry this loop's repository name as a whole token?
+
+    Roots are shared (``~/.hermes/cache/scratch`` serves every loop on the machine), and a bare
+    ``pr7`` is PR 7 of *some* repository. A plain root child is only attributable to this loop
+    when it says which repository it belongs to — ``widgets-pr7-target``, ``pr7_widgets.log`` —
+    with the same boundary rule as the PR token, so ``widgets`` never claims ``widgetsplus``.
+    Registered detached worktrees of this loop's clone need no name: the registration is proof.
+    """
+    repo = loop["repo"].split("/")[-1]
+    return bool(re.search(rf"(?:^|[^0-9a-z]){re.escape(repo)}(?![0-9a-z])", name, re.I))
 
 
 def overlaps_branch_worktree(path: pathlib.Path, protected: set[pathlib.Path]) -> bool:
@@ -137,8 +152,15 @@ def contains_nested_git(path: pathlib.Path, registered_worktree: bool = False) -
 
 
 def owned_candidate(path: pathlib.Path, roots: list[pathlib.Path],
-                    clone: pathlib.Path | None, registered: set[pathlib.Path]) -> bool:
-    """Only root-contained artifacts or registered detached checkouts may be removed."""
+                    clone: pathlib.Path | None, registered: set[pathlib.Path],
+                    loop_artifacts: pathlib.Path | None = None) -> bool:
+    """Only root-contained artifacts or registered detached checkouts may be removed.
+
+    ``loop_artifacts`` is this PR's ``artifacts/<N>`` directory under the loop's own state dir,
+    resolved. The loop created it (isolation clones live at ``artifacts/<N>/<seat>/repo``), so
+    the nested ``.git`` inside it is ours and does not disqualify it the way a nested checkout
+    in a shared root does.
+    """
     if has_symlink_component(path):
         return False
     candidate = path.resolve()
@@ -151,6 +173,8 @@ def owned_candidate(path: pathlib.Path, roots: list[pathlib.Path],
     # repository's contents belong to this loop (including inherited owners).
     if owner and (owner != candidate or candidate not in registered):
         return False
+    if loop_artifacts is not None and candidate == loop_artifacts:
+        return True
     # A PR-named build directory may enclose an unrelated checkout. Do not recurse
     # through a Git registration we cannot prove belongs to this clone.
     if contains_nested_git(path, candidate in registered):
@@ -268,33 +292,36 @@ def clear_state(loop: dict, number: int, quiet: bool) -> list[str]:
     st = state_mod.state_for(loop)
     key = f"{loop['repo']}#{number}"
     cleared: list[str] = []
-    for path in (st.locks, st.pending, st.inflight_file, st.breach):
-        data = st._load(path, {}) or {}
-        if not isinstance(data, dict):
-            continue
-        before = json.dumps(data, sort_keys=True)
-        data.pop(key, None)
-        if path == st.inflight_file:
-            # Marks are role:PR:SHA; require exact fields, not a string prefix.
-            for mark in list(data):
-                if not isinstance(mark, str):
+    # The same locks the gates take: a gate claiming a seat between our read and our write
+    # would otherwise be erased by this rewrite.
+    with st.locked(), st._breach_lock():
+        for path in (st.locks, st.pending, st.inflight_file, st.breach):
+            data = st._load(path, {}) or {}
+            if not isinstance(data, dict):
+                continue
+            before = json.dumps(data, sort_keys=True)
+            data.pop(key, None)
+            if path == st.inflight_file:
+                # Marks are role:PR:SHA; require exact fields, not a string prefix.
+                for mark in list(data):
+                    if not isinstance(mark, str):
+                        continue
+                    parts = mark.split(":")
+                    if (len(parts) == 3 and parts[0] in ("review", "fix")
+                            and parts[1] == str(number) and parts[2]):
+                        data.pop(mark)
+            for seat, entry in list(data.items()):
+                if not isinstance(entry, dict):
                     continue
-                parts = mark.split(":")
-                if (len(parts) == 3 and parts[0] in ("review", "fix")
-                        and parts[1] == str(number) and parts[2]):
-                    data.pop(mark)
-        for seat, entry in list(data.items()):
-            if not isinstance(entry, dict):
-                continue
-            if entry.get("key") == key:              # a seat lock holding this PR
-                data.pop(seat, None)
-                continue
-            entry.pop(key, None)                     # a queue keyed by PR
-            if not entry:
-                data.pop(seat, None)
-        if json.dumps(data, sort_keys=True) != before:
-            st._save(path, data)
-            cleared.append(path.name)
+                if entry.get("key") == key:              # a seat lock holding this PR
+                    data.pop(seat, None)
+                    continue
+                entry.pop(key, None)                     # a queue keyed by PR
+                if not entry:
+                    data.pop(seat, None)
+            if json.dumps(data, sort_keys=True) != before:
+                st._save(path, data)
+                cleared.append(path.name)
     if cleared:
         log(f"    state cleared: {', '.join(cleared)}", quiet)
     return cleared
@@ -331,11 +358,17 @@ def clean_pr(loop: dict, number: int, dry: bool, quiet: bool, force: bool = Fals
         for child in root.iterdir():
             if child in cands:
                 continue
-            if pr_from_path(child.name) == number:
+            if pr_from_path(child.name) == number and (child.resolve() in registered
+                                                       or names_repo(child.name, loop)):
                 cands.append(child)
     base = config.artifacts_dir(loop, number)
     if base.exists() and base not in cands:
         cands.append(base)
+    # The loop's own per-PR artifacts dir, only when it is a real directory under the loop's
+    # real state dir: a symlinked state dir or artifacts path gets the ordinary checks.
+    state_dir = config._path(loop["state_dir"])
+    loop_artifacts = (base.resolve() if base.is_dir() and not has_symlink_component(base)
+                      and inside(base.resolve(), state_dir.resolve()) else None)
 
     for cand in cands:
         # Pin the directory identity BEFORE ownership checks; a real-directory
@@ -345,7 +378,8 @@ def clean_pr(loop: dict, number: int, dry: bool, quiet: bool, force: bool = Fals
         except OSError as exc:
             log(f"    SKIP (changed candidate): {cand}: {exc}", quiet)
             continue
-        if not owned_candidate(cand, roots, clone.resolve() if clone else None, registered):
+        if not owned_candidate(cand, roots, clone.resolve() if clone else None, registered,
+                               loop_artifacts):
             log(f"    SKIP (outside owned cleanup scope): {cand}", quiet)
             continue
         # Every source (worktree list, configured roots, artifacts base) shares this
@@ -381,13 +415,14 @@ def sweep(loop: dict, dry: bool, quiet: bool) -> int:
         number = pr_from_path(pathlib.Path(tree["path"]).name)
         if number:
             by_pr.setdefault(number, []).append(tree)
-    # Roots can hold a PR's logs with no worktree left; those still count.
+    # Roots can hold a PR's logs with no worktree left; those still count — when they name this
+    # loop's repository (a shared root also holds other loops' PR numbers).
     for root in [pathlib.Path(p).expanduser() for p in loop["roots"]]:
         if not root.is_dir() or has_symlink_component(root):
             continue
         for child in root.iterdir():
             number = pr_from_path(child.name)
-            if number:
+            if number and names_repo(child.name, loop):
                 by_pr.setdefault(number, [])
 
     total = 0

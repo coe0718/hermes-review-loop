@@ -413,6 +413,11 @@ underneath itself — the live run holds its old profile, login and credential u
 identity it started with". `apply --dry-run` shows all of it without writing: the seat diff, the
 route profiles it would rebind, and nothing else.
 
+`apply` is also the upgrade path for a loop installed before the dedicated adjudicator gate: its
+breach route still runs `gate_reviewer.py`, `doctor` flags it, and `apply --loop <id>` rebinds that
+route to `gate_adjudicator.py` in place, secret kept. Only a script this plugin itself once
+installed for the route (with its own prompt) is rewritten; anything else is left alone.
+
 Preview a loop before installing it with `hermes review-loop init ... --dry-run`: it prints the
 effective seat mapping (profile, login, route, and the URL the profile is part of) and stops
 without writing config, routes, hooks or cron.

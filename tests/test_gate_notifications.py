@@ -76,10 +76,18 @@ class NotificationFreshnessTest(unittest.TestCase):
                         pr() | {"number": 8}, pr() | {"head": {}}):
             with self.subTest(current=current):
                 self.state.reset_mock()
+                self.state.release_if.return_value = False    # no claim at the approved head
                 live, _, drain, notify = self.invoke(gate_fixer, payload, current)
                 live.assert_called_once_with(self.loop, 7)
-                self.state.release_if.assert_not_called()
+                # Only the claim made for the approved head may end; never another run's.
+                self.state.release_if.assert_called_once_with("reviewer", mock.ANY, HEAD_A)
                 drain.assert_not_called()
+            with self.subTest(current=current, claim_at_approved_head=True):
+                # That claim is freed even though the live read failed, and its queue drains.
+                self.state.reset_mock()
+                self.state.release_if.return_value = True
+                _, _, drain, _ = self.invoke(gate_fixer, payload, current)
+                drain.assert_called_once()
                 notify.assert_called_once()
                 self.assertNotEqual(notify.call_args.kwargs["next_turn"], "you merge")
 

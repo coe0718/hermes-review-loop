@@ -200,17 +200,17 @@ def make_clone() -> None:
     git("worktree", "add", "--detach", str(wt), "HEAD")
     (wt / "target").mkdir()
     (wt / "target" / "big.bin").write_bytes(b"x" * 4096)
-    (REVIEWS / "pr7-build.log").write_text("log\n")
+    (REVIEWS / "widgets-pr7-build.log").write_text("log\n")
     (REVIEWS / "pr7-phase3-evidence").mkdir()
     (REVIEWS / "pr7-phase3-evidence" / "keep.json").write_text("{}\n")
     # a detached review checkout for PR 9 (still open) and a branch worktree for PR 8
     git("worktree", "add", "--detach", str(REVIEWS / "pr9-wt"), "HEAD")
     (REVIEWS / "pr9-wt" / "notes.txt").write_text("keep me\n")
-    (SCRATCH / "pr8-target").mkdir(parents=True)
+    (SCRATCH / "widgets-pr8-target").mkdir(parents=True)
     # A build-output file the cleanup should reclaim. Text, and named like the real artifacts
     # (.log), because a stray .bin here trips the plugin security scan's binary-file caution every
     # time anyone runs `hermes plugins validate` on this repo.
-    (SCRATCH / "pr8-target" / "build.log").write_text("y" * 2048 + "\n")
+    (SCRATCH / "widgets-pr8-target" / "build.log").write_text("y" * 2048 + "\n")
     branch_wt = SCRATCH / "pr8-work-branch"
     git("worktree", "add", "-b", "fix/thing-8", str(branch_wt), "HEAD")
     (branch_wt / "work.txt").write_text("someone's work\n")
@@ -444,6 +444,21 @@ def group_config() -> None:
     check("cap kept", loop["cap"], 3)
     check("artifacts path is per PR", str(config.artifacts_dir(loop, 7)).endswith("artifacts/7"), True)
 
+    # Cleanup deletes PR-named children of every root: a root above the operator's own files
+    # would put their projects in scope.
+    home_dir = pathlib.Path.home()
+    for label, value in (("/", "/"), ("home", "~"), ("home (absolute)", str(home_dir)),
+                         ("ancestor of home", str(home_dir.parent))):
+        try:
+            config.normalize({**json.loads((LOOPS_DIR / "widgets.json").read_text()),
+                              "roots": [value]})
+            check(f"root {label} is refused", "accepted", "ConfigError")
+        except config.ConfigError:
+            check(f"root {label} is refused", "ConfigError", "ConfigError")
+    check("a directory under home is still a valid root", config.normalize(
+        {**json.loads((LOOPS_DIR / "widgets.json").read_text()),
+         "roots": ["~/.hermes/cache/scratch"]})["roots"], ["~/.hermes/cache/scratch"])
+
     bad = {"repo": "no-slash", "fixers": ["x"], "reviewers": ["y"],
            "seats": {"reviewer": {"route": "r", "profile": "p"}, "fixer": {"route": "r", "profile": "p"}}}
     try:
@@ -475,6 +490,9 @@ def group_reviewer_gate() -> None:
                    pr_payload(sender="passer-by"))
 
     reset(prs={"7": pr(7)})
+    # No hardcoded account outside the loop's own config may hand a PR to review.
+    check_rejected("request from an unconfigured org account is silent", "gate_reviewer.py",
+                   pr_payload(sender="patchhive"))
     check_rejected("a plain push (synchronize) is silent", "gate_reviewer.py",
                    pr_payload(action="synchronize"))
 
@@ -766,6 +784,46 @@ def group_fixer_gate() -> None:
     run("gate_fixer.py", review_payload(rid=5))
     check("same head twice → second is silent",
           run("gate_fixer.py", review_payload(rid=5))[0], "SILENT")
+
+    # The payload's head is a snapshot: the live PR is what authorizes a fix run.
+    reset(prs={"7": {**pr(7, head=HEAD_B), "reviews": [review(REVIEWER, rid=5)]}})
+    check("live PR moved past the verdict's head → silent",
+          run("gate_fixer.py", review_payload(rid=5))[0], "SILENT")
+    reset(prs={"7": {**pr(7, state="closed"), "reviews": [review(REVIEWER, rid=5)]}})
+    check("live PR closed → silent", run("gate_fixer.py", review_payload(rid=5))[0], "SILENT")
+    reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, rid=5)]}})
+    check("unreadable live PR → silent", run("gate_fixer.py", review_payload(rid=5),
+          extra_env={"REVIEW_LOOP_GH_STUB": "/bin/false"})[0], "SILENT")
+    later_approval = {**review(REVIEWER, state="APPROVED", rid=6),
+                      "submitted_at": "2026-01-02T00:00:00Z"}
+    reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, rid=5), later_approval]}})
+    check("changes-requested superseded by a same-head approval → silent",
+          run("gate_fixer.py", review_payload(rid=5))[0], "SILENT")
+    check("  and no fixer seat is claimed", "fixer" in load_state("locks.json"), False)
+    dismissed = {**review(REVIEWER, state="DISMISSED", rid=5)}
+    reset(prs={"7": {**pr(7), "reviews": [dismissed]}})
+    check("changes-requested dismissed since → silent",
+          run("gate_fixer.py", review_payload(rid=5))[0], "SILENT")
+
+    # An approval always ends the reviewer's turn, even when GitHub cannot be read back:
+    # only the merge handoff waits on the live read, never the seat release.
+    reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, state="approved", rid=9)]}})
+    state_file("locks.json").write_text(json.dumps(
+        {"reviewer": {f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "why": "review"}}}))
+    run("gate_fixer.py", review_payload(state="approved", rid=9),
+        extra_env={"REVIEW_LOOP_GH_STUB": "/bin/false"})
+    check("approval with an unreadable PR still frees the reviewer seat",
+          "reviewer" in load_state("locks.json"), False)
+
+    # The drain re-reads GitHub: an older changes-requested at the head is not a work order
+    # once a later approval landed at that same head.
+    reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, rid=5), later_approval]}})
+    state_file("pending.json").write_text(json.dumps({"fixer": {
+        f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "url": "u", "reason": "busy"}}}))
+    before = len(RECEIVED)
+    run("watchdog.py", None, "--loop", "widgets", "--drain", "--seat", "fixer")
+    check("drain never wakes the fixer past a later approval", len(RECEIVED) - before, 0)
+    check("  and the stale queue entry is dropped", load_state("pending.json"), {})
 
 
 def group_seats() -> None:
@@ -3115,7 +3173,7 @@ def group_cleanup() -> None:
 
     out, _, _ = run("cleanup.py", None, "--loop", "widgets", "--pr", "7")
     check("real run removes the worktree", (REVIEWS / "pr7-wt").exists(), False)
-    check("  removes its build log", (REVIEWS / "pr7-build.log").exists(), False)
+    check("  removes its build log", (REVIEWS / "widgets-pr7-build.log").exists(), False)
     check("  SKIPS the evidence dir", (REVIEWS / "pr7-phase3-evidence").exists(), True)
     check("  another PR's worktree untouched", (REVIEWS / "pr9-wt").exists(), True)
     check("  the branch worktree untouched", (SCRATCH / "pr8-work-branch").exists(), True)
@@ -3127,12 +3185,12 @@ def group_cleanup() -> None:
     # A branch checkout matching the *same* closed PR must survive the configured-root
     # scan, even when a configured root points inside that checkout.
     reset(prs={"7": pr(7, state="closed")})
-    branch = REVIEWS / "pr7-dev"
+    branch = REVIEWS / "widgets-pr7-dev"
     subprocess.run(["git", "-C", str(CLONE), "worktree", "add", "-b", "fix/pr7",
                     str(branch), "HEAD"], check=True, capture_output=True)
     sentinel = branch / "uncommitted.txt"
     sentinel.write_text("do not lose local work\n")
-    nested = branch / "pr7-logs"
+    nested = branch / "widgets-pr7-logs"
     nested.mkdir()
     (nested / "build.log").write_text("preserve\n")
     cfg = json.loads((LOOPS_DIR / "widgets.json").read_text())
@@ -3148,7 +3206,7 @@ def group_cleanup() -> None:
 
     # A root child enclosing a branch checkout is just as destructive to remove.
     reset(prs={"7": pr(7, state="closed")})
-    parent = REVIEWS / "pr7-container"
+    parent = REVIEWS / "widgets-pr7-container"
     parent.mkdir()
     inside = parent / "developer"
     subprocess.run(["git", "-C", str(CLONE), "worktree", "add", "-b", "fix/inside7",
@@ -3169,9 +3227,52 @@ def group_cleanup() -> None:
     check("branch worktree at artifacts base survives", base_sentinel.read_text() if base_sentinel.exists() else None,
           "preserve base\n")
 
+    # The loop's own isolation workspace is a full clone (artifacts/<N>/<seat>/repo). Its .git
+    # is ours: refusing it as a "nested checkout" would leave every isolated PR on disk forever.
+    reset(prs={"7": pr(7, state="closed")})
+    base = STATE_DIR / "artifacts" / "7"
+    iso = base / "reviewer" / "repo"
+    iso.parent.mkdir(parents=True)
+    subprocess.run(["git", "clone", "-q", "--local", str(CLONE), str(iso)], check=True,
+                   capture_output=True)
+    (base / "reviewer" / "target").mkdir()
+    (base / "reviewer" / "target" / "build.log").write_text("z" * 1024 + "\n")
+    run("cleanup.py", None, "--loop", "widgets", "--pr", "7")
+    check("isolated per-PR workspace is removed", base.exists(), False)
+    check("  the loop clone is untouched", (CLONE / "README.md").exists(), True)
+
+    # ...but only the real directory: an artifacts path reached through a symlink is not ours.
+    reset(prs={"7": pr(7, state="closed")})
+    elsewhere = TMP / "elsewhere-artifacts"
+    shutil.rmtree(elsewhere, ignore_errors=True)
+    subprocess.run(["git", "clone", "-q", "--local", str(CLONE), str(elsewhere / "reviewer" / "repo")],
+                   check=True, capture_output=True)
+    (STATE_DIR / "artifacts").mkdir(parents=True)
+    (STATE_DIR / "artifacts" / "7").symlink_to(elsewhere, target_is_directory=True)
+    run("cleanup.py", None, "--loop", "widgets", "--pr", "7")
+    check("symlinked artifacts dir is not followed",
+          (elsewhere / "reviewer" / "repo" / "README.md").exists(), True)
+
+    # Roots are shared between loops: pr7 alone is PR 7 of *some* repository.
+    reset(prs={"7": pr(7, state="closed")})
+    for name in ("gadgets-pr7-target", "pr7-build", "widgetsplus-pr7.log", "widgets-pr7-target"):
+        (SCRATCH / name).mkdir()
+        (SCRATCH / name / "sentinel.txt").write_text(name + "\n")
+    run("cleanup.py", None, "--loop", "widgets", "--pr", "7")
+    check("another repo's pr7 dir in a shared root survives",
+          (SCRATCH / "gadgets-pr7-target" / "sentinel.txt").exists(), True)
+    check("  an unscoped pr7 dir survives", (SCRATCH / "pr7-build" / "sentinel.txt").exists(), True)
+    check("  a prefix-sharing repo name survives",
+          (SCRATCH / "widgetsplus-pr7.log" / "sentinel.txt").exists(), True)
+    check("  this repo's pr7 dir is reclaimed", (SCRATCH / "widgets-pr7-target").exists(), False)
+    reset(prs={"7": pr(7, state="closed")})
+    (SCRATCH / "gadgets-pr7-target").mkdir()
+    out, _, _ = run("cleanup.py", None, "--loop", "widgets", "--sweep", "--dry-run")
+    check("  sweep does not list another repo's PR", "gadgets-pr7-target" in out, False)
+
     # Configured roots are discovery boundaries, not permission to remove another repo.
     reset(prs={"7": pr(7, state="closed")})
-    other = REVIEWS / "pr7-other-repo"
+    other = REVIEWS / "widgets-pr7-other-repo"
     subprocess.run(["git", "init", "-q", "-b", "main", str(other)], check=True)
     other_sentinel = other / "uncommitted.txt"
     other_sentinel.write_text("other repo's branch\n")
@@ -3193,7 +3294,7 @@ def group_cleanup() -> None:
     subprocess.run(["git", "init", "-q", "-b", "main", str(foreign)], check=True)
     foreign_root = foreign / "build"
     foreign_root.mkdir()
-    foreign_file = foreign_root / "pr7-source"
+    foreign_file = foreign_root / "widgets-pr7-source"
     foreign_file.write_text("foreign source\n")
     cfg = json.loads((LOOPS_DIR / "widgets.json").read_text())
     cfg["roots"].append(str(foreign_root))
@@ -3219,7 +3320,7 @@ def group_cleanup() -> None:
     external = TMP / "external-cleanup"
     shutil.rmtree(external, ignore_errors=True)
     external.mkdir()
-    (external / "pr7-sentinel").write_text("external root\n")
+    (external / "widgets-pr7-sentinel").write_text("external root\n")
     linked = TMP / "linked-root"
     linked.unlink(missing_ok=True)
     linked.symlink_to(external, target_is_directory=True)
@@ -3227,14 +3328,14 @@ def group_cleanup() -> None:
     cfg["roots"].append(str(linked))
     (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg))
     run("cleanup.py", None, "--loop", "widgets", "--pr", "7")
-    check("symlinked root cannot delete external child", (external / "pr7-sentinel").exists(), True)
+    check("symlinked root cannot delete external child", (external / "widgets-pr7-sentinel").exists(), True)
 
     # Swap a validated root at the du seam; string-path unlink would hit the sentinel.
     reset(prs={"7": pr(7, state="closed")})
     external = TMP / "outside-swap"
     shutil.rmtree(external, ignore_errors=True)
     external.mkdir()
-    outside_file = external / "pr7-build.log"
+    outside_file = external / "widgets-pr7-build.log"
     outside_file.write_text("outside must survive\n")
     outside_tree = external / "pr7-wt"
     outside_tree.mkdir()
@@ -3326,10 +3427,10 @@ def group_cleanup() -> None:
           (unrelated / "neutral-wt" / "sentinel.txt").exists(), True)
 
     reset(prs={"7": pr(7, state="closed")})
-    nested_repo = REVIEWS / "pr7-bundle" / "developer"
+    nested_repo = REVIEWS / "widgets-pr7-bundle" / "developer"
     subprocess.run(["git", "init", "-q", "-b", "main", str(nested_repo)], check=True)
     (nested_repo / "uncommitted.txt").write_text("nested repo\n")
-    link = REVIEWS / "pr7-external-link"
+    link = REVIEWS / "widgets-pr7-external-link"
     external = TMP / "external-cleanup"
     external.mkdir(exist_ok=True)
     (external / "sentinel.txt").write_text("external link\n")
@@ -3423,7 +3524,7 @@ def group_cleanup() -> None:
     out, _, _ = run("cleanup.py", None, "--loop", "widgets", "--sweep")
     check("sweep reclaims the closed PR", (REVIEWS / "pr7-wt").exists(), False)
     check("sweep keeps the open one", (REVIEWS / "pr9-wt").exists(), True)
-    check("sweep keeps the unknown one", (SCRATCH / "pr8-target").exists(), True)
+    check("sweep keeps the unknown one", (SCRATCH / "widgets-pr8-target").exists(), True)
     check("sweep reports a total", "reclaimed" in out, True)
 
 
@@ -4051,6 +4152,28 @@ def group_doctor() -> None:
     rc, out = run_doctor("--loop", "widgets")
     check("wrong adjudicator gate fails", rc, 1)
     check("  requires gate_adjudicator.py", "gate_adjudicator.py" in out, True)
+    # A pre-#21 loop: `init` refuses an existing loop, so the hint must name apply, and apply
+    # must actually rebind the route it names.
+    check("  and names the command that repairs it",
+          "hermes review-loop apply --loop widgets" in out and "re-run init" not in out, True)
+    from review_loop import prompts as prompts_mod
+    edit_subs(lambda subs: subs["widgets-breach"].update(prompt=prompts_mod.ADJUDICATOR))
+    secret = json.loads(SUBS.read_text())["widgets-breach"]["secret"]
+    rc, out = run_cli(parser_for({}).parse_args(["apply", "--loop", "widgets", "--dry-run"]))
+    check("apply --dry-run shows the legacy gate repair",
+          (rc, "script gate_reviewer.py → gate_adjudicator.py" in out), (0, True))
+    rc, out = run_cli(parser_for({}).parse_args(["apply", "--loop", "widgets"]))
+    breach = json.loads(SUBS.read_text())["widgets-breach"]
+    check("apply rebinds a legacy breach route", (rc, breach["script"]), (0, "gate_adjudicator.py"))
+    check("  keeping its secret", breach["secret"], secret)
+    check("  and doctor is satisfied", "❌ route:widgets-breach" in run_doctor("--loop", "widgets")[1],
+          False)
+    check("  a second apply is a no-op", "already matches" in
+          run_cli(parser_for({}).parse_args(["apply", "--loop", "widgets"]))[1], True)
+    edit_subs(lambda subs: subs["widgets-breach"].update(script="someone_elses.py"))
+    run_cli(parser_for({}).parse_args(["apply", "--loop", "widgets"]))
+    check("apply never rebinds a foreign script",
+          json.loads(SUBS.read_text())["widgets-breach"]["script"], "someone_elses.py")
 
     install_doctor_fixture()
     profile_env("reviewer-profile").write_text("GH_TOKEN=  # unset\n")
@@ -4188,6 +4311,89 @@ def group_doctor() -> None:
     check("an unknown loop is refused", rc, 2)
     check("  with the reason", "cannot preflight loop" in out, True)
 
+STATE_RACE_CHILD = r"""
+import json, os, sys, time
+sys.path.insert(0, os.environ["ROOT"])
+from review_loop import config, gate, isolation, state
+loop = config.load_id("widgets")
+st = state.state_for(loop)
+mode, who = sys.argv[1], int(sys.argv[2])
+if mode == "acquire":
+    for i in range(50):
+        st.acquire("reviewer", f"acme/widgets#{who * 1000 + i}", "h", "race")
+        st.queue_add("fixer", f"acme/widgets#{who * 1000 + i}", "h", "u", "race")
+        st.inflight(f"review:{who * 1000 + i}:h", record=True)
+else:
+    # Widen the window between the capacity read and the claim, as a slow disk would.
+    read = gate.seat_capacity
+    def slow(*a, **k):
+        out = read(*a, **k)
+        time.sleep(0.2)
+        return out
+    gate.seat_capacity = slow
+    isolation.ensure = lambda *a, **k: None
+    try:
+        gate.take_seat(loop, st, "reviewer", 100 + who, "h", "race")
+        print("CLAIMED")
+    except SystemExit:
+        print("QUEUED")
+"""
+
+
+def group_state_race() -> None:
+    section("state — concurrent gates never lose each other's entries")
+    reset(prs={})
+    script = TMP / "state_race_child.py"
+    script.write_text(STATE_RACE_CHILD)
+    child_env = {**env(), "ROOT": str(ROOT)}
+
+    def spawn(mode: str, n: int) -> list[str]:
+        procs = [subprocess.Popen([sys.executable, str(script), mode, str(i)], env=child_env,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                 for i in range(n)]
+        return [proc.communicate(timeout=180)[0].strip().rsplit("\n", 1)[-1] for proc in procs]
+
+    spawn("acquire", 4)
+    check("4 procs x 50 acquires keep every seat lock",
+          len(load_state("locks.json").get("reviewer") or {}), 200)
+    check("  and every queue entry", len(load_state("pending.json").get("fixer") or {}), 200)
+    check("  and every in-flight mark", len(load_state("inflight.json")), 200)
+    check("  and no temp file is left behind",
+          sorted(p.name for p in STATE_DIR.iterdir() if p.name.startswith(".")), [])
+
+    for name in ("locks.json", "pending.json", "inflight.json"):
+        state_file(name).unlink()
+    outcomes = spawn("claim", 4)
+    check("concurrent take_seat at capacity 1 claims once", outcomes.count("CLAIMED"), 1)
+    check("  the rest are queued", outcomes.count("QUEUED"), 3)
+    check("  and the ledger holds one run", len(load_state("locks.json").get("reviewer") or {}), 1)
+
+
+def group_open_prs() -> None:
+    section("open PR listing — every page, or unknown")
+    from review_loop import gh
+
+    loop = {"repo": REPO}
+    path = f"/repos/{REPO}/pulls?state=open&per_page=100"
+    first = [pr(n) for n in range(1, 101)]
+    second = [pr(n) for n in range(101, 151)]
+    with mock.patch.object(gh, "fetch", side_effect=[(first, ""), (second, "")]) as fetch:
+        listed = gh.open_prs(loop)
+    check("a second page is read", [c.args[1] for c in fetch.call_args_list],
+          [path, path + "&page=2"])
+    check("  and every open PR is listed", len(listed or []), 150)
+    for label, page in (("failed", (None, "HTTP 502")), ("malformed", ({"message": "x"}, "")),
+                        ("item-less", ([None], ""))):
+        with mock.patch.object(gh, "fetch", side_effect=[(first, ""), page]):
+            check(f"a {label} later page makes the listing unknown",
+                  gh.open_prs(loop) is None, True)
+    with (mock.patch.object(gh, "MAX_PR_PAGES", 3),
+          mock.patch.object(gh, "fetch", return_value=(first, "")) as fetch):
+        check("an endless full listing is unknown, not truncated",
+              gh.open_prs(loop) is None, True)
+        check("  and the read is bounded", fetch.call_count, 3)
+
+
 def group_reconciliation() -> None:
     section("seat reconciliation — route, hook and config rollback")
     test = subprocess.run([sys.executable, str(ROOT / "tests" / "test_reconciliation.py")],
@@ -4205,7 +4411,8 @@ GROUPS = {"routes": group_routes, "config": group_config, "reviewer": group_revi
           "plugin_settings": group_plugin_settings, "seat_identity": group_seat_identity,
           "watchdog": group_watchdog, "explain": group_explain,
           "cleanup": group_cleanup, "doctor": group_doctor,
-          "reconciliation": group_reconciliation,
+          "reconciliation": group_reconciliation, "state_race": group_state_race,
+          "open_prs": group_open_prs,
            "observer": group_observer, "observer_safety": group_observer_safety,
            "observer_cli": group_observer_cli}
 
