@@ -72,6 +72,10 @@ class LoopState:
         self.breach = self.dir / "breach.json"
         self.observations = self.dir / "observations.json"
         self.watch_file = self.dir / "watchdog.json"
+        self.transitions_file = self.dir / "stack-transitions.json"
+        # A review's commit_id identifies a head, not the base it reviewed. This ledger
+        # has no webhook writer: an external review event cannot create an association.
+        self.review_situations = self.dir / "review-situations.json"
         self.log = self.dir / "watchdog.log"
 
     # -- raw ----------------------------------------------------------------
@@ -272,6 +276,20 @@ class LoopState:
                     data.pop(seat, None)
                 self._save_queue(data)
 
+    def queue_pop_head(self, seat: str, key: str, head: str) -> bool:
+        """Do not discard a newer head while removing a stale queued request."""
+        with self._queue_lock():
+            data = self._load(self.pending, {}) or {}
+            items = data.get(seat) or {}
+            entry = items.get(key)
+            if not isinstance(entry, dict) or entry.get("head") != head:
+                return False
+            items.pop(key)
+            if not items:
+                data.pop(seat, None)
+            self._save_queue(data)
+            return True
+
     def queue_pop_if(self, seat: str, key: str, expected: dict | None) -> bool:
         """Acknowledge only the entry observed before enqueue, never its replacement."""
         with self._queue_lock():
@@ -311,6 +329,20 @@ class LoopState:
         timestamp, and recomputing the TTL comparison anywhere else would be a second rule.
         """
         return float((self._load(self.inflight_file, {}) or {}).get(key, 0) or 0)
+
+    def quarantine(self, number: int, head: str) -> None:
+        """Erase head-only run and escalation tokens after a base transition."""
+        with self.locked():
+            data = self._load(self.inflight_file, {}) or {}
+            for prefix in (f"review:{number}:{head}", f"fix:{number}:{head}"):
+                data.pop(prefix, None)
+            self._save(self.inflight_file, data)
+        key = f"{self.loop['repo']}#{number}"
+        with self._breach_lock():
+            markers = self._load(self.breach, {}) or {}
+            if key in markers:
+                markers.pop(key)
+                self._breach_save(markers)
 
     # -- breach markers -----------------------------------------------------
 
@@ -424,6 +456,47 @@ class LoopState:
 
     def watch_save(self, data: dict) -> None:
         self._save(self.watch_file, data)
+
+    def transition_get(self, number: int) -> dict:
+        return (self._load(self.transitions_file, {}) or {}).get(str(number)) or {}
+
+    def transition_set(self, number: int, entry: dict) -> dict:
+        """Separate durable ledger: whole-watchdog snapshots cannot erase holds."""
+        self.dir.mkdir(parents=True, exist_ok=True)
+        with (self.dir / "stack-transitions.lock").open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            data = self._load(self.transitions_file, {}) or {}
+            prior = data.get(str(number))
+            if isinstance(prior, dict) and prior.get("head") == entry["head"]:
+                return prior
+            data[str(number)] = entry
+            fd, name = tempfile.mkstemp(dir=self.dir, prefix=".stack-transitions-")
+            try:
+                with os.fdopen(fd, "w") as out:
+                    json.dump(data, out)
+                    out.flush()
+                    os.fsync(out.fileno())
+                os.replace(name, self.transitions_file)
+                directory = os.open(self.dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+            finally:
+                if os.path.exists(name):
+                    os.unlink(name)
+            return entry
+
+    def associated_review(self, number: int, identity: str, review_id: int) -> bool:
+        """No trusted host receipt issuer exists yet: *all* associations are unknown.
+
+        A JSON record's ``source`` string is caller-forgeable, including the former
+        ``trusted-submission-receipt`` label. In particular a reviewer's process can
+        write state under the same HOME; neither file permissions nor a label attest
+        that the gateway dispatched this run. Never authorize stacked readiness from
+        this disk file until an actual host-attested issuer and verifier are integrated.
+        """
+        return False
 
 
 def state_for(loop: dict) -> LoopState:

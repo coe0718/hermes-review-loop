@@ -124,6 +124,44 @@ class EffectiveVerdictTest(unittest.TestCase):
         self.assertIn("fixer never pushed", "\n".join(lines))
         notify.assert_called_once()
 
+    def test_queued_fixer_replays_only_live_latest_rejection(self):
+        st = mock.Mock()
+        st.queue_items.return_value = {"acme/widgets#7": {"head": HEAD, "at": 1}}
+        st.active.return_value = {}
+        st.held_by_other.return_value = None
+        st.watch.return_value = {}
+        newer_approval = APPROVED | {"submitted_at": "2026-01-01T00:02:00Z"}
+        scenarios = (([REJECTED, newer_approval], False, True),
+                     ([newer_approval, REJECTED], False, True),
+                     ([APPROVED, REJECTED], True, True),
+                     ([REJECTED, APPROVED], True, True),
+                     ([REJECTED, newer_approval | {"submitted_at": None}], False, False),
+                     ([REJECTED | {"state": "DISMISSED"}], False, False))
+        for reviews, should_fire, should_pop in scenarios:
+            with self.subTest(reviews=reviews):
+                st.reset_mock()
+                entry = {"head": HEAD, "at": 1}
+                # The gate acknowledges a fired entry by removing it; drain reads that back.
+                st.queue_items.side_effect = [{"acme/widgets#7": entry}, {}]
+                st.active.return_value = {}
+                st.held_by_other.return_value = None
+                st.watch.return_value = {}
+                with (mock.patch.object(watchdog.config, "seat_concurrency", return_value=1),
+                      mock.patch.object(gh, "pr", return_value=PR),
+                      mock.patch.object(gh, "reviews", return_value=reviews),
+                      mock.patch.object(watchdog.routes, "fire", return_value=True) as fire):
+                    started = watchdog.drain(LOOP, st, "fixer", quiet=True)
+                self.assertEqual(started, int(should_fire))
+                if should_fire:
+                    self.assertEqual(fire.call_args.args[2]["review"]["id"], REJECTED["id"])
+                else:
+                    fire.assert_not_called()
+                # A superseded entry is dropped by drain; a fired one only by the gate that took it.
+                if should_pop and not should_fire:
+                    st.queue_pop_if.assert_called_once_with("fixer", "acme/widgets#7", entry)
+                else:
+                    st.queue_pop_if.assert_not_called()
+
     def test_first_armed_sweep_retries_and_flushes_without_stall(self):
         st = mock.Mock()
         st.watch.return_value = {}

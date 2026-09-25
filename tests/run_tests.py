@@ -785,6 +785,33 @@ def group_fixer_gate() -> None:
     check("same head twice → second is silent",
           run("gate_fixer.py", review_payload(rid=5))[0], "SILENT")
 
+    # Trunk moving on does not supersede a verdict on a direct-trunk PR: the webhook's base
+    # snapshot differs from the live base only because main advanced.
+    reset(prs={"7": {**pr(7), "base": {"ref": "main", "sha": HEAD_B},
+                        "reviews": [review(REVIEWER, rid=5)]}})
+    state_file("locks.json").write_text(json.dumps({"reviewer": {
+        f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "why": "review"}}}))
+    moved = review_payload(rid=5)
+    moved["pull_request"]["base"] = {"ref": "main", "sha": HEAD_A}
+    check_eligible("verdict after trunk advanced still starts the fixer", "gate_fixer.py",
+                   moved, "fixer")
+    reset(prs={"7": {**pr(7), "base": {"ref": "main", "sha": HEAD_B},
+                        "reviews": [review(REVIEWER, state="approved", rid=5)]}})
+    state_file("locks.json").write_text(json.dumps({"reviewer": {
+        f"{REPO}#7": {"at": time.time(), "head": HEAD_A, "why": "review"}}}))
+    moved["review"]["state"] = "approved"
+    before = len(RECEIVED)
+    check("approval after trunk advanced is silent", run("gate_fixer.py", moved)[0], "SILENT")
+    check("  and still frees the claim for its head", "reviewer" in load_state("locks.json"), False)
+    check("  and produces no gateway wake", [r for r in RECEIVED[before:]
+          if r["path"].endswith("/webhooks/widgets-review")], [])
+
+    reset(prs={"7": {**pr(7, base="parent"), "reviews": [review(REVIEWER, rid=5)]}})
+    old = review_payload(rid=5)
+    before = len(RECEIVED)
+    check("retargeted stacked PR refuses old fixer wake", run("gate_fixer.py", old)[0], "SILENT")
+    check("retargeted stacked PR produces no POST", len(RECEIVED), before)
+
     # The payload's head is a snapshot: the live PR is what authorizes a fix run.
     reset(prs={"7": {**pr(7, head=HEAD_B), "reviews": [review(REVIEWER, rid=5)]}})
     check("live PR moved past the verdict's head → silent",
@@ -1914,6 +1941,43 @@ def group_watchdog() -> None:
     check("  fixer hold remains until gate acknowledgement",
           f"{REPO}#7" in load_state("pending.json").get("fixer", {}), True)
 
+    # A complete fake GitHub listing and individual read agree: a known stacked
+    # child became draft while retargeting main at the SAME head. This is not a
+    # new reviewer/fixer authorization, even when stale tokens survived on disk.
+    parent = {**pr(7, head=HEAD_B), "head": {"ref": "parent", "sha": HEAD_B},
+              "base": {"ref": "main", "sha": HEAD_A}}
+    child = {**pr(9, head=HEAD_A, base="parent"),
+             "base": {"ref": "parent", "sha": HEAD_B},
+             "reviews": [review(REVIEWER, head=HEAD_A, rid=71)]}
+    reset(prs={"7": parent, "9": child})
+    run("watchdog.py", None, "--loop", "widgets", extra_env={"REVIEW_LOOP_TEST": ""})
+    stacked = load_state("watchdog.json").get("stacked_wait", {}).get("9")
+    check("stacked child observed before draft retarget", stacked.get("head") if stacked else None, HEAD_A)
+    key = f"{REPO}#9"
+    state_file("pending.json").write_text(json.dumps({seat: {key: {
+        "at": time.time(), "head": HEAD_A, "url": "u", "reason": "stacked"}}
+        for seat in ("reviewer", "fixer")}))
+    state_file("inflight.json").write_text(json.dumps({
+        f"review:9:{HEAD_A}": time.time(), f"fix:9:{HEAD_A}": time.time()}))
+    state_file("breach.json").write_text(json.dumps({key: {
+        "head": HEAD_A, "status": "delivery-pending"}}))
+    child["draft"] = True
+    child["base"] = {"ref": "main", "sha": HEAD_A}
+    set_prs({"7": parent, "9": child})
+    before = len(RECEIVED)
+    run("watchdog.py", None, "--loop", "widgets", extra_env={"REVIEW_LOOP_TEST": ""})
+    check("draft retarget records same-head hold", load_state("stack-transitions.json").get("9", {}).get("head"), HEAD_A)
+    check("draft retarget clears stacked wait", "9" in load_state("watchdog.json").get("stacked_wait", {}), False)
+    check("draft retarget drops both stale seat requests", load_state("pending.json"), {})
+    check("draft retarget clears in-flight tokens", load_state("inflight.json"), {})
+    check("draft retarget clears escalation marker", load_state("breach.json"), {})
+    check("draft retarget never starts an agent", len(RECEIVED) - before, 0)
+    child["draft"] = False
+    set_prs({"7": parent, "9": child})
+    run("watchdog.py", None, "--loop", "widgets", extra_env={"REVIEW_LOOP_TEST": ""})
+    check("ready transition keeps same-head hold", load_state("stack-transitions.json").get("9", {}).get("head"), HEAD_A)
+    check("ready transition does not wake stale work", len(RECEIVED) - before, 0)
+
     # shape 1: the reviewer never posted a verdict
     reset(prs={"7": pr(7, head=HEAD_A)})
     state_file("watchdog.json").parent.mkdir(parents=True, exist_ok=True)
@@ -2524,7 +2588,14 @@ def group_explain() -> None:
           any("hook state unreadable" in text for text in decide(armed=None)["blockers"]), True)
     check("paused → re-arm", decide(armed=False)["next"]["kind"], "rearm")
     check("a draft → ready_for_review", decide(pr=pr(7, draft=True))["next"]["kind"], "ready")
-    check("a wrong base → nothing", decide(pr=pr(7, base="release"))["next"]["kind"], "none")
+    check("unverified stacked base → retry, not a run", decide(pr=pr(7, base="release"))["next"]["kind"], "retry")
+    from review_loop import situation
+    verified_stack = situation.Resolution("waiting", "waiting on #6",
+        situation.Identity(HEAD_A, "release", HEAD_B, ((6, "release", HEAD_B, HEAD_A),)), (6,))
+    stacked_kind = decide(pr=pr(7, base="release"), chain=verified_stack,
+                          parent_readiness=(False, "approval unassociated"))["next"]["kind"]
+    check("verified stacked branch waits", stacked_kind, "wait")
+    check("stacked wait is a declared explain kind", stacked_kind in gate.EXPLAIN_KINDS, True)
     check("someone else's PR → nothing", decide(pr=pr(7, author="outsider"))["next"]["kind"], "none")
     check("approved at the head → nothing",
           decide(reviews=[review(REVIEWER, state="approved")])["next"]["kind"], "none")
@@ -4401,6 +4472,16 @@ def group_reconciliation() -> None:
     if test.returncode:
         print(test.stdout + test.stderr)
     check("route and hook reconciliation regression suite", test.returncode, 0)
+
+
+def group_situation_authorization() -> None:
+    section("stacked situation authorization — read-only fail closed")
+    test = subprocess.run([sys.executable, "-m", "unittest",
+                           "tests.test_situation_authorization"],
+                          cwd=ROOT, capture_output=True, text=True)
+    if test.returncode:
+        print(test.stdout + test.stderr)
+    check("generation-bound parent approval fail-closed suite", test.returncode, 0)
 
 
 GROUPS = {"routes": group_routes, "config": group_config, "reviewer": group_reviewer_gate, "budget": group_budget,

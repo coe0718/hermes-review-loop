@@ -1,0 +1,177 @@
+"""Resolve the *diff* a review is about, not merely its child commit.
+
+An unresolved base is never interpreted as trunk. The returned identity is useful for
+persisting verdict associations, but a caller must still enforce parent readiness and
+re-read the situation immediately before any side effect.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+import hashlib
+import json
+import re
+from urllib.parse import quote
+
+from . import gh
+
+SHA = re.compile(r"[0-9a-fA-F]{40}\Z")
+MAX_PARENT_DEPTH = 20
+
+
+@dataclass(frozen=True)
+class Identity:
+    head_sha: str
+    base_ref: str
+    base_sha: str
+    parents: tuple[tuple[int, str, str, str], ...]
+
+    @property
+    def key(self) -> str:
+        fields = [self.head_sha, self.base_ref, self.base_sha, self.parents]
+        return hashlib.sha256(json.dumps(fields, separators=(",", ":")).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class Resolution:
+    status: str  # eligible, waiting, blocked
+    reason: str
+    identity: Identity | None = None
+    parents: tuple[int, ...] = ()
+
+
+def _repo(part: dict) -> str:
+    return ((part.get("repo") or {}).get("full_name") or "") if isinstance(part, dict) else ""
+
+
+def _fields(pr: dict, repo: str) -> tuple[str, str, str, str] | None:
+    head, base = pr.get("head") or {}, pr.get("base") or {}
+    if (not isinstance(head, dict) or not isinstance(base, dict)
+            or _repo(head) != repo or _repo(base) != repo):
+        return None
+    branch, head_sha = head.get("ref"), head.get("sha")
+    base_ref, base_sha = base.get("ref"), base.get("sha")
+    if (not isinstance(branch, str) or not branch or not isinstance(base_ref, str)
+            or not base_ref or not isinstance(head_sha, str) or not SHA.fullmatch(head_sha)
+            or not isinstance(base_sha, str) or not SHA.fullmatch(base_sha)):
+        return None
+    return branch, head_sha.lower(), base_ref, base_sha.lower()
+
+
+def _verify_trunk(loop: dict, base_ref: str, base_sha: str) -> Resolution | None:
+    """Require a readable live trunk commit ref.
+
+    A PR's ``base.sha`` is not compared with the trunk tip: trunk moving on does not change
+    what a direct-trunk PR or a stack rooted on trunk is waiting for, and requiring equality
+    would block every stack in an active repository after any merge.
+    """
+    path = f"/repos/{loop['repo']}/git/ref/heads/{quote(base_ref, safe='/')}"
+    live_ref, error = gh.fetch(loop, path)
+    if error or not isinstance(live_ref, dict):
+        return Resolution("blocked", f"trunk ref unreadable: {error or 'invalid response'}")
+    obj = live_ref.get("object")
+    live_sha = obj.get("sha") if isinstance(obj, dict) else None
+    if (live_ref.get("ref") != f"refs/heads/{base_ref}" or
+            not isinstance(obj, dict) or obj.get("type") != "commit" or
+            not isinstance(live_sha, str) or not SHA.fullmatch(live_sha)):
+        return Resolution("blocked", "trunk ref response unverified")
+    return None
+
+
+def resolve(loop: dict, number: int, *, listing: list[dict] | None = None) -> Resolution:
+    """Read child and bounded open-parent listing; ambiguity or inconsistent SHA blocks."""
+    repo = loop["repo"]
+    child = gh.pr(loop, number)
+    if (not isinstance(child, dict) or child.get("number") != number
+            or child.get("state") != "open"):
+        return Resolution("blocked", "child PR unavailable or not open")
+    child_fields = _fields(child, repo)
+    if child_fields is None:
+        return Resolution("blocked", "child base/head SHA or repository unverified")
+    _, child_sha, base_ref, base_sha = child_fields
+    if base_ref == loop["base"]:
+        invalid = _verify_trunk(loop, base_ref, base_sha)
+        if invalid is not None:
+            return invalid
+        return Resolution("eligible", "direct trunk base",
+                          Identity(child_sha, base_ref, base_sha, ()))
+
+    if listing is None:
+        listing, error = gh.open_prs_read(loop)
+    else:
+        error = ""
+    if error or listing is None:
+        return Resolution("blocked", f"parent list unreadable: {error or 'unknown response'}")
+    seen = {number}
+    chain: list[tuple[int, str, str, str]] = []
+    current_ref, current_sha = base_ref, base_sha
+    for _ in range(MAX_PARENT_DEPTH):
+        matches = [p for p in listing if isinstance(p.get("head"), dict)
+                   and p["head"].get("ref") == current_ref]
+        if not matches:
+            return Resolution("blocked", f"missing open parent for branch {current_ref}")
+        if len(matches) != 1:
+            return Resolution("blocked", f"ambiguous parent branch {current_ref}")
+        parent = matches[0]
+        parent_number = parent.get("number")
+        if not isinstance(parent_number, int) or parent_number <= 0:
+            return Resolution("blocked", "parent number unverified")
+        if parent_number in seen:
+            return Resolution("blocked", f"cycle at parent #{parent_number}")
+        live_parent = gh.pr(loop, parent_number)
+        if (not isinstance(live_parent, dict) or live_parent.get("number") != parent_number
+                or live_parent.get("state") != "open"):
+            return Resolution("blocked", f"parent #{parent_number} unreadable or closed")
+        fields = _fields(live_parent, repo)
+        if fields is None:
+            return Resolution("blocked", f"foreign or unverified parent #{parent_number}")
+        branch, head_sha, next_ref, next_sha = fields
+        if branch != current_ref or _fields(parent, repo) != fields:
+            return Resolution("blocked", f"parent #{parent_number} changed during resolution")
+        if head_sha != current_sha:
+            return Resolution("blocked", f"parent #{parent_number} advanced beyond child base SHA")
+        seen.add(parent_number)
+        chain.append((parent_number, branch, head_sha, next_sha))
+        if next_ref == loop["base"]:
+            invalid = _verify_trunk(loop, next_ref, next_sha)
+            if invalid is not None:
+                return invalid
+            return Resolution("waiting", f"waiting on #{chain[0][0]}",
+                              Identity(child_sha, base_ref, base_sha, tuple(chain)),
+                              tuple(item[0] for item in chain))
+        current_ref, current_sha = next_ref, next_sha
+    return Resolution("blocked", f"parent chain exceeds {MAX_PARENT_DEPTH} levels")
+
+
+def parent_readiness(loop: dict, st, number: int, expected: Resolution) -> tuple[bool, str]:
+    """A child may proceed only with current, associated approvals on every parent.
+
+    A delivered webhook, matching head SHA, or a bare APPROVED REST review never
+    establishes which diff was approved. Re-resolve both the child and every parent;
+    any changed generation, missing receipt, dismissed verdict, or failed read parks it.
+    The current state reader rejects even a disk record labeled as a trusted receipt:
+    no host-attested reviewer submission writer/verifier exists yet.
+    """
+    if expected.status != "waiting" or expected.identity is None or not expected.parents:
+        return False, "no verified stacked child situation"
+    current = resolve(loop, number)
+    if (current.status != "waiting" or current.identity != expected.identity
+            or current.parents != expected.parents):
+        return False, "child/parent generation changed or cannot be re-read"
+    from . import gate  # avoid module import cycle; gate imports situation
+    for parent_number in expected.parents:
+        parent = resolve(loop, parent_number)
+        if parent.status not in {"eligible", "waiting"} or parent.identity is None:
+            return False, f"parent #{parent_number} situation unverified"
+        reviews, error = gh.reviews_read(loop, parent_number)
+        if error or not isinstance(reviews, list):
+            return False, f"parent #{parent_number} reviews unreadable"
+        latest = gate.latest_effective_review_at_head(reviews, loop, parent.identity.head_sha)
+        if (latest is None or gh.review_state(latest) != "APPROVED"
+                or type(latest.get("id")) is not int
+                or not st.associated_review(parent_number, parent.identity.key, latest["id"])):
+            return False, f"parent #{parent_number} approval unassociated or not current"
+    # A parent can advance during the approval reads; prove the original chain again.
+    final = resolve(loop, number)
+    if final.status != "waiting" or final.identity != expected.identity:
+        return False, "parent chain changed during approval reads"
+    return True, "all parents have current associated approvals"

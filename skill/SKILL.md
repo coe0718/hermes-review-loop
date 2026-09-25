@@ -31,8 +31,11 @@ directory is yours: still keep everything inside it and out of the repository.
    tests it touches, reproduce what it says it fixed. A claim you did not check is not a finding,
    it is a rumor. Never work in the shared clone named in `isolation.shared`: another seat may be
    using it right now.
-3. Post a verdict on the PR. For each finding: severity, evidence (the command and what it
-   printed), and `file:line`. Findings without evidence get argued about instead of fixed.
+3. For a direct trunk PR, post a verdict on the PR. For each finding: severity, evidence
+   (the command and what it printed), and `file:line`. Findings without evidence get
+   argued about instead of fixed. For a stacked PR, do **not** use direct gh/manual
+   REST: no trusted run-bound submission CLI exists, so it cannot produce an associated
+   receipt. Escalate and leave the stacked handoff parked.
 4. If the head moved while you worked, say which sha you actually reviewed.
 5. Finish with a 3-5 line summary in your channel: verdict, what you verified, what you did not.
 

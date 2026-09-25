@@ -150,5 +150,47 @@ class NotificationFreshnessTest(unittest.TestCase):
                 self.assertNotEqual(notify.call_args.kwargs["next_turn"], "you merge")
 
 
+    def test_delayed_rejection_after_approval_never_releases_or_starts_fix(self):
+        rejection = {"id": 42, "state": "changes_requested", "commit_id": HEAD_A,
+                     "user": {"login": "reviewer"}, "submitted_at": "2026-01-01T00:00:00Z"}
+        approval = rejection | {"id": 43, "state": "APPROVED",
+                                "submitted_at": "2026-01-01T00:01:00Z"}
+        payload = {"action": "submitted", "number": 7, "pull_request": pr(), "review": rejection}
+        for reviews in ([rejection, approval], [approval, rejection],
+                        [rejection | {"state": "DISMISSED"}],
+                        [rejection, approval | {"submitted_at": None}], None):
+            with self.subTest(reviews=reviews):
+                self.state.reset_mock()
+                with (mock.patch.object(gate_fixer.gate, "take_seat") as take,
+                      mock.patch.object(gate_fixer.gate, "breach") as breach):
+                    _, _, drain, notify = self.invoke(gate_fixer, payload, pr(), reviews)
+                self.state.release_if.assert_not_called()
+                drain.assert_not_called()
+                notify.assert_not_called()
+                take.assert_not_called()
+                breach.assert_not_called()
+
+    def test_live_rejection_keeps_direct_trunk_cap_path(self):
+        rejection = {"id": 42, "state": "changes_requested", "commit_id": HEAD_A,
+                     "user": {"login": "reviewer"}, "submitted_at": "2026-01-01T00:01:00Z"}
+        older = rejection | {"id": 41, "submitted_at": "2026-01-01T00:00:00Z"}
+        payload = {"action": "submitted", "number": 7, "pull_request": pr(), "review": rejection}
+        self.loop["cap"] = 2
+        self.state.inflight.return_value = False
+        with (mock.patch.object(gate_fixer.sys, "stdin", io.StringIO(json.dumps(payload))),
+              mock.patch.object(gate_fixer.gate, "context", return_value=(self.loop, self.state)),
+              mock.patch.object(gate_fixer.gh, "pr", return_value=pr()),
+              mock.patch.object(gate_fixer.gh, "reviews", return_value=[rejection, older]),
+              mock.patch.object(gate_fixer.gate, "drain_seat"),
+              mock.patch.object(gate_fixer.gate, "breach") as breach,
+              mock.patch.object(gate_fixer.gate, "take_seat") as take,
+              mock.patch.object(gate_fixer.observer, "notify"),
+              contextlib.redirect_stdout(io.StringIO())):
+            with self.assertRaises(SystemExit):
+                gate_fixer.main()
+        breach.assert_called_once()
+        take.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

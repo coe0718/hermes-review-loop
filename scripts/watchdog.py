@@ -27,6 +27,7 @@ never spend a run, and a watchdog that cries wolf on a deliberate pause gets ign
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -36,7 +37,7 @@ import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from review_loop import config, gate, gh, observer, routes, state as state_mod  # noqa: E402
+from review_loop import config, gate, gh, observer, routes, situation, transition, state as state_mod  # noqa: E402
 from review_loop.util import age_min, epoch, log, now_iso  # noqa: E402
 
 TEST = bool(os.environ.get("REVIEW_LOOP_TEST"))
@@ -112,6 +113,17 @@ def drain(loop: dict, st: state_mod.LoopState, seat: str, quiet: bool = False) -
             log(f"drain: PR #{number} moved since queued — stale head dropped")
             continue
         base = (pr.get("base") or {}).get("ref") or ""
+        stacked = (st.watch().get("stacked_wait") or {}).get(str(number))
+        if isinstance(stacked, dict) and stacked.get("base") != base:
+            if base == loop["base"]:
+                transition.record(loop, st, number, head, base)
+            st.queue_pop_head(seat, key, stacked.get("head"))
+            log(f"drain: PR #{number} retargeted since stacked observation — stale request dropped")
+            continue
+        if transition.hold(st, number, head):
+            st.queue_pop_head(seat, key, head)
+            log(f"drain: PR #{number} same-head retarget is quarantined — dropped")
+            continue
         author = ((pr.get("user") or {}).get("login") or "").lower()
         if pr.get("draft") or base != loop["base"] or author not in set(loop["fixers"]):
             st.queue_pop_if(seat, key, entry)
@@ -127,6 +139,7 @@ def drain(loop: dict, st: state_mod.LoopState, seat: str, quiet: bool = False) -
                  "title": pr.get("title", ""), "html_url": pr.get("html_url", "")}
 
         if seat == "fixer":
+            # Unknown chronology is not proof that the queued verdict was superseded.
             # Any changes-requested at this head is not enough: a later approval (or an
             # undatable verdict) at the same head means there is no fix to order.
             latest = gate.latest_effective_review_at_head(reviews, loop, head)
@@ -190,6 +203,98 @@ def drain_queued(loop: dict, st: state_mod.LoopState, lines: list[str]) -> None:
             lines.append(f"started the queued {seat} run whose wait was over")
 
 
+def reconcile_stacked(loop: dict, st: state_mod.LoopState, watch: dict,
+                      prs: list[dict], lines: list[str]) -> None:
+    """Separate visibility queue; never a seat authorization or drain input."""
+    previous = watch.get("stacked_wait")
+    pending = dict(previous) if isinstance(previous, dict) else {}
+    listed = set()
+    for pr in prs:
+        if not isinstance(pr, dict) or pr.get("state") != "open":
+            continue
+        number = pr.get("number")
+        if type(number) is not int or number <= 0:
+            continue
+        key = str(number)
+        base = (pr.get("base") or {}).get("ref")
+        prior_head = (watch.get("heads") or {}).get(key)
+        # A draft-only sweep can have removed the visibility entry while retaining
+        # its stacked head observation. Restore that boundary before reconciling.
+        if (base == loop["base"] and key not in pending and isinstance(prior_head, dict)
+                and prior_head.get("base") not in (None, loop["base"])):
+            pending[key] = {"head": prior_head.get("sha"), "base": prior_head["base"]}
+        # Drafts are not scheduling candidates, but an observed stacked child
+        # can be retargeted while draft. Quarantine before skipping draft work.
+        if pr.get("draft") and not (key in pending and base == loop["base"]):
+            continue
+        listed.add(key)
+        if (not base or base == loop["base"] or
+                ((pr.get("user") or {}).get("login") or "").lower() not in loop["fixers"]):
+            if key in pending:
+                if base == loop["base"]:
+                    live = gh.pr(loop, number)
+                    if (not isinstance(live, dict) or live.get("number") != number
+                            or live.get("state") != "open" or
+                            (live.get("head") or {}).get("sha") != (pr.get("head") or {}).get("sha") or
+                            (live.get("base") or {}).get("ref") != base or
+                            (live.get("base") or {}).get("sha") != (pr.get("base") or {}).get("sha")):
+                        continue
+                    entry = transition.record(loop, st, number, (pr.get("head") or {}).get("sha"),
+                                              base, watch=watch)
+                    if entry:
+                        lines.append(f"#{number} retargeted to {base} at the same head — old "
+                                     "reviews and queued work quarantined; new head or fresh "
+                                     "explicit human review required; no automatic wake")
+                        observer.notify(loop, st, "stall", number, entry["head"],
+                                        identity=f"retarget:{entry['head']}",
+                                        outcome="old same-head reviews quarantined", next_turn="you")
+                # A retarget is not permission to reinterpret a previous seat request
+                # for the same child SHA as a trunk request.
+                for seat in ("reviewer", "fixer"):
+                    st.queue_pop_head(seat, f"{loop['repo']}#{number}", pending[key].get("head"))
+                pending.pop(key)
+            continue
+        resolution = situation.resolve(loop, number, listing=prs)
+        head = (pr.get("head") or {}).get("sha")
+        base_sha = (pr.get("base") or {}).get("sha")
+        if (resolution.status == "eligible" or
+                resolution.identity and (resolution.identity.head_sha != head or
+                                         resolution.identity.base_ref != base or
+                                         resolution.identity.base_sha != base_sha)):
+            # Individual read disagrees with the listing; retry next sweep.
+            continue
+        branch_heads = []
+        ref, visited = base, set()
+        for _ in range(situation.MAX_PARENT_DEPTH):
+            if ref in visited or ref == loop["base"]:
+                break
+            visited.add(ref)
+            matches = [p for p in prs if isinstance(p, dict) and
+                       isinstance(p.get("head"), dict) and p["head"].get("ref") == ref]
+            branch_heads.append(sorted(
+                [(p.get("number"), p["head"].get("sha"),
+                  (p.get("base") or {}).get("ref"), (p.get("base") or {}).get("sha"),
+                  p.get("state")) for p in matches], key=lambda item: str(item)))
+            if len(matches) != 1:
+                break
+            ref = (matches[0].get("base") or {}).get("ref")
+        generation = hashlib.sha256(json.dumps(
+            [head, base, base_sha, branch_heads, resolution.status, resolution.reason,
+             resolution.identity.key if resolution.identity else ""],
+            separators=(",", ":")).encode()).hexdigest()
+        if (pending.get(key) or {}).get("generation") == generation:
+            continue
+        pending[key] = {"head": head, "base": base, "base_sha": base_sha,
+                        "generation": generation, "status": resolution.status,
+                        "reason": resolution.reason, "parents": list(resolution.parents),
+                        "identity": resolution.identity.key if resolution.identity else "",
+                        "at": time.time()}
+        lines.append(f"#{number} stacked {resolution.status}: {resolution.reason} "
+                     "— visibility queue only; no reviewer run authorized")
+        observer.notify(loop, st, "stall", number, head or "", identity=f"stacked:{generation}",
+                        outcome=f"stacked {resolution.status}: {resolution.reason}", next_turn="you")
+    watch["stacked_wait"] = {k: v for k, v in pending.items() if k in listed}
+
 def retry_pending_breaches(loop: dict, st: state_mod.LoopState, prs: list) -> None:
     """Retry listed eligible heads only after reviews verify the cap.
 
@@ -208,6 +313,8 @@ def retry_pending_breaches(loop: dict, st: state_mod.LoopState, prs: list) -> No
         head = (pr.get("head") or {}).get("sha")
         if type(number) is not int or not head:
             continue
+        if transition.hold(st, number, head):
+            continue  # same-head retarget cannot retry old cap authorization
         marker = markers.get(f"{loop['repo']}#{number}")
         if (not isinstance(marker, dict) or gate.breach_delivery_status(marker, head) != "delivery-pending"
                 or marker.get("head") != head):
@@ -239,6 +346,8 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
         lines.append(f"⚠️ {loop['id']}: could not list open PRs — stall scan and queue drain skipped this run")
         return lines
 
+    reconcile_stacked(loop, st, watch, prs, lines)
+
     # A commit's authored/committed date says nothing about when its SHA reached a PR.
     # Snapshot the heads on the first *successful* armed sweep, before any stall evaluation.
     # Those heads are history; later SHA changes get their own durable observation clock.
@@ -251,6 +360,12 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
     heads = {} if first_sweep else watch.get("heads")
     if not isinstance(heads, dict):
         heads = {}
+    history = watch.get("head_history")
+    watch["head_history"] = ({k: v for k, v in history.items()
+                              if isinstance(v, dict) and
+                              (clock := valid_clock(v.get("last_seen_at"), now)) is not None and
+                              now - clock < HEAD_RETENTION_SEC}
+                             if isinstance(history, dict) else {})
     current_heads: dict[str, dict] = {}
     for key, previous in heads.items():
         if not isinstance(previous, dict) or not previous.get("sha"):
@@ -260,6 +375,8 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
         last_seen = valid_clock(previous.get("last_seen_at"), now) or now
         if now - last_seen < HEAD_RETENTION_SEC:
             current_heads[key] = {"sha": previous["sha"],
+                                  "base": previous.get("base"),
+                                  "base_sha": previous.get("base_sha"),
                                   "observed_at": valid_clock(previous.get("observed_at"), now),
                                   "last_seen_at": last_seen}
     for pr in prs:
@@ -268,21 +385,28 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
         author = ((pr.get("user") or {}).get("login") or "").lower()
         if author not in set(loop["fixers"]) or pr.get("draft"):
             continue
-        if (pr.get("base") or {}).get("ref") != loop["base"]:
-            continue
         number = pr.get("number")
         head = (pr.get("head") or {}).get("sha") or ""
         if not number or not head:
             continue
         key = str(number)
         previous = current_heads.get(key, {})
-        if previous.get("sha") == head:
-            current_heads[key] = {**previous, "last_seen_at": now}
+        base = (pr.get("base") or {}).get("ref")
+        base_sha = (pr.get("base") or {}).get("sha")
+        # For a direct-trunk PR, trunk moving on is not a new situation: only its own head or
+        # base ref restarts the stall clock. A stacked base's generation does.
+        if (previous.get("sha") == head and previous.get("base") in (None, base)
+                and (base == loop["base"] or previous.get("base_sha") in (None, base_sha))):
+            current_heads[key] = {**previous, "base": base, "base_sha": base_sha,
+                                  "last_seen_at": now}
         else:
+            if previous:
+                history = watch.setdefault("head_history", {})
+                history[f"{key}:{previous.get('sha')}:{previous.get('base', '')}:{previous.get('base_sha', '')}"] = previous
             # A first-seen old PR could be preexisting; created_at only establishes
             # eligibility for genuinely new PRs, never the time of a later push.
             new_pr = epoch(pr.get("created_at")) >= int(watch["armed_since"])
-            current_heads[key] = {"sha": head, "observed_at":
+            current_heads[key] = {"sha": head, "base": base, "base_sha": base_sha, "observed_at":
                                   now if previous or (not first_sweep and new_pr) else None,
                                   "last_seen_at": now}
     watch["heads"] = current_heads
@@ -316,6 +440,8 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
         if not number or not head:
             continue
 
+        if transition.hold(st, number, head):
+            continue  # no old verdict may count as a current direct-trunk stall
         reviews = gh.reviews(loop, number)
         if not isinstance(reviews, list):
             continue                              # unknown beats wrong

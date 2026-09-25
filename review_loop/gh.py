@@ -191,16 +191,21 @@ def reviews(loop: dict, number: int):
     return result
 
 
+def open_prs_read(loop: dict) -> tuple[list[dict] | None, str]:
+    """Complete bounded listing: a full last page cannot authorize a partial chain."""
+    path = f"/repos/{loop['repo']}/pulls?state=open&per_page=100"
+    return _read_pages(loop, path, "open PR", MAX_PR_PAGES)
+
+
 def open_prs(loop: dict):
     """Every open PR, or ``None`` (unknown) when any page could not be read.
 
     The watchdog treats this as its scheduling view; a repository with more than 100 open PRs
     read as "the first 100" would silently never scan or drain the rest.
     """
-    path = f"/repos/{loop['repo']}/pulls?state=open&per_page=100"
-    result, error = _read_pages(loop, path, "open PR", MAX_PR_PAGES)
+    result, error = open_prs_read(loop)
     if error:
-        log(f"gh GET {path} failed: {error}")
+        log(f"gh open PR list failed: {error}")
     return result
 
 

@@ -38,8 +38,11 @@ What to do:
    answer what you are about to ask.
 2. Verify the claims yourself in your own clone: build it, run the tests it touches, reproduce the
    bug it says it fixed. A claim you did not check is not a finding, it is a rumor.
-3. Post the review on the PR: a verdict, and for every finding the severity, the evidence
-   (command plus observed output) and the `file:line` it lives at.
+3. For a direct trunk PR, post the review on the PR: a verdict, and for every finding the
+   severity, evidence (command plus observed output) and the `file:line` it lives at.
+   A stacked PR needs a trusted, run-bound submission CLI, which is not installed yet:
+   **do not post a stacked verdict via direct gh/manual REST or claim it unblocks the stack.**
+   Stop and escalate the missing submission path instead.
 4. If the head moved while you worked, say which sha you actually reviewed.
 5. Finish with a 3-5 line summary in your own channel: verdict, what you verified, what you did
    not verify.

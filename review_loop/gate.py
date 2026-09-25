@@ -32,7 +32,7 @@ import sys
 import time
 import urllib.request
 
-from . import config, gh, isolation, observer, routes, state as state_mod
+from . import config, gh, isolation, observer, routes, situation, transition, state as state_mod
 from .util import iso_at, log, now_iso, silence
 
 
@@ -277,7 +277,7 @@ def hooks_armed(loop: dict) -> bool:
 # The vocabulary of ``next.kind``. The suite asserts every conclusion is one of these, so a new
 # branch cannot quietly invent a kind nobody is checking for.
 EXPLAIN_KINDS = ("review-verdict", "review-request", "fixer-retry", "fixer-push", "release", "adjudication",
-                 "rearm", "ready", "retry", "none")
+                 "rearm", "ready", "retry", "wait", "none")
 
 
 def _mark_time(entry: dict | None, fallback: float) -> float:
@@ -416,8 +416,19 @@ def explain_facts(loop: dict, number: int) -> dict:
         pr_error = ""  # GitHub hides inaccessible resources behind 404 as well.
     reviews, reviews_error = gh.reviews_read(loop, number)
     armed, armed_error = hooks_read(loop)
+    base = (pr.get("base") or {}).get("ref") if isinstance(pr, dict) else None
+    chain = situation.resolve(loop, number) if base and base != loop["base"] else None
+    if isinstance(chain, situation.Resolution) and chain.identity and isinstance(pr, dict):
+        if (chain.identity.head_sha != (pr.get("head") or {}).get("sha") or
+                chain.identity.base_ref != base or
+                chain.identity.base_sha != (pr.get("base") or {}).get("sha")):
+            chain = situation.Resolution("blocked", "PR changed during chain read; retry")
+    readiness = (situation.parent_readiness(loop, state_mod.state_for(loop), number, chain)
+                 if isinstance(chain, situation.Resolution) and chain.status == "waiting"
+                 else (False, "parent chain unverified"))
     return {"pr": pr, "pr_error": pr_error, "reviews": reviews, "reviews_error": reviews_error,
-            "armed": armed, "armed_error": armed_error, "read_at": time.time()}
+            "armed": armed, "armed_error": armed_error, "read_at": time.time(),
+            "chain": chain, "parent_readiness": readiness}
 
 
 def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> dict:
@@ -444,6 +455,13 @@ def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> di
     head = raw_head if isinstance(raw_head, str) else ""
     short = head[:7] if head else "?"
     base = str(((pr or {}).get("base") or {}).get("ref") or "")
+    chain = facts.get("chain")
+    stacked = bool(base and base != loop["base"])
+    chain_reason = (chain.reason if isinstance(chain, situation.Resolution) else
+                    "parent chain not verified")
+    if stacked and isinstance(facts.get("parent_readiness"), tuple):
+        chain_reason += f"; parent approval: {facts['parent_readiness'][1]}"
+    chain_parents = (chain.parents if isinstance(chain, situation.Resolution) else ())
     author = str(((pr or {}).get("user") or {}).get("login") or "").lower()
     state = ("unknown" if pr is None
              else "merged" if (pr.get("merged") or pr.get("merged_at"))
@@ -461,7 +479,11 @@ def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> di
     approved = False
     reviewed = False
     changes: list[dict] = []
+    boundary = transition.hold(st, number, head) if head and not stacked else None
     if reviews is not None:
+        # A post-retarget review list is diagnostic, not an authorization: its
+        # commit_id cannot prove the base generation or a dispatched run.
+        reviews = [] if boundary else reviews
         spent = len(verdicts(reviews, loop))
         if head:
             latest = latest_effective_review_at_head(reviews, loop, head)
@@ -495,6 +517,18 @@ def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> di
 
     # -- local state: who holds it, what waits, what is marked -------------------------------
     local = _explain_state(loop, st, key, number, head, now)
+    pending_stack = (st.watch().get("stacked_wait") or {}).get(str(number))
+    if stacked and isinstance(pending_stack, dict):
+        if (pending_stack.get("head") == head and pending_stack.get("base") == base and
+                pending_stack.get("base_sha") == ((pr or {}).get("base") or {}).get("sha") and
+                (not isinstance(chain, situation.Resolution) or
+                 (pending_stack.get("status") == chain.status and
+                  pending_stack.get("reason") == chain.reason and
+                  (not chain.identity or pending_stack.get("identity") == chain.identity.key)))):
+            stacked_line = (f"stacked visibility queue: {pending_stack.get('status')} — "
+                            f"{pending_stack.get('reason')} (no seat run authorized)")
+            local["queue"] = (stacked_line if local["queue"] == "not queued" else
+                              local["queue"] + " · " + stacked_line)
     held = local["held"]
     queued_seat = local["queued_seat"]
     queued_reason = local["queued_reason"]
@@ -544,8 +578,12 @@ def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> di
                 blockers.append("PR head missing or malformed — no gate can authorize a run")
             if pr.get("draft"):
                 blockers.append("draft PR: the reviewer gate stays silent until ready_for_review")
-            if base and base != loop["base"]:
-                blockers.append(f"wrong base: this loop watches {loop['base']}, the PR targets {base}")
+            if stacked:
+                blockers.append(f"stacked PR: {chain_reason} — visible only; no reviewer or fixer "
+                                "run is authorized by parent readiness")
+            if boundary:
+                blockers.append("same-head base retarget: pre-retarget reviews, rounds and approvals "
+                                "quarantined; no automatic reviewer or fixer run")
             if author and author not in set(loop["fixers"]):
                 blockers.append(f"the author {author} is not one of this loop's fixers "
                                 f"({', '.join(loop['fixers'])})")
@@ -611,10 +649,15 @@ def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> di
         kind = "ready"
         action = ("mark the PR ready for review (the ready_for_review event) — the reviewer gate "
                   "ignores drafts")
-    elif base and base != loop["base"]:
-        kind = "none"
-        action = (f"nothing — this loop only serves PRs based on {loop['base']}; retarget the PR, "
-                  f"or add a loop for {base}")
+    elif stacked:
+        kind = "wait" if isinstance(chain, situation.Resolution) and chain.status == "waiting" else "retry"
+        action = (f"{chain_reason} — wait for a verified parent/base transition; "
+                  "no automatic reviewer wake or gate authorization")
+    elif boundary and not approved:
+        kind = "wait"
+        action = ("same-head retarget: push a new child head and explicitly request review, "
+                  "or obtain a fresh explicit human review of the retargeted diff. "
+                  "Old approvals/verdicts cannot authorize a run; no automatic wake")
     elif author and author not in set(loop["fixers"]):
         kind = "none"
         action = (f"nothing — the reviewer gate only serves PRs opened by this loop's fixers "
@@ -715,6 +758,10 @@ def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> di
     return {
         "pr": number, "repo": repo, "url": pr_url(loop, number), "state": state,
         "head": head, "cap": cap, "spent": spent, "at_head": at_head,
+        "chain": {"status": chain.status if isinstance(chain, situation.Resolution) else
+                  ("unverified" if stacked else "direct"), "reason": chain_reason if stacked else "direct trunk base",
+                  "parents": list(chain_parents),
+                  "identity": chain.identity.key if isinstance(chain, situation.Resolution) and chain.identity else ""},
         "approved": approved, "reviewed": reviewed, "request_pending": request_pending,
         "read_at": iso_at(now),
         "state_line": state_line, "budget": budget, "seat": local["seat"], "queue": local["queue"],

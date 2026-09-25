@@ -23,7 +23,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from review_loop import gate, gh, observer  # noqa: E402
+from review_loop import gate, gh, observer, transition  # noqa: E402
 from review_loop.util import log, silence  # noqa: E402
 
 
@@ -63,7 +63,47 @@ def main() -> None:
     if ledger.exists() and Supervisor(ledger).post_write_hold(loop['repo'], number):
         silence('post-write push quarantined — operator inspection required; no merge handoff')
 
+    # An approval ends the turn that was claimed for the approved head. Free that claim before
+    # the checks below: they gate the merge handoff and fixer work, and a failed read or a
+    # retarget must not keep the reviewer's seat until its TTL. Only that head's claim ends,
+    # so a late webhook cannot end a newer run on the same PR.
+    approved_early = False
+    if (str(review.get("state", "")).upper() == "APPROVED" and review.get("commit_id")
+            and st.release_if("reviewer", key, review["commit_id"])):
+        approved_early = True
+        log(f"released reviewer seat for {key}")
+        gate.drain_seat(loop, "reviewer")
+
     state = str(review.get("state", "")).upper()
+    # An approval reaches its own verification below, which rechecks the live head, base and
+    # retarget hold before any merge cue and otherwise reports it unverified. A rejection is a
+    # work order, so it must pass these checks before anything else happens.
+    if state != "APPROVED":
+        # A webhook is a delivered snapshot, not permission to release a seat, announce
+        # approval, escalate, or start a fixer after the PR was retargeted. Stacked reviews
+        # have no trustworthy review-ID/base association in this direct-gh workflow yet.
+        if (pr.get("base") or {}).get("ref") != loop["base"]:
+            silence("stacked/retargeted verdict has no verified review situation")
+        live = gh.pr(loop, number)
+        if (not isinstance(live, dict) or live.get("number") != number
+                or live.get("state") != "open" or live.get("draft")
+                or (live.get("base") or {}).get("ref") != loop["base"]
+                or (live.get("head") or {}).get("sha") != (pr.get("head") or {}).get("sha")):
+            silence("verdict snapshot is stale or live PR unavailable")
+        snapshot_base_sha = (pr.get("base") or {}).get("sha")
+        live_base_sha = (live.get("base") or {}).get("sha")
+        # Trunk moving on does not supersede a verdict on a direct-trunk PR; a stacked base's
+        # generation does. The merge handoff still rechecks the base below.
+        if (snapshot_base_sha and (pr.get("base") or {}).get("ref") != loop["base"]
+                and live_base_sha != snapshot_base_sha):
+            silence("verdict base generation changed")
+        boundary = transition.record(loop, st, number, (live.get("head") or {}).get("sha"), loop["base"])
+        if boundary:
+            # Review commit_id binds only the head. Even a post-boundary REST review
+            # cannot prove which base it examined or which request dispatched it.
+            # In particular a review on another head must never produce a merge cue.
+            silence("base retarget: no generation-bound review receipt; no automated handoff")
+
     if state == "APPROVED":
         # An approval ends the reviewer's turn exactly as a rejection does, and nothing else would
         # free that slot before it expired. A slot that leaks for `ttl_min` is a queue that stops
@@ -90,20 +130,27 @@ def main() -> None:
         live_approval = (latest is not None and latest.get("id") == review.get("id")
                          and gh.review_state(latest) == "APPROVED"
                          and gate.reviewer_login(latest) == gate.reviewer_login(review))
+        # A review's commit_id binds the head only. The live PR must still describe the
+        # same direct-trunk generation as the webhook snapshot; a same-head base retarget or
+        # advancement between reads makes the approval an unknown-diff verdict.
+        first_base = pr.get("base") or {}
+        final_base = (current.get("base") or {}) if isinstance(current, dict) and live_open else {}
+        same_base = (final_base.get("ref") == loop["base"]
+                     and first_base.get("ref") == final_base.get("ref")
+                     and first_base.get("sha") == final_base.get("sha")
+                     and not transition.hold(st, number, current_head))
         if live_open and current_head and approved_head and approved_head != current_head:
             outcome, next_turn = "on an older head — the PR moved since", "the reviewer, on this head"
         elif (live_open and current_head and approved_head == current_head
-              and snapshot_matches and base_matches and live_approval):
+              and snapshot_matches and base_matches and live_approval and same_base):
             outcome, next_turn = "", "you merge"
         else:
-            outcome, next_turn = "current approval/head unverified — no merge handoff", "check current PR state"
-        # The approval ended the run that was claimed for the approved head, whether or not
-        # GitHub can be read back now; a verified handoff also ends any other claim.
-        released = (st.release_if("reviewer", key) if next_turn == "you merge"
-                    else st.release_if("reviewer", key, approved_head) if approved_head else False)
+            outcome, next_turn = "current approval/head/base unverified — no merge handoff", "check current PR state"
+        # The claim for the approved head was freed above; a verified handoff also ends any other.
+        released = st.release_if("reviewer", key) if next_turn == "you merge" else False
         if released:
             log(f"released reviewer seat for {key}")
-        if released or next_turn == "you merge":
+        if (released or next_turn == "you merge") and not approved_early:
             gate.drain_seat(loop, "reviewer")
         observer.notify(loop, st, "approved", number, approved_head,
                         identity=review.get("id"), actor=gate.reviewer_login(review),
@@ -133,7 +180,7 @@ def main() -> None:
     if (latest is None or latest.get("id") != review.get("id")
             or gh.review_state(latest) != "CHANGES_REQUESTED"
             or gate.reviewer_login(latest) != gate.reviewer_login(review)):
-        silence("verdict is not the latest effective same-head rejection")
+        silence("changes-requested webhook is not the live latest effective verdict")
     prior = len(gate.verdicts(reviews, loop, exclude_id=review.get("id")))
     if st.inflight(f"fix:{number}:{pr_head}"):
         silence(f"a fix run for head {pr_head[:7]} is already out")
