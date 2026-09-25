@@ -4,9 +4,14 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly and on demand, so timing flakes surface outside PR runs.
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # Keyed by event too, so a push to main never cancels the scheduled run (or vice versa).
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -23,7 +28,7 @@ jobs:
           python-version: ${{ matrix.python }}
       # No dependencies to install: the plugin is stdlib-only on purpose, and so are its tests.
       - name: Compile every file
-        run: python -m compileall -q review_loop scripts __init__.py
+        run: python -m compileall -q review_loop scripts __init__.py tests
       - name: Loop tests (gates, budget, seats, watchdog, cleanup)
         run: python tests/run_tests.py
       # The sandbox tests skip without bubblewrap; a green run must mean they ran. Ubuntu
@@ -33,4 +38,8 @@ jobs:
           sudo apt-get update -q && sudo apt-get install -yq bubblewrap
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - name: Boundary tests (broker, push, fetch, proxy, supervisor, sandbox)
+        run: python -m unittest discover -s tests -p 'test_*.py'
+      # Scheduled runs repeat the boundary suite: a second pass doubles the chance to catch a timing flake.
+      - name: Boundary tests, second pass (scheduled only)
+        if: github.event_name == 'schedule'
         run: python -m unittest discover -s tests -p 'test_*.py'
