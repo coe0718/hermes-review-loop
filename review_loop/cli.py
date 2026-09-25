@@ -1329,6 +1329,32 @@ def cmd_doctor(args) -> int:
     return 1 if failed else 0
 
 
+def cmd_selftest(args) -> int:
+    """Verify the live isolated path for one loop; every step and its fix live in selftest.py.
+
+    Unlike ``doctor`` this touches the real capabilities (bubblewrap, the model, GitHub reads, and
+    with ``--live-turn`` one real reviewer turn) — but it never writes to GitHub: GitHub calls go
+    through a GET-only guard and the live turn's broker runs in its host-only no-write mode.
+    """
+    from . import selftest
+    if args.live_turn and args.pr is None:
+        print("--live-turn needs --pr N: the turn reviews that pull request")
+        return 2
+    if args.live_turn and args.no_model:
+        print("--live-turn needs the model; drop --no-model")
+        return 2
+    if args.timeout < 1:
+        print("--timeout must be positive")
+        return 2
+    try:
+        loop = config.load_id(args.loop)
+    except config.ConfigError as exc:
+        print(f"cannot selftest loop: {doctor._safe_report_text(str(exc))}")
+        return 2
+    return selftest.run(loop, pr=args.pr, model=not args.no_model, live_turn=args.live_turn,
+                        timeout=args.timeout)
+
+
 def cmd_arm(args) -> int:
     for loop in ([config.load_id(args.loop)] if args.loop else config.all_loops()):
         for line in _set_hooks(loop, not args.pause, args.admin_token):
@@ -1556,6 +1582,20 @@ def register_cli(ctx, settings: dict | None = None) -> None:
         preflight.add_argument("--strict", action="store_true",
                                help="treat a check that could not be decided as a failure")
         preflight.set_defaults(func=cmd_doctor)
+
+        check = sub.add_parser("selftest", help="Verify the live isolated path step by step "
+                                                "(runtime, bwrap, model, identities, broker, ledger); "
+                                                "never writes to GitHub")
+        check.add_argument("--loop", required=True)
+        check.add_argument("--pr", type=int, help="dry-run the reviewer write authorization on this PR")
+        check.add_argument("--no-model", action="store_true",
+                           help="skip the one tiny real completion (costs a few tokens)")
+        check.add_argument("--live-turn", action="store_true",
+                           help="with --pr: run one real isolated reviewer turn whose verdict is "
+                                "printed and never posted")
+        check.add_argument("--timeout", type=int, default=120,
+                           help="live turn budget in seconds (production worker default: 120)")
+        check.set_defaults(func=cmd_selftest)
 
         change = sub.add_parser("set", help="Change a loop's settings in place")
         change.add_argument("--loop", required=True)
