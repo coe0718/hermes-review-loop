@@ -9,6 +9,15 @@
 > cannot atomically authorize PR state/author at receive-pack. The descriptions
 > below document the previous operational design, not current enabled behavior.
 >
+> **Adjudication is isolated like the seats.** A spent cap enqueues an isolated
+> adjudicator turn in the host run ledger (never the legacy gateway route, which
+> stays silent). It runs credentialless in the same sandbox, with a read-only
+> checkout, and can only submit one ruling (ACCEPT / REJECT / RESPEC + reason)
+> through the broker. The host records it, tells the operator (observer `ruling`
+> notice plus the watchdog outbox), and posts it as a PR comment only when a
+> distinct `seats.adjudicator.login` identity is configured. It never merges,
+> pushes or reviews. See `docs/configuration.md#adjudication-the-isolated-ruling`.
+>
 > **Operator decision: no unattended fixer push rollout.** The gate rejects
 > verdicts for PRs whose webhook author is not in `fixers`; the credentialed
 > broker independently reads the live PR author before every fixer write and
@@ -469,8 +478,10 @@ That is the whole payload: the loop, the PR, the head at the recorded transition
 event, the outcome, an optional next-turn hint, and a direct link to the PR. Delayed retries and
 digests omit next-turn hints because the PR or review may have changed since the transition.
 Never a token, an HMAC secret, a private diff, or a review body. Escalation reaches the observer
-after the cap marker is durable and before the adjudicator POST; it explicitly says delivery is
-pending, not that the adjudicator received it.
+after the cap marker is durable and before the adjudicator turn is enqueued; it explicitly says
+delivery is pending, not that the adjudicator received it. A `ruling` notice carries the verdict
+and counts, never the adjudicator's reason text (that goes to the watchdog outbox and, when an
+adjudicator identity is configured, the PR).
 
 Turn it on at init, or add it to a loop that is already running:
 
@@ -490,7 +501,7 @@ The flags write this block into the loop file, the only place the feed is config
   "route": "widgets-observe",
   "profile": "tuck",
   "deliver": "telegram",
-  "events": ["opened", "handoff", "verdict", "approved", "escalation", "stall", "closed"],
+  "events": ["opened", "handoff", "verdict", "approved", "escalation", "ruling", "stall", "closed"],
   "digest_min": 30
 }
 ```
@@ -501,10 +512,10 @@ The flags write this block into the loop file, the only place the feed is config
 `init` also installs the route (`<id>-observe`) through the seats' own mechanism — the same signed
 POST at the same gateway — but with `deliver_only: true` and a two-line prompt, because the notice
 is *already written*: nothing wakes an agent, and there is no third seat to hold a lock or take a
-turn. The seven transitions are `opened` (a new PR needs its first look), `handoff` (a fix was
+turn. The eight transitions are `opened` (a new PR needs its first look), `handoff` (a fix was
 pushed and review requested), `verdict` (a changes-requested verdict started a fix), `approved`
 (the reviewer approved), `escalation` (the cap is spent and adjudicator delivery is pending),
-`stall` (the watchdog decided a quiet PR is worth reporting) and `closed` (merged or abandoned;
+`ruling` (an isolated adjudicator's ruling was recorded), `stall` (the watchdog decided a quiet PR is worth reporting) and `closed` (merged or abandoned;
 cleanup was attempted, but disk reclamation is not confirmed by this notice).
 
 Four rules keep the feed from becoming a gate:

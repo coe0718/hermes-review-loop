@@ -35,8 +35,10 @@ See [Preflight](architecture.md#preflight-can-this-installation-run).
 | `seats.<seat>.agent` | profile name | display name used in start-pings and prompts |
 | `seats.<seat>.channel` | profile's `DISCORD_HOME_CHANNEL` | where the start-ping goes |
 | `seats.<seat>.emoji` | 🔍 / 🔧 | cosmetic, for the ping |
-| `adjudicator.route` | — | route woken when the cap is spent; omit to only write the marker |
-| `adjudicator.profile` | `default` | profile the adjudication run happens as |
+| `adjudicator.route` | — | enables adjudication: when the cap is spent an isolated adjudicator turn is enqueued in the host run ledger; omit to only write the marker. The legacy gateway route itself stays silent |
+| `adjudicator.profile` | `default` | profile of the legacy gateway route (validated against the seats; the isolated turn does not run as it) |
+| `seats.adjudicator.login` | unset | **optional** GitHub identity the ruling is *also* posted as, as a PR comment. It needs its own `tokens` entry and must be a fourth account: not the `read_token`, not either seat, not in `fixers`/`reviewers`, and not sharing a token file with any of them. The broker re-checks all of it (plus distinct `/user` principals and the live PR) before each comment. Without it rulings go to the operator only — not an error |
+| `seats.adjudicator.concurrency` | `1` | isolated adjudicator turns at once. Does not inherit the loop-level `concurrency` |
 | `skill` | — | skill the seats are told to load |
 | `tokens` | `{}` | `login → path of a file containing that seat's PAT (mode 600)` |
 | `read_token` | first token | login whose token performs reads |
@@ -65,7 +67,7 @@ per loop — no `observer` block, no feed — and it is the one block in this fi
 | `observer.route` | `<id>-observe` | the gateway route each notice is POSTed to. Without it there is nowhere to deliver, and `status` says so |
 | `observer.profile` | `default` | the Hermes profile whose chat the route delivers into |
 | `observer.deliver` | `telegram` | the route's delivery target. `log` is refused by `init` / `set`, since it would deliver to nobody |
-| `observer.events` | all seven | any subset of `opened`, `handoff`, `verdict`, `approved`, `escalation`, `stall`, `closed`. An event left out is never sent, and never recorded as owed |
+| `observer.events` | all eight | any subset of `opened`, `handoff`, `verdict`, `approved`, `escalation`, `ruling`, `stall`, `closed`. An event left out is never sent, and never recorded as owed |
 | `observer.digest_min` | `0` | `0` sends one message per transition; above `0` batches them into one compact message at the next watchdog sweep |
 | `observer.mute` | `false` | stop delivering and keep the configuration (`--observer-mute` / `--observer-unmute`) |
 
@@ -89,6 +91,7 @@ the loop. The transitions it can send:
 | `verdict` | a changes-requested verdict landed and a fix run started |
 | `approved` | the reviewer approved (nothing else would free that seat) |
 | `escalation` | the cap is spent — sent after the durable marker, before adjudicator delivery; receipt remains pending |
+| `ruling` | an isolated adjudicator recorded its ruling (ACCEPT / REJECT / RESPEC) in the host ledger. The notice carries the verdict and counts only; the reason reaches the operator through the watchdog's outbox, which delivers every ruling even with no, a muted, or a filtered feed |
 | `stall` | the watchdog decided a quiet head is worth reporting |
 | `closed` | the PR was merged or abandoned, and its disk was reclaimed |
 
@@ -108,6 +111,28 @@ Consequences worth knowing:
   remain: queued notices stay owed but do not send while disabled, and re-enabling at a different
   host, route, profile or delivery target is refused until they are settled. `status` shows the
   outstanding count. A loop whose feed is broken logs the problem and runs its seats normally.
+
+## Adjudication (the isolated ruling)
+
+When the cap is spent without an approval, the gate writes the durable breach marker and — if the
+loop has an `adjudicator.route` — enqueues an **isolated** adjudicator turn in the host run ledger
+(`$HERMES_HOME/state/review-loop-runs.sqlite`, turn `breach:<rounds>` at that head). It runs exactly
+like the other seats: a detached worker re-reads GitHub (PR open, not draft, same base, same head,
+author a configured fixer, the cap still spent, no approval at the head, a matching marker),
+exports the head read-only into bubblewrap, and gives the agent no credentials. Its only write is
+`python -m review_loop.broker_client ruling --verdict ACCEPT|REJECT|RESPEC --body-file PATH`,
+once. It never merges, pushes or reviews.
+
+The host then, in order: records the ruling in the ledger (`rulings` table — this is the
+acknowledgement), sends a `ruling` observer notice, and — only when `seats.adjudicator.login` is
+configured — posts the ruling as a PR comment under that identity. Every ruling, with its reason,
+is also delivered by the watchdog's operator outbox (cron stdout), so the operator always hears
+of it. `python -m review_loop.run_supervisor rulings $HERMES_HOME/state/review-loop-runs.sqlite`
+lists recent rulings with their comment state (`none`, `denied`, `posted`, or `uncertain` for a
+POST whose outcome is unknown — never retried automatically).
+
+If the enqueue fails (no private runtime file, ledger or spawn error), the marker stays
+`delivery-pending` and the watchdog retries it; a duplicate delivery is deduplicated by the ledger.
 
 ## Plugin settings (the desktop form)
 
