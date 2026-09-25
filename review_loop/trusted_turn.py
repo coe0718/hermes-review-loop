@@ -149,8 +149,9 @@ _COMMON = ('You have no GitHub credentials or network. Never claim a write succe
            'do not retry it, say so.')
 TOOLS = {
     'reviewer': ('For your one authorized write use `python -m review_loop.broker_client review '
-                 '--verdict APPROVE --body-file /work/review.txt` (or REQUEST_CHANGES/COMMENT). '
-                 'A reviewer gets exactly one write. '),
+                 '--verdict APPROVE --body-file /work/review.txt` (or --verdict REQUEST_CHANGES). '
+                 'The verdict must be exactly APPROVE or REQUEST_CHANGES; anything else is refused '
+                 'without spending the write. A reviewer gets exactly one write. '),
     'fixer': ('To publish use `python -m review_loop.broker_client push '
               '--manifest-file /work/manifest.json`, then `python -m review_loop.broker_client '
               'request_review`. A fixer gets one push followed by one review request. '),
@@ -169,10 +170,19 @@ def tool_instructions(role: str) -> str:
 
 def run_turn(loop: dict, scope: broker_ipc.RunScope, *, source: Path, venv: Path,
              runtime: Path, rust: Path, upstream: str, key: str, model: str,
-             prompt: str, timeout: int = 600, work_root: Path | None = None) -> int:
-    """Stage a live PR head, start host capabilities, execute Hermes within bwrap."""
+             prompt: str, timeout: int = 600, work_root: Path | None = None,
+             no_write: bool = False, observed: dict | None = None) -> int:
+    """Stage a live PR head, start host capabilities, execute Hermes within bwrap.
+
+    ``no_write`` (host-only; the selftest's live turn) starts the broker in its record-only
+    mode: a reviewer's verdict is authorized with live reads and recorded, never POSTed.
+    ``observed``, when given, receives the sandbox exit code, bounded output tails and the
+    recorded submissions.
+    """
     if scope.repo != loop.get('repo') or scope.role not in TOOLS:
         raise TurnDenied('scope mismatch')
+    if no_write is not False and (no_write is not True or scope.role != 'reviewer'):
+        raise TurnDenied('no-write mode supports only a reviewer turn')
     if not model or not prompt or timeout < 1 or not key:
         raise TurnDenied('missing model, prompt or credential')
     parent = Path(work_root or loop['state_dir']).resolve()
@@ -209,7 +219,7 @@ def run_turn(loop: dict, scope: broker_ipc.RunScope, *, source: Path, venv: Path
             broker_root.mkdir(mode=0o700)
             broker = stack.enter_context(broker_ipc.RunBroker(
                 loop, scope, broker_root, require_push=scope.role == 'fixer',
-                require_receipt=scope.role == 'reviewer'))
+                require_receipt=scope.role == 'reviewer', no_write=no_write))
             server = broker_ipc.serve_in_thread(broker)
             try:
                 command = ['/opt/venv/bin/python', '-m', 'review_loop.inference_proxy',
@@ -225,6 +235,10 @@ def run_turn(loop: dict, scope: broker_ipc.RunScope, *, source: Path, venv: Path
                     # A ruling is judgement, not a change: the adjudicator's tree is mounted
                     # read-only so nothing it runs can dress up the head it rules on.
                     checkout_writable=scope.role != 'adjudicator')
+                if observed is not None:
+                    observed.update(returncode=result.returncode,
+                                    stdout=result.stdout[-4000:], stderr=result.stderr[-4000:],
+                                    submissions=[dict(entry) for entry in broker.recorded])
                 if result.returncode == 0 and not broker.completed:
                     raise TurnDenied('agent exited without a confirmed scoped write')
                 return result.returncode

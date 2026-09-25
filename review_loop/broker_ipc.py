@@ -61,7 +61,17 @@ class RunBroker:
     """Single-threaded server: reviewer writes once; fixer may push then request review."""
 
     def __init__(self, loop: dict, scope: RunScope, directory: str | Path,
-                 *, require_push: bool = False, require_receipt: bool = False):
+                 *, require_push: bool = False, require_receipt: bool = False,
+                 no_write: bool = False):
+        # ``no_write`` is a host-only constructor argument (the selftest's live turn). It is
+        # not a socket field: requests carry exactly operation/verdict/body (or a manifest),
+        # so nothing inside the namespace can turn it on, off, or observe it.
+        if type(no_write) is not bool or (no_write and scope.role != "reviewer"):
+            raise ValueError("no-write mode is a host flag for reviewer runs only")
+        self._no_write = no_write
+        # What a no-write reviewer WOULD have submitted: verdict, body and the live authorization
+        # outcome. Host memory only; never sent back to the sandbox.
+        self.recorded: list[dict] = []
         self._loop = loop
         self.require_push = require_push
         self.require_receipt = require_receipt
@@ -114,6 +124,11 @@ class RunBroker:
     def __exit__(self, *_: object) -> None:
         self.close()
 
+    @property
+    def no_write(self) -> bool:
+        """Read-only after construction: a started broker cannot be switched into or out of it."""
+        return self._no_write
+
     def serve(self) -> None:
         if self._listener is None:
             raise RuntimeError("broker not started")
@@ -144,6 +159,11 @@ class RunBroker:
 
     def _dispatch(self, raw: bytes) -> object:
         request = json.loads(raw)
+        if self._no_write and not (isinstance(request, dict)
+                                   and request.get("operation") == "review"):
+            # A no-write broker serves one reviewer verdict and nothing else, before any branch
+            # that could reach a push, a ruling, or a GitHub write.
+            raise ProtocolError("operation out of scope")
         # The adjudicator has exactly one operation, and only the adjudicator has it. Decide
         # that before any other branch so neither side can reach the other's write paths.
         if self.scope.role == "adjudicator" or (isinstance(request, dict)
@@ -238,11 +258,18 @@ class RunBroker:
             raise ProtocolError("invalid review fields")
         if self._used and not (operation == "request_review" and self._pushed_head):
             raise ProtocolError("run capability already used")
+        if operation == "review" and (verdict not in broker.REVIEW_VERDICTS or not body.strip()):
+            # Refused before the capability is consumed, so the reviewer can resubmit a real
+            # verdict in the same turn. A COMMENT would neither wake the fixer nor cue a merge.
+            raise ProtocolError("review verdict must be APPROVE or REQUEST_CHANGES with a non-empty "
+                                "body (COMMENT is not a verdict); nothing was written, resubmit")
         # Consume BEFORE an external write: a lost response cannot lead to a replay.
         self._used = True
         after_push = operation == "request_review" and bool(self._pushed_head)
         head = self._pushed_head if after_push else self.scope.head
         self._pushed_head = None
+        if self._no_write:
+            return self._record_only(verdict, body)
         if operation == 'review' and self.scope.run_id is not None:
             from .review_receipt import ReceiptLedger, submit
             ledger = ReceiptLedger(self.scope.ledger_db, self.scope.run_id,
@@ -258,6 +285,30 @@ class RunBroker:
         self.completed = True
         return result
 
+    def _record_only(self, verdict: str, body: str) -> object:
+        """No-write reviewer: the live authorization reads, then record, and never POST.
+
+        ``broker.authorize`` only GETs (``/user`` per identity and the live PR), so this proves
+        the real write would have been allowed at this head without making it. No receipt claim,
+        ledger row, audit line or GitHub write is produced. The sandbox gets the same answer a
+        real write would give, so the agent's behaviour is the one a live run would show.
+        """
+        # Same verdicts a real reviewer write accepts: a COMMENT would stall the loop.
+        if verdict not in ("APPROVE", "REQUEST_CHANGES") or not body.strip():
+            raise broker.BrokerDenied("invalid review verdict or empty body")
+        entry = {"verdict": verdict, "body": body, "authorized": False, "denial": ""}
+        self.recorded.append(entry)
+        try:
+            entry["login"] = broker.authorize(
+                self._loop, repo=self.scope.repo, number=self.scope.number,
+                head=self.scope.head, role="reviewer", branch=self.scope.branch,
+                operation="review")
+        except broker.BrokerDenied as exc:
+            entry["denial"] = str(exc)[:200]
+            raise
+        entry["authorized"] = True
+        self.completed = True
+        return {"recorded": True}
 
     def _ruling(self, raw: bytes, request: object) -> object:
         """Record the one ruling, then tell the operator, then (optionally) the PR.
@@ -405,6 +456,8 @@ def main() -> None:
             parser.error("ruling requires --verdict ACCEPT|REJECT|RESPEC and --body-file")
         if args.manifest_file or (args.operation == "review" and not args.body_file):
             parser.error("invalid review arguments")
+        if args.operation == "review" and args.verdict not in broker.REVIEW_VERDICTS:
+            parser.error("review requires --verdict APPROVE|REQUEST_CHANGES (COMMENT is not a verdict)")
         body = Path(args.body_file).read_text() if args.body_file else ""
         if len(body.encode()) > MAX_BODY:
             parser.error("review body too large")

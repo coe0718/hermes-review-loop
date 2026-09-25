@@ -150,15 +150,17 @@ What to do:
    what you are about to ask.
 2. Verify the claims yourself in `/work`: build it, run the tests it touches, reproduce the bug it
    says it fixed. A claim you did not check is not a finding, it is a rumor.
-3. Write the review body to a file and submit it through the broker (command below): a verdict,
-   and for every finding the severity, evidence (command plus observed output) and the
-   `file:line` it lives at.
+3. Write the review body to a file and submit it through the broker (command below). Your review
+   must end with exactly one verdict, APPROVE or REQUEST_CHANGES — a comment-only review is
+   refused, because it would neither wake the fixer nor cue a merge. For every finding give the
+   severity, evidence (command plus observed output) and the `file:line` it lives at.
 4. You get exactly one review write. The broker pins it to head {head}; if the head moved, the
-   write is refused — say so rather than retrying.
+   write is refused — say so rather than retrying. A verdict other than APPROVE or
+   REQUEST_CHANGES is refused before anything is written: resubmit with a real verdict.
 5. Finish with a 3-5 line summary: verdict, what you verified, what you did not verify.
 
-Never approve what you did not verify. If you cannot verify something, say so in the review
-instead of guessing."""
+Never approve what you did not verify. If you are uncertain — something you could not verify —
+the verdict is REQUEST_CHANGES, naming exactly what could not be verified, instead of guessing."""
 
 ISOLATED_FIXER = """A review on your pull request in {repo} needs an answer.
 

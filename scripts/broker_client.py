@@ -48,8 +48,9 @@ def main() -> int:
     parser.add_argument("verdict", nargs="?", default="")
     parser.add_argument("body", nargs="?", default="")
     args = parser.parse_args()
-    if args.operation == "review" and (not args.verdict or not args.body):
-        parser.error("review requires verdict and body")
+    if args.operation == "review" and (args.verdict not in ("APPROVE", "REQUEST_CHANGES")
+                                       or not args.body):
+        parser.error("review requires APPROVE|REQUEST_CHANGES and a body (COMMENT is not a verdict)")
     if args.operation == "ruling" and (args.verdict not in ("ACCEPT", "REJECT", "RESPEC")
                                        or not args.body):
         parser.error("ruling requires ACCEPT|REJECT|RESPEC and a reason")
