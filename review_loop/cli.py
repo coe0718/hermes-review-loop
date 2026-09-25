@@ -1355,6 +1355,65 @@ def cmd_selftest(args) -> int:
                         timeout=args.timeout)
 
 
+def cmd_models(args) -> int:
+    """Read-only: what a profile's provider offers, from Hermes's model catalog (issue #32).
+
+    Changing a seat's model is changing that profile's model in Hermes (`hermes -p NAME model`);
+    this only lists. Exit 1 when the profile, its provider or the catalog cannot answer.
+    """
+    from . import doctor, seat_model
+    if bool(args.profile) == bool(args.seat):
+        print("pass exactly one of --profile NAME or --seat reviewer|fixer|adjudicator")
+        return 2
+    profile, seat = args.profile, args.seat
+    if seat:
+        try:
+            loop = config.load_id(args.loop) if args.loop else None
+            if loop is None:
+                loops = config.all_loops()
+                if len(loops) != 1:
+                    print("--seat needs --loop ID when more than one loop is configured")
+                    return 2
+                loop = loops[0]
+        except config.ConfigError as exc:
+            print(f"cannot read loop: {doctor._safe_report_text(str(exc))}")
+            return 2
+        profile = config.seat_profile(loop, seat)
+    problem = seat_model.profile_problem(profile, seat or "requested")
+    if problem:
+        print(f"❌ {problem}")
+        return 1
+    settings, bad = doctor.runtime_settings()
+    try:
+        answer = seat_model.run_resolver(profile, "models", settings if bad is None else None)
+    except seat_model.SeatModelError as exc:
+        print(f"❌ {exc}")
+        return 1
+    provider = str(answer.get("requested") or "(auto)")
+    current = str(answer.get("model") or "")
+    print(f"profile {profile}{f' (seat {seat})' if seat else ''}: provider {provider}, "
+          f"current model {current or '(unset)'}")
+    if answer.get("error"):
+        print(f"❌ {seat_model._redact(answer['error'])}")
+        return 1
+    rows = [(str(mid), "catalog") for mid in answer.get("catalog") or []]
+    rows += [(str(mid), "profile config") for mid in answer.get("declared") or []
+             if str(mid) not in {row[0] for row in rows}]
+    if not answer.get("catalog_known"):
+        print(f"⚠️  provider {provider} is unknown to the Hermes model catalog "
+              "(no curated list; the catalog may also be unreachable or disabled)")
+    if not rows:
+        print("❌ no models listed for this provider — check the provider name, or ask the "
+              "provider directly; nothing here changes the profile")
+        return 1
+    for mid, where in rows:
+        print(f"  {'*' if mid == current else ' '} {mid}  ({where})")
+    if current and current not in {mid for mid, _ in rows}:
+        print(f"⚠️  the current model {current} is not in this list")
+    print(f"change it with `hermes -p {profile} model` — this command never writes")
+    return 0
+
+
 def cmd_arm(args) -> int:
     for loop in ([config.load_id(args.loop)] if args.loop else config.all_loops()):
         for line in _set_hooks(loop, not args.pause, args.admin_token):
@@ -1596,6 +1655,14 @@ def register_cli(ctx, settings: dict | None = None) -> None:
         check.add_argument("--timeout", type=int, default=600,
                            help="live turn budget in seconds (default 600; the production worker uses its own child_timeout)")
         check.set_defaults(func=cmd_selftest)
+
+        models = sub.add_parser("models", help="Read-only: list the models a seat's Hermes "
+                                               "profile's provider offers (Hermes catalog)")
+        models.add_argument("--profile", help="Hermes profile name")
+        models.add_argument("--seat", choices=("reviewer", "fixer", "adjudicator"),
+                            help="use this seat's profile from the loop config")
+        models.add_argument("--loop", help="loop id for --seat (default: the only loop)")
+        models.set_defaults(func=cmd_models)
 
         change = sub.add_parser("set", help="Change a loop's settings in place")
         change.add_argument("--loop", required=True)

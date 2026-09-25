@@ -5,11 +5,15 @@ verification asks: *can the host actually run one isolated turn?* Each step is i
 it can be, prints one ✅/❌ line per check with the command that fixes a failure, and the verb
 exits 1 if anything failed:
 
-1. the private runtime file (``$HERMES_HOME/review-loop-runtime.json``) and the paths it names;
+1. the private runtime file (``$HERMES_HOME/review-loop-runtime.json``) and the paths it names,
+   then each seat's model as the worker would resolve it (its Hermes profile, or a runtime
+   override — see ``seat_model``), shown as profile → provider / model, never the key;
 2. bubblewrap with unprivileged user namespaces, and a probe *inside* the real sandbox layout
    (configured venv, runtime and Rust, a staged source snapshot) that must not be able to read a
-   dummy host secret, the model key, the PATs, the runtime file or ``$HERMES_HOME/.env``;
-3. one tiny real completion through the host inference capability (``--no-model`` skips it);
+   dummy host secret, any model key file, the seat profiles' ``.env``/``auth.json``/``config.yaml``,
+   the PATs, the runtime file or ``$HERMES_HOME/.env``;
+3. one tiny real completion through the host inference capability, once per distinct seat
+   resolution (``--no-model`` skips it);
 4. the read/reviewer/fixer (and optional adjudicator) tokens resolve via ``/user`` to distinct
    principals with the expected logins, and the repository is readable;
 5. with ``--pr N``: the broker's reviewer-write authorization, run with reads only;
@@ -41,7 +45,7 @@ from . import config, doctor, gh
 
 PASS, FAIL, WARN, SKIP = "pass", "fail", "warn", "skip"
 MARKS = {PASS: "✅", FAIL: "❌", WARN: "⚠️ ", SKIP: "⏭️ "}
-RUNTIME_KEYS = ("source", "venv", "runtime", "rust", "upstream", "key_file", "model")
+RUNTIME_KEYS = ("source", "venv", "runtime", "rust")   # required; the model comes from each seat
 DEFAULT_TIMEOUT = 600  # a real review routinely outlasts a two-minute budget
 
 
@@ -206,17 +210,52 @@ def _interpreter_outside(link: Path, runtime: Path) -> str:
     return ""
 
 
+def _check_override(report: Report, step: str, prefix: str, block: dict) -> bool:
+    """An explicit model override's upstream and key file; True when both are usable."""
+    from .inference_proxy import UPSTREAM_SUFFIX, _NoRedirectConnection
+    ok = True
+    upstream = block["upstream"]
+    parts = urlsplit(upstream)
+    try:
+        _NoRedirectConnection(upstream)
+        shape_ok = True
+    except ValueError:
+        shape_ok = False
+    if parts.scheme != "https":
+        ok = False
+        report.add(step, prefix + "upstream", FAIL, f"upstream scheme is {parts.scheme or '(none)'!r}",
+                   "use an https:// URL: the production worker refuses plain HTTP inference")
+    elif not shape_ok:
+        ok = False
+        report.add(step, prefix + "upstream", FAIL,
+                   f"upstream must be https://host[:port]/…{UPSTREAM_SUFFIX} with no credentials, "
+                   "query or fragment", f"set upstream to the provider's full …{UPSTREAM_SUFFIX} URL")
+    else:
+        report.add(step, prefix + "upstream", PASS,
+                   f"https://{parts.hostname}{parts.path} (model {block['model']})")
+    key_path = Path(block["key_file"]).expanduser()
+    good, detail, fix = _private_file(key_path)
+    if good and not key_path.read_text().strip():
+        good, detail, fix = False, f"{key_path} is empty", f"write the provider API key into {key_path}"
+    if not good:
+        ok = False
+        report.add(step, prefix + "key_file", FAIL, detail,
+                   fix or f"write the provider API key to {key_path} and `chmod 600 {key_path}`")
+    else:
+        report.add(step, prefix + "key_file", PASS, detail + ", non-empty")
+    return ok
+
+
 def check_runtime(report: Report, path: Path) -> dict | None:
     """Step 1. Returns the settings when the turn could start from them, else ``None``."""
+    from . import seat_model
     step = "runtime"
     template = ('{"source": "/path/to/hermes-agent", "venv": "/path/to/hermes-agent/venv", '
-                '"runtime": "/path/to/python-runtime", "rust": "~/.rustup/toolchains/stable-...", '
-                '"upstream": "https://provider/v1/chat/completions", "key_file": "/path/to/model.key", '
-                '"model": "model-name"}')
+                '"runtime": "/path/to/python-runtime", "rust": "~/.rustup/toolchains/stable-..."}')
     ok, detail, fix = _private_file(path)
     if not ok:
         if not path.exists() and not path.is_symlink():
-            fix = f"write {path} with exactly {template} and `chmod 600 {path}`"
+            fix = f"write {path} with {template} and `chmod 600 {path}`"
         report.add(step, "runtime:file", FAIL, detail, fix)
         return None
     try:
@@ -225,54 +264,28 @@ def check_runtime(report: Report, path: Path) -> dict | None:
         report.add(step, "runtime:file", FAIL, f"{path} is not valid JSON ({type(exc).__name__})",
                    f"repair {path}: the worker refuses to start without it")
         return None
-    if not isinstance(settings, dict) or set(settings) != set(RUNTIME_KEYS):
-        keys = set(settings) if isinstance(settings, dict) else set()
-        missing = sorted(set(RUNTIME_KEYS) - keys)
-        extra = sorted(keys - set(RUNTIME_KEYS))
-        report.add(step, "runtime:file", FAIL,
-                   f"keys must be exactly {', '.join(RUNTIME_KEYS)}"
-                   + (f"; missing {', '.join(missing)}" if missing else "")
-                   + (f"; unexpected {', '.join(extra)}" if extra else ""),
-                   f"edit {path}: the production worker rejects any other key set")
+    try:
+        seat_model.parse_runtime(settings)
+    except ValueError as exc:
+        report.add(step, "runtime:file", FAIL, str(exc),
+                   f"edit {path}: required {', '.join(RUNTIME_KEYS)}; optional seats.<seat> "
+                   "{model, upstream, key_file} overrides (and the legacy top-level trio)")
         return None
-    bad = [key for key in RUNTIME_KEYS if not isinstance(settings[key], str) or not settings[key]]
-    if bad:
-        report.add(step, "runtime:file", FAIL, f"empty or non-string: {', '.join(bad)}",
-                   f"give {', '.join(bad)} a string value in {path}")
-        return None
-    report.add(step, "runtime:file", PASS, detail + ", 7 required keys")
+    report.add(step, "runtime:file", PASS, detail + ", host paths present")
     usable = True
 
-    upstream = settings["upstream"]
-    parts = urlsplit(upstream)
-    from .inference_proxy import PATH, _NoRedirectConnection
-    try:
-        _NoRedirectConnection(upstream)
-        shape_ok = True
-    except ValueError:
-        shape_ok = False
-    if parts.scheme != "https":
-        usable = False
-        report.add(step, "runtime:upstream", FAIL, f"upstream scheme is {parts.scheme or '(none)'!r}",
-                   "use an https:// URL: the production worker refuses plain HTTP inference")
-    elif not shape_ok:
-        usable = False
-        report.add(step, "runtime:upstream", FAIL,
-                   f"upstream must be https://host[:port]{PATH} with no credentials, query or "
-                   "fragment", f"set upstream to the provider's full {PATH} URL")
-    else:
-        report.add(step, "runtime:upstream", PASS, f"https://{parts.hostname}{PATH}")
-
-    key_path = Path(settings["key_file"]).expanduser()
-    ok, detail, fix = _private_file(key_path)
-    if ok and not key_path.read_text().strip():
-        ok, detail, fix = False, f"{key_path} is empty", f"write the provider API key into {key_path}"
-    if not ok:
-        usable = False
-        report.add(step, "runtime:key_file", FAIL, detail,
-                   fix or f"write the provider API key to {key_path} and `chmod 600 {key_path}`")
-    else:
-        report.add(step, "runtime:key_file", PASS, detail + ", non-empty")
+    legacy = seat_model.legacy_override(settings)
+    blocks = [("runtime:", legacy)] if legacy is not None else []
+    blocks += [(f"runtime:seats.{seat}.", block)
+               for seat, block in sorted((settings.get("seats") or {}).items())]
+    for prefix, block in blocks:
+        usable = _check_override(report, step, prefix, block) and usable
+    if legacy is not None:
+        report.add(step, "runtime:legacy-model", WARN,
+                   f"top-level model {legacy['model']} is a LEGACY fallback: used only for a seat "
+                   "whose profile cannot be resolved, and every such seat then shares it",
+                   "once each seat's profile resolves, drop model/upstream/key_file from the "
+                   "runtime file (or move them under seats.<seat> as an explicit override)")
 
     source = Path(settings["source"])
     if not source.is_dir():
@@ -377,8 +390,10 @@ def _work_root(loop: dict) -> Path:
 
 
 def host_secret_paths(loop: dict, settings: dict, runtime_file: Path) -> list[str]:
-    paths = [str(Path(settings["key_file"]).expanduser()), str(runtime_file),
-             str(config.home() / ".env"), str(config.config_dir() / f"{loop['id']}.json")]
+    from . import seat_model
+    paths = seat_model.secret_paths(loop, settings)
+    paths += [str(runtime_file), str(config.home() / ".env"),
+              str(config.config_dir() / f"{loop['id']}.json")]
     paths += [str(Path(str(raw)).expanduser()) for raw in (loop.get("tokens") or {}).values()]
     return list(dict.fromkeys(paths))
 
@@ -474,8 +489,9 @@ def check_bwrap(report: Report, loop: dict, settings: dict | None, runtime_file:
                        "sure none of these paths lives under source, venv, runtime or rust")
         else:
             report.add(step, "sandbox:secrets", PASS,
-                       f"{len(paths)} host secret paths unreadable (dummy secret, model key, "
-                       "PATs, runtime file, .env, loop config)")
+                       f"{len(paths)} host secret paths unreadable (dummy secret, model key "
+                       "files, seat profiles' .env/auth.json/config.yaml, PATs, runtime file, "
+                       ".env, loop config)")
         if facts.get("network") or facts.get("dns"):
             report.add(step, "sandbox:network", FAIL, "the sandbox reached the network",
                        "bwrap must run with --unshare-all; check for a wrapper replacing bwrap")
@@ -497,22 +513,60 @@ def check_bwrap(report: Report, loop: dict, settings: dict | None, runtime_file:
 
 # -- step 3: inference ---------------------------------------------------------------------------
 
-def check_model(report: Report, settings: dict | None) -> None:
-    """Step 3: one tiny completion through the real host capability (key never leaves the host)."""
-    from . import inference_proxy
-    step = "inference"
-    if settings is None:
-        report.add(step, "model:completion", SKIP, "needs a usable runtime config (step 1)")
+def check_seats(report: Report, loop: dict, settings: dict | None, resolver=None) -> dict:
+    """Step 1 (cont.): each seat's model exactly as the worker resolves it. Returns seat → it."""
+    from . import seat_model
+    step = "runtime"
+    resolved: dict = {}
+    for seat in seat_model.seats_for(loop):
+        name = f"seat:{seat}"
+        if settings is None:
+            report.add(step, name, SKIP, "needs a usable runtime config")
+            continue
+        try:
+            inference = seat_model.resolve_seat(loop, seat, settings, resolver=resolver)
+        except seat_model.SeatModelError as exc:
+            report.add(step, name, FAIL, f"{exc}; the {seat} turn would be held",
+                       f"`hermes review-loop models --seat {seat} --loop {loop['id']}` lists what "
+                       "its profile's provider offers")
+            continue
+        report.redact.add(inference.key)
+        resolved[seat] = inference
+        if inference.origin == "legacy":
+            report.add(step, name, WARN, f"{inference.describe()} — {inference.warning}",
+                       f"make profile {inference.profile or '<name>'} resolve, or add an explicit "
+                       f"seats.{seat} override")
+        else:
+            report.add(step, name, PASS, inference.describe())
+    return resolved
+
+
+def check_model(report: Report, seats: dict | None) -> None:
+    """Step 3: one tiny completion per distinct seat resolution (keys never leave the host)."""
+    if not seats:
+        report.add("inference", "model:completion", SKIP,
+                   "needs at least one resolved seat model (step 1)")
         return
-    key = Path(settings["key_file"]).expanduser().read_text().strip()
-    report.redact.add(key)
-    host = urlsplit(settings["upstream"]).hostname
+    groups: dict = {}
+    for seat, inference in seats.items():
+        groups.setdefault(inference.identity(), []).append((seat, inference))
+    for members in groups.values():
+        names = "+".join(seat for seat, _ in members)
+        _one_completion(report, names, members[0][1])
+
+
+def _one_completion(report: Report, seats: str, inference) -> None:
+    from . import inference_proxy
+    step, name = "inference", "model:completion"
+    report.redact.add(inference.key)
+    host = inference.host
     body = json.dumps({"messages": [{"role": "user", "content": "Reply with the single word OK."}],
                        "max_tokens": 16}).encode()
     try:
         with tempfile.TemporaryDirectory(prefix="rl-st-") as sockets:
-            with inference_proxy.InferenceCapability(Path(sockets) / "i", settings["upstream"], key,
-                                                     model=settings["model"], quota=1) as capability:
+            with inference_proxy.InferenceCapability(Path(sockets) / "i", inference.upstream,
+                                                     inference.key, model=inference.model,
+                                                     quota=1) as capability:
                 conn = inference_proxy._UnixHTTP(str(capability.socket_path))
                 try:
                     conn.request("POST", inference_proxy.PATH, body=body,
@@ -522,29 +576,31 @@ def check_model(report: Report, settings: dict | None) -> None:
                 finally:
                     conn.close()
     except (OSError, http.client.HTTPException, ValueError) as exc:
-        report.add(step, "model:completion", FAIL,
-                   f"the host capability did not answer ({type(exc).__name__})",
+        report.add(step, name, FAIL,
+                   f"{seats}: the host capability did not answer ({type(exc).__name__})",
                    "check that the upstream host is reachable from this machine")
         return
-    fixes = {401: f"the key in {settings['key_file']} was rejected — replace it",
-             403: f"the key in {settings['key_file']} may not use model {settings['model']!r}",
-             404: f"the provider does not know model {settings['model']!r} at this URL — check "
-                  "model and upstream",
+    where = (f"profile {inference.profile}'s credential" if inference.origin == "profile"
+             else "the override's key file")
+    fixes = {401: f"{where} was rejected — replace it",
+             403: f"{where} may not use model {inference.model!r}",
+             404: f"the provider does not know model {inference.model!r} at this URL — "
+                  "`hermes review-loop models` lists what it offers",
              429: "the provider rate-limited or the account is out of credit",
              502: f"the proxy could not complete an HTTPS call to {host} (DNS, TLS, network, or a "
                   "non-JSON answer) — try `curl -sS https://" + str(host) + "` from this host"}
+    what = f"{seats}: {inference.describe()}"
     if status != 200:
-        report.add(step, "model:completion", FAIL, f"HTTP {status} via {host}, model {settings['model']}",
+        report.add(step, name, FAIL, f"HTTP {status} for {what}",
                    fixes.get(status, "check the upstream URL, the model name and the key"))
         return
     try:
         answer = json.loads(data)["choices"][0]["message"].get("content") or ""
     except Exception:
-        report.add(step, "model:completion", FAIL, f"HTTP 200 via {host}, but not a chat completion",
-                   "upstream must be an OpenAI-compatible /v1/chat/completions endpoint")
+        report.add(step, name, FAIL, f"{seats}: HTTP 200 via {host}, but not a chat completion",
+                   "upstream must be an OpenAI-compatible chat-completions endpoint")
         return
-    report.add(step, "model:completion", PASS,
-               f"HTTP 200 via {host}, model {settings['model']}, reply {answer.strip()[:40]!r}")
+    report.add(step, name, PASS, f"HTTP 200 — {what}, reply {answer.strip()[:40]!r}")
 
 
 # -- step 4: identities --------------------------------------------------------------------------
@@ -722,34 +778,33 @@ def check_ledger(report: Report, loop: dict, runtime_file: Path, settings: dict 
 # -- step 7: live no-write turn ------------------------------------------------------------------
 
 def run_live_turn(report: Report, loop: dict, settings: dict | None, pr: dict | None,
-                  timeout: int) -> None:
+                  timeout: int, reviewer=None) -> None:
     from . import broker_ipc, gh as gh_mod, trusted_turn
     from .run_supervisor import effective_reviews, isolated_prompt
     step = "live-turn"
-    if settings is None or pr is None:
+    if settings is None or pr is None or reviewer is None:
         report.add(step, "turn:reviewer", SKIP,
-                   "needs a usable runtime (step 1) and an authorized PR (step 5)")
+                   "needs a usable runtime and reviewer model (step 1) and an authorized PR (step 5)")
         return
     number, head, ref = pr["number"], pr["head"]["sha"], pr["head"]["ref"]
     row = {"seat": "reviewer", "repo": loop["repo"], "pr": number, "head": head}
     try:
         reviews = effective_reviews(loop, row, gh_mod.reviews(loop, number), str(ledger_path()))
         prompt = isolated_prompt(loop, row, reviews)
-        key = Path(settings["key_file"]).expanduser().read_text().strip()
-        report.redact.add(key)
+        report.redact.add(reviewer.key)
     except Exception as exc:
         report.add(step, "turn:prompt", FAIL, f"could not build the reviewer prompt: {exc}",
                    "check the reviews read in step 5")
         return
     scope = broker_ipc.RunScope(loop["repo"], number, head, "reviewer", ref)
     observed: dict = {}
-    report.text(f"  … running one isolated reviewer turn on #{number} (up to {timeout}s; "
-                "the broker is in no-write mode)")
+    report.text(f"  … running one isolated reviewer turn on #{number} as "
+                f"{reviewer.describe()} (up to {timeout}s; the broker is in no-write mode)")
     try:
         rc = trusted_turn.run_turn(loop, scope, source=Path(settings["source"]),
                                    venv=Path(settings["venv"]), runtime=Path(settings["runtime"]),
-                                   rust=Path(settings["rust"]), upstream=settings["upstream"],
-                                   key=key, model=settings["model"], prompt=prompt,
+                                   rust=Path(settings["rust"]), upstream=reviewer.upstream,
+                                   key=reviewer.key, model=reviewer.model, prompt=prompt,
                                    timeout=timeout, work_root=_work_root(loop),
                                    no_write=True, observed=observed)
         error = ""
@@ -782,7 +837,8 @@ def run_live_turn(report: Report, loop: dict, settings: dict | None, pr: dict | 
 # -- driver ------------------------------------------------------------------------------------
 
 def run(loop: dict, *, pr: int | None = None, model: bool = True, live_turn: bool = False,
-        timeout: int = DEFAULT_TIMEOUT, out=None, runtime_file: Path | None = None) -> int:
+        timeout: int = DEFAULT_TIMEOUT, out=None, runtime_file: Path | None = None,
+        resolver=None) -> int:
     """Run every step; return 1 when any check failed, else 0."""
     runtime_file = Path(runtime_file or runtime_path())
     redact = Redactor()
@@ -795,15 +851,20 @@ def run(loop: dict, *, pr: int | None = None, model: bool = True, live_turn: boo
         report.add("preconditions", "github:stub", FAIL, "REVIEW_LOOP_GH_STUB is set: GitHub is faked",
                    "unset REVIEW_LOOP_GH_STUB — the selftest must talk to the real API")
     with github_read_only(), worker_tempdir():
-        report.step("1. Runtime config")
+        report.step("1. Runtime config and seat models")
         settings = check_runtime(report, runtime_file)
         if settings is not None:
-            redact.add_file(Path(settings["key_file"]).expanduser())
+            from . import seat_model
+            for block in [seat_model.legacy_override(settings),
+                          *(settings.get("seats") or {}).values()]:
+                if block:
+                    redact.add_file(Path(block["key_file"]).expanduser())
+        seats = check_seats(report, loop, settings, resolver)
         report.step("2. Bubblewrap containment")
         check_bwrap(report, loop, settings, runtime_file)
-        report.step("3. Inference proxy")
+        report.step("3. Inference proxy (once per distinct seat model)")
         if model:
-            check_model(report, settings)
+            check_model(report, seats if settings is not None else None)
         else:
             report.add("inference", "model:completion", SKIP, "--no-model")
         report.step("4. GitHub identities")
@@ -814,7 +875,7 @@ def run(loop: dict, *, pr: int | None = None, model: bool = True, live_turn: boo
         check_ledger(report, loop, runtime_file, settings)
         report.step("7. Live isolated reviewer turn (no-write)")
         if live_turn:
-            run_live_turn(report, loop, settings, live_pr, timeout)
+            run_live_turn(report, loop, settings, live_pr, timeout, seats.get("reviewer"))
         else:
             report.add("live-turn", "turn:reviewer", SKIP, "pass --live-turn --pr N to run one")
     counts = report.counts()
