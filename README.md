@@ -1,5 +1,34 @@
 # hermes-review-loop
 
+> **Safety hold (issue #16): PR-facing reviewer, fixer and adjudicator agents are
+> disabled in this branch.** Eligible gate events are queued with an actionable
+> reason and emit `[SILENT]`, so Hermes never falls through to its normal
+> credential-owning gateway agent. The checkout is NOT a security sandbox.
+> Do not install this branch expecting an operational review loop. The broker
+> has isolated transport and exact-ref lease primitives, but an exact-ref lease
+> cannot atomically authorize PR state/author at receive-pack. The descriptions
+> below document the previous operational design, not current enabled behavior.
+>
+> **Operator decision: no unattended fixer push rollout.** The gate rejects
+> verdicts for PRs whose webhook author is not in `fixers`; the credentialed
+> broker independently reads the live PR author before every fixer write and
+> rejects missing/outsider authors. These checks do not close the time-of-check
+> race: a PR can close, become draft, change author/target, or close and reopen
+> after the final API read and before Git receives a ref update. The lease only
+> compares `refs/heads/<branch>` to the old SHA, not GitHub PR metadata. A
+> post-push readback can flag some transitions but cannot undo a published
+> commit or observe a transient close/reopen. Do not call that an atomic PR
+> policy. Keep the production worker config absent, PR-facing routes silent,
+> and fixer credentials unavailable to agents. For an individual fix, a human
+> operator must inspect the live PR owner, state, draft flag, base/head repo,
+> review and intended diff, then make the authorized branch write manually and
+> verify the exact PR/ref afterwards; stop and reconcile ambiguous outcomes,
+> never blindly retry. Before enabling any automation, require a provider-side
+> transaction/authorization mechanism spanning PR metadata and ref mutation (or
+> an explicitly accepted weaker threat model), plus uncertain-worker manual
+> reconciliation, notification delivery, credential-transport validation, and
+> end-to-end production-like tests. None is established by this branch.
+
 **Two agents review each other's pull requests, unattended — and every step in between is a
 script, not a model.**
 
@@ -384,6 +413,11 @@ underneath itself — the live run holds its old profile, login and credential u
 identity it started with". `apply --dry-run` shows all of it without writing: the seat diff, the
 route profiles it would rebind, and nothing else.
 
+`apply` is also the upgrade path for a loop installed before the dedicated adjudicator gate: its
+breach route still runs `gate_reviewer.py`, `doctor` flags it, and `apply --loop <id>` rebinds that
+route to `gate_adjudicator.py` in place, secret kept. Only a script this plugin itself once
+installed for the route (with its own prompt) is rewritten; anything else is left alone.
+
 Preview a loop before installing it with `hermes review-loop init ... --dry-run`: it prints the
 effective seat mapping (profile, login, route, and the URL the profile is part of) and stops
 without writing config, routes, hooks or cron.
@@ -419,12 +453,15 @@ never copied into `~/.hermes/skills/`.
 
 ### Watching from your phone (the observer feed)
 
-The seats drive each other; a person watching from a phone should not have to be a third agent in
-between. Give a loop an **observer** and it sends one short notice per transition to a chat you
-choose — Telegram, Discord, wherever that Hermes profile already talks:
+The seats drive each other in the historical design; on this branch, PR-facing turns are held
+for isolated workers or queued fail-closed, and no gateway agent is dispatched. An observer
+can still report a verified transition, but an `opened`, `handoff`, or `verdict` notice says the
+next turn is **queued**, not that a reviewer or fixer has started. Give a loop an **observer** and
+it sends one short notice per transition to a chat you choose — Telegram, Discord, wherever
+that Hermes profile already talks:
 
 ```
-🔧 [widgets] #7 `aaaaaaa` fix pushed · review requested (dev-fixer) · round 1/3 · next: reviewer
+🔧 [widgets] #7 `aaaaaaa` fix pushed · review requested (dev-fixer) · round 1/3 · next: reviewer queued
 https://github.com/acme/widgets/pull/7
 ```
 
@@ -529,7 +566,15 @@ profile, and nowhere else.
 
 ## Status and honesty
 
-Exercised and passing:
+**Current branch:** the hermetic canonical harness now checks `[SILENT]`,
+held eligible turns, and the guarded breach marker instead of expecting legacy
+`FIRE` payloads or an adjudicator POST. The focused pytest suite also exercises
+an isolated worker with disposable credentials and local fakes. Neither suite
+proves a safe GitHub-side PR-metadata/ref transaction; see
+`docs/issue-16-boundary.md`. The historical claims below describe pre-hold live
+use and must not be used to certify this branch.
+
+Historical pre-hold evidence (not current rollout authorization):
 
 - `python3 tests/run_tests.py` — full offline suite: every gate branch, the cap, the one-PR-one-
   seat rule (including the handoff that must *not* deadlock the gates), per-seat capacity and

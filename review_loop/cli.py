@@ -89,6 +89,11 @@ GATE_SCRIPT = {"reviewer": "gate_reviewer.py", "fixer": "gate_fixer.py",
                "adjudicator": "gate_adjudicator.py", "observer": "observe.py"}
 
 
+# Each role's route prompt: together with the gate script, the proof that a route is ours.
+_ROUTE_PROMPT = {"reviewer": prompts.REVIEWER, "fixer": prompts.FIXER,
+                 "adjudicator": prompts.ADJUDICATOR, "observer": prompts.OBSERVER}
+
+
 def _verify_routes(loop: dict, roles) -> None:
     """Refuse to write a route that is not this loop's to write.
 
@@ -130,14 +135,11 @@ def _verify_routes(loop: dict, roles) -> None:
             raise config.ConfigError(f"route {name!r} exists but its ownership cannot be verified "
                                      "— pick another route name")
         script = entry.get("script")
-        if script != GATE_SCRIPT[role]:
+        if script != GATE_SCRIPT[role] and script not in config.LEGACY_GATE_SCRIPTS.get(role, ()):
             raise config.ConfigError(
                 f"route {name!r} runs {script!r}, not {GATE_SCRIPT[role]!r} — it belongs to "
                 "something else; pick another route name")
-        expected_prompt = {"reviewer": prompts.REVIEWER, "fixer": prompts.FIXER,
-                           "adjudicator": prompts.ADJUDICATOR,
-                           "observer": prompts.OBSERVER}[role]
-        if entry.get("prompt") != expected_prompt:
+        if entry.get("prompt") != _ROUTE_PROMPT[role]:
             raise config.ConfigError(
                 f"route {name!r} does not have this {role} gate's prompt — ownership cannot be "
                 "verified; pick another route name")
@@ -321,6 +323,24 @@ def _route_binds(loop: dict, touched: set[str]) -> dict:
         if current != target:
             binds[role] = (name, current, target)
     return binds
+
+
+def _stale_scripts(loop: dict) -> dict:
+    """role → (route name, installed script) for this loop's routes still on an older gate.
+
+    Only a script this plugin itself once installed for that role counts, and only with the
+    role's own prompt: anything else is not provably ours and ``_verify_routes`` refuses it.
+    """
+    stale: dict = {}
+    for role, name in _routes_of(loop).items():
+        entry = routes.route(name)
+        if not isinstance(entry, dict):
+            continue
+        script = entry.get("script")
+        if (script in config.LEGACY_GATE_SCRIPTS.get(role, ())
+                and entry.get("prompt") == _ROUTE_PROMPT[role]):
+            stale[role] = (name, script)
+    return stale
 
 
 def _busy_seats(loop: dict, roles: set[str]) -> list[str]:
@@ -545,10 +565,24 @@ def _install_schedule(loop: dict, schedule: str, deliver: str) -> list[str]:
 # -- verbs ----------------------------------------------------------------------
 
 
-def _write_config(loop: dict) -> pathlib.Path:
+def _write_config(loop: dict, *, policy_change: bool = False) -> pathlib.Path:
+    with config.push_policy_lock():
+        return _write_config_locked(loop, policy_change=policy_change)
+
+
+def _write_config_locked(loop: dict, *, policy_change: bool = False) -> pathlib.Path:
     directory = config.config_dir()
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{loop['id']}.json"
+    if path.is_symlink():
+        raise config.ConfigError('symlinked loop config refused')
+    if path.exists() and not policy_change:
+        # Set/apply snapshots never own this switch. Re-read under the same lock
+        # used by explicit enable/disable and by the broker's ref operation.
+        current = config.load_id(loop['id'])
+        if current['repo'] != loop['repo']:
+            raise config.ConfigError('repository changed during config update')
+        loop = {**loop, 'unattended_fixer_push': current['unattended_fixer_push']}
     payload = json.dumps({k: v for k, v in loop.items() if v not in ({}, [], "")},
                          indent=2, sort_keys=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{loop['id']}.", suffix=".tmp", dir=directory)
@@ -564,6 +598,21 @@ def _write_config(loop: dict) -> pathlib.Path:
 
 def _restore_config(path: pathlib.Path, data: bytes) -> None:
     """Publish a previous snapshot without exposing partially restored JSON."""
+    with config.push_policy_lock():
+        if path.is_symlink():
+            raise config.ConfigError('symlinked loop config refused')
+        if path.exists():
+            current = config.load_id(path.stem)
+            snapshot = json.loads(data)
+            if snapshot.get('repo', '').lower() != current['repo']:
+                raise config.ConfigError('repository changed during config rollback')
+            if snapshot.get('unattended_fixer_push', False) != current['unattended_fixer_push']:
+                snapshot['unattended_fixer_push'] = current['unattended_fixer_push']
+                data = json.dumps(snapshot, indent=2, sort_keys=True).encode()
+        _restore_config_locked(path, data)
+
+
+def _restore_config_locked(path: pathlib.Path, data: bytes) -> None:
     fd, temporary = tempfile.mkstemp(prefix=f".{path.stem}.", suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(fd, "wb") as stream:
@@ -934,7 +983,10 @@ def cmd_apply(args) -> int:
     # The installed registry can drift independently of the loop and the form. Repair those
     # routes through the same ownership, seat and in-flight preflight as an identity push.
     binds = _route_binds(updated, set(_routes_of(updated)))
-    rebinding = touched | set(binds)
+    # A route installed by an older release (the pre-#21 breach route on gate_reviewer.py) is
+    # repaired here too: `init` refuses an existing loop, so apply is the only reconcile path.
+    repairs = _stale_scripts(updated)
+    rebinding = touched | set(binds) | set(repairs)
     try:
         # Validate what this apply would *write*: a loop that predates the seat checks keeps
         # loading, but a seat this push moves must be one that can actually run.
@@ -959,7 +1011,7 @@ def cmd_apply(args) -> int:
     missing_routes = sorted(name for role, name in _routes_of(updated).items()
                             if role in touched and not routes.route(name))
 
-    if not changes and not identity and not binds:
+    if not changes and not identity and not binds and not repairs:
         print(f"[{loop['id']}] already matches the plugin settings")
         return 0
     if not args.dry_run and updated.get("host") != loop.get("host") and loop.get("observer"):
@@ -976,6 +1028,9 @@ def cmd_apply(args) -> int:
         print(f"  {name}: {was} → {now}")
     for role, (name, current, target) in sorted(binds.items()):
         print(f"  route {name}: profile {current} → {target}   (the URL carries the profile)")
+    for role, (name, script) in sorted(repairs.items()):
+        print(f"  route {name}: script {script} → {GATE_SCRIPT[role]}   (installed by an older "
+              "release)")
     for name in missing_routes:
         print(f"  route {name}: not installed — `hermes review-loop init` creates routes; "
               "apply will not invent one behind your back")
@@ -1006,16 +1061,20 @@ def cmd_apply(args) -> int:
     except config.ConfigError as exc:
         print(f"refused: {exc}")
         return 2
-    previous = {name: routes.route(name) for name, _, _ in binds.values()}
+    previous = {name: routes.route(name)
+                for name in {bind[0] for bind in binds.values()} | {n for n, _ in repairs.values()}}
     config_path = config.config_dir() / f"{loop['id']}.json"
     previous_config = config_path.read_bytes()
     attempted_hooks = []
     try:
-        rebound = list(_install_routes(updated, roles=tuple(binds)).items()) if binds else []
+        rewrite = tuple(set(binds) | set(repairs))
+        rebound = list(_install_routes(updated, roles=rewrite).items()) if rewrite else []
         for role, name in rebound:
             entry = routes.route(name)
             if not entry or str(entry.get("profile") or "") != config.seat_profile(updated, role):
                 raise config.ConfigError(f"route {name} readback does not match requested profile")
+            if entry.get("script") != GATE_SCRIPT[role]:
+                raise config.ConfigError(f"route {name} readback does not run {GATE_SCRIPT[role]}")
         for hook_id, old, new in hook_moves:
             attempted_hooks.append((hook_id, old))
             _patch_hook_url(loop, hook_id, new)
@@ -1050,7 +1109,8 @@ def cmd_apply(args) -> int:
         return 2
     print(f"loop config updated: {path}")
     for role, name in rebound:
-        print(f"  route {name} rebound → profile {config.seat_profile(updated, role)}")
+        print(f"  route {name} rebound → profile {config.seat_profile(updated, role)}"
+              + (f", script {GATE_SCRIPT[role]}" if role in repairs else ""))
     for hook_id, _, new in hook_moves:
         print(f"  hook {hook_id} → {new}")
     return 0
@@ -1127,6 +1187,9 @@ def cmd_status(args) -> int:
             + ("" if config.seat_concurrency(loop, seat) > 1 else " (serialized)")
             for seat in ("reviewer", "fixer")))
         print(f"  clone:      {loop['clone'] or '(none)'}")
+        print("  fixer push: " + ("ENABLED — operator accepted PR-metadata/ref race"
+                                  if config.unattended_fixer_push_enabled(loop)
+                                  else "off (unattended pushes disabled)"))
         print(f"  state:      {st.dir}")
         print(f"  seats:      reviewer={loop['seats']['reviewer']['login']} "
               f"({loop['seats']['reviewer']['profile']}) · "
@@ -1270,6 +1333,72 @@ def cmd_arm(args) -> int:
     for loop in ([config.load_id(args.loop)] if args.loop else config.all_loops()):
         for line in _set_hooks(loop, not args.pause, args.admin_token):
             print(f"[{loop['id']}] {line}")
+    return 0
+
+def cmd_fixer_push(args) -> int:
+    """Change only this repository's unattended push permission by explicit operator action."""
+    try:
+        with config.push_policy_lock():
+            return _cmd_fixer_push_locked(args)
+    except (OSError, ValueError, config.ConfigError) as exc:
+        print(f"fixer push policy update not confirmed: {exc}")
+        return 2
+
+
+def _cmd_fixer_push_locked(args) -> int:
+    try:
+        loop = config.load_id(args.loop)
+        config.by_repo(loop['repo'])  # duplicate owners fail closed
+    except config.ConfigError as exc:
+        print(f"no such loop: {exc}")
+        return 2
+    if args.enable and not args.acknowledge_pr_race:
+        print("refused: host-operator policy only (not verified GitHub owner/admin consent). "
+              "Unattended fixer pushes have a residual PR-metadata/ref race: "
+              "closing, drafting or retargeting a PR between the last check and Git's "
+              "exact-SHA-lease push can still publish. Inspect the production boundary and "
+              "pass --acknowledge-pr-race to opt in for this repository.")
+        return 2
+    if args.enable:
+        try:
+            busy = _busy_seats(loop, {"fixer"})
+            from .run_supervisor import Supervisor, ACTIVE
+            ledger = config.home() / 'state' / 'review-loop-runs.sqlite'
+            if ledger.exists():
+                with Supervisor(ledger)._connect() as con:
+                    rows = con.execute(
+                        'SELECT pr,state FROM runs WHERE repo=? AND seat=? '
+                        'AND state IN (?,?,?,?) LIMIT 1',
+                        (loop['repo'], 'fixer', *ACTIVE)).fetchall()
+                busy.extend(f"fixer supervisor on PR {row['pr']} ({row['state']})"
+                            for row in rows)
+        except (OSError, ValueError) as exc:
+            print(f"refused: cannot check active fixer runs: {exc}")
+            return 2
+        if busy:
+            print("refused: fixer run in flight; wait for it to finish before arming pushes: "
+                  + "; ".join(busy))
+            return 2
+    enabled = bool(args.enable)
+    if config.unattended_fixer_push_enabled(loop) == enabled:
+        print(f"[{loop['id']}] unattended fixer push already {'enabled' if enabled else 'disabled'}")
+        return 0
+    updated = config.normalize({**loop, "unattended_fixer_push": enabled})
+    if args.dry_run:
+        print(f"[{loop['id']}] dry run — would {'enable' if enabled else 'disable'} "
+              "unattended fixer pushes; nothing written")
+        return 0
+    try:
+        path = _write_config_locked(updated, policy_change=True)
+        actual = config.load_id(loop["id"])
+        if actual["repo"] != loop["repo"] or config.unattended_fixer_push_enabled(actual) != enabled:
+            raise config.ConfigError("readback does not match the requested repository/policy")
+    except (OSError, ValueError, config.ConfigError) as exc:
+        print(f"fixer push policy update not confirmed: {exc}")
+        return 2
+    print(f"[{loop['id']}] {loop['repo']}: host-operator unattended fixer push "
+          f"{'enabled (not GitHub owner consent; residual PR-metadata/ref race acknowledged)' if enabled else 'disabled'} "
+          f"in {path}")
     return 0
 
 
@@ -1481,6 +1610,16 @@ def register_cli(ctx, settings: dict | None = None) -> None:
         arm.add_argument("--pause", action="store_true", help="pause instead of arming")
         arm.add_argument("--admin-token", default="")
         arm.set_defaults(func=cmd_arm)
+
+        fixer_push = sub.add_parser("fixer-push", help="Explicit per-repository unattended fixer push policy")
+        fixer_push.add_argument("--loop", required=True, help="exact loop id (never all loops)")
+        direction = fixer_push.add_mutually_exclusive_group(required=True)
+        direction.add_argument("--enable", action="store_true", help="opt this repository in")
+        direction.add_argument("--disable", action="store_true", help="turn unattended pushes off")
+        fixer_push.add_argument("--acknowledge-pr-race", action="store_true",
+                                help="accept the residual non-atomic PR-metadata/ref race; required for --enable")
+        fixer_push.add_argument("--dry-run", action="store_true", help="show action without writing")
+        fixer_push.set_defaults(func=cmd_fixer_push)
 
         drain = sub.add_parser("drain", help="Start a queued run once its seat is free")
         drain.add_argument("--loop", required=True)

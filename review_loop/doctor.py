@@ -384,10 +384,19 @@ def check_adjudicator_route(loop: dict, data: dict) -> Check | None:
                      f"events {events or '(none)'} do not include 'pull_request'",
                      "re-run init for this loop: breach wakes use pull_request events")
     script = str(entry.get("script") or "")
+    if script in config.LEGACY_GATE_SCRIPTS["adjudicator"]:
+        # Installed before the dedicated adjudicator gate. `init` refuses an existing loop, so
+        # the hint names the command that rewrites this route in place, secret kept.
+        return Check(f"route:{name}", MISMATCH,
+                     f"runs {script!r} (installed by an older release), expected "
+                     "'gate_adjudicator.py'",
+                     f"run `hermes review-loop apply --loop {loop['id']}` to rebind it to "
+                     "gate_adjudicator.py (its secret is kept)")
     if script != "gate_adjudicator.py":
         return Check(f"route:{name}", MISMATCH,
                      f"runs {script or '(none)'!r}, expected 'gate_adjudicator.py'",
-                     "re-run init to install the adjudicator gate for breach wakes")
+                     "this route is not the loop's adjudicator gate — point adjudicator.route at "
+                     "a route of its own")
     if not (scripts_dir() / script).is_file():
         return Check(f"route:{name}", ABSENT, f"gate_adjudicator.py missing from {scripts_dir()}",
                      "reinstall the plugin")

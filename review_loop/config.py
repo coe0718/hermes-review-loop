@@ -47,6 +47,8 @@ is dropped with its reason kept under ``misconfigured`` for ``status`` to report
 
 from __future__ import annotations
 
+import contextlib
+
 import ipaddress
 import json
 import os
@@ -115,6 +117,11 @@ LOGIN_SETTINGS: dict = {"reviewer": "reviewer_login", "fixer": "fixer_login"}
 # Every role that can own a webhook route. The adjudicator is here but not in ``SEAT_KEYS``: it has
 # a route and a profile, and no login or allowlist of its own.
 ROUTE_ROLES = ("reviewer", "fixer", "adjudicator")
+# Gate scripts an older release of *this* plugin installed for a role. Before the dedicated
+# adjudicator gate (PR #21) the breach route ran gate_reviewer.py. Such a route is still ours —
+# its prompt proves it — so ``apply`` rebinds it in place instead of refusing it as foreign, and
+# ``doctor`` points there rather than at ``init``, which refuses an existing loop.
+LEGACY_GATE_SCRIPTS: dict = {"adjudicator": frozenset({"gate_reviewer.py"})}
 
 # A Hermes profile name is a directory name under ``profiles/``. Refusing separators and dots-only
 # names here is what keeps a typo from resolving to somewhere outside the profiles root.
@@ -287,7 +294,16 @@ DEFAULTS: dict = {
     "ttl_min": 45,            # seat lock lifetime: past this a crashed run has lost its seat
     "inflight_ttl_min": 10,
     "host": "",
+    "unattended_fixer_push": False,  # per-repository; never inherited from plugin settings
 }
+
+def unattended_fixer_push_enabled(loop: dict) -> bool:
+    """Only a literal opt-in in a trusted loop config authorizes unattended fixer pushes.
+
+    Callers must load the loop from the host-owned config file, not an event payload or
+    sandbox-supplied mapping. Hook arming, seat assignment and a legacy config are not consent.
+    """
+    return isinstance(loop, dict) and loop.get("unattended_fixer_push") is True
 
 SEAT_KEYS = ("reviewer", "fixer")
 
@@ -565,8 +581,43 @@ def config_dir() -> pathlib.Path:
     return pathlib.Path(override).expanduser() if override else home() / "review-loops.d"
 
 
+@contextlib.contextmanager
+def push_policy_lock():
+    """Serialize host CLI policy writes and a broker's final push attempt.
+
+    Manual config edits outside this lock are not an authorization mechanism.
+    """
+    import fcntl
+    directory = config_dir()
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / '.fixer-push-policy.lock').open('a+b') as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(stream, fcntl.LOCK_UN)
+
+
 def _path(value: str) -> pathlib.Path:
     return pathlib.Path(str(value)).expanduser()
+
+
+def dangerous_root(value: str) -> str:
+    """Why a cleanup root is too broad to accept, or ``""`` when it is fine.
+
+    Cleanup removes PR-named children of every root. ``/``, the home directory and anything
+    above it hold the operator's own projects and dotfiles, which are never a loop's to delete,
+    however they happen to be named.
+    """
+    path = _path(value).resolve()
+    home_dir = pathlib.Path.home().resolve()
+    if path == pathlib.Path(path.anchor):
+        return "the filesystem root"
+    if path == home_dir:
+        return "the home directory"
+    if path in home_dir.parents:
+        return "an ancestor of the home directory"
+    return ""
 
 
 def normalize(raw: dict, source: pathlib.Path | None = None) -> dict:
@@ -575,6 +626,9 @@ def normalize(raw: dict, source: pathlib.Path | None = None) -> dict:
         raise ConfigError(f"{source or 'config'}: expected a JSON object")
     loop = {**DEFAULTS, **raw}
     where = f"{source or loop.get('id', '<inline>')}"
+    if type(loop["unattended_fixer_push"]) is not bool:
+        raise ConfigError(f"{where}: 'unattended_fixer_push' must be a JSON boolean; "
+                          "only explicit true authorizes unattended fixer pushes")
 
     repo = str(loop.get("repo") or "").strip()
     if repo.count("/") != 1:
@@ -628,6 +682,11 @@ def normalize(raw: dict, source: pathlib.Path | None = None) -> dict:
     loop["tokens"] = {k: str(v) for k, v in (loop.get("tokens") or {}).items()}
     loop["read_token"] = str(loop.get("read_token") or (next(iter(loop["tokens"]), "")))
     loop["roots"] = [str(p) for p in (loop.get("roots") or [])]
+    for root in loop["roots"]:
+        reason = dangerous_root(root)
+        if reason:
+            raise ConfigError(f"{where}: root {root!r} is {reason}; cleanup deletes PR-named "
+                              f"children of every root, so a root must be a dedicated directory")
 
     # `or 1` here would swallow a literal 0 into "serialized", which is the worst kind of silent
     # correction: the operator asked for something invalid and got a loop that looks configured.
@@ -671,10 +730,17 @@ def load_file(path: pathlib.Path) -> dict:
 
 
 def load_id(loop_id: str) -> dict:
+    if not loop_id or pathlib.Path(loop_id).name != loop_id or loop_id in ('.', '..'):
+        raise ConfigError('loop ID must name one config file')
     path = config_dir() / f"{loop_id}.json"
-    if not path.exists():
+    if path.is_symlink():
+        raise ConfigError(f"{path}: symlinked loop configs are not allowed")
+    if not path.is_file():
         raise ConfigError(f"no loop config named {loop_id!r} in {config_dir()}")
-    return load_file(path)
+    loop = load_file(path)
+    if loop['id'] != loop_id:
+        raise ConfigError(f"{path}: loop ID does not match filename")
+    return loop
 
 
 def all_loops() -> list[dict]:
@@ -683,15 +749,15 @@ def all_loops() -> list[dict]:
     directory = config_dir()
     if not directory.exists():
         return []
-    return [load_file(p) for p in sorted(directory.glob("*.json"))]
+    return [load_id(p.stem) for p in sorted(directory.glob("*.json"))]
 
 
 def by_repo(full_name: str) -> dict | None:
     want = str(full_name or "").lower()
-    for loop in all_loops():
-        if loop["repo"] == want:
-            return loop
-    return None
+    matches = [loop for loop in all_loops() if loop['repo'] == want]
+    if len(matches) > 1:
+        raise ConfigError(f"duplicate loop configs for {want}: unattended writes denied")
+    return matches[0] if matches else None
 
 
 def artifacts_dir(loop: dict, number: int) -> pathlib.Path:

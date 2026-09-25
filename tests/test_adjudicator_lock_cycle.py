@@ -93,18 +93,15 @@ class AdjudicatorCycleTest(unittest.TestCase):
                 return False
         return self.st.breach_deliver(7, entry, current or (lambda: self.head_file.read_text() == head), send)
 
-    def test_synchronous_gateway_claims_once_without_deadlock(self):
+    def test_synchronous_gateway_is_held_without_deadlock(self):
         self.assertEqual(self.deliver(HEAD_A), "new")
         self.assertEqual(len(self.requests), 1)
-        self.assertTrue(self.requests[0].startswith("{"), self.requests)
-        self.assertEqual(json.loads(self.requests[0])["_loop"]["head"], HEAD_A)
-        self.assertEqual(self.st.breach_get(7)["status"], "adjudicating")
-        self.assertEqual(self.deliver(HEAD_A), "already")
-        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(self.requests[0], "[SILENT]")
+        self.assertEqual(self.st.breach_get(7)["status"], "delivery-pending")
         self.head_file.write_text(HEAD_B)
         self.assertEqual(self.deliver(HEAD_A), "stale")
         self.assertEqual(self.deliver(HEAD_B), "new")
-        self.assertEqual(json.loads(self.requests[-1])["_loop"]["head"], HEAD_B)
+        self.assertEqual(self.requests[-1], "[SILENT]")
         self.assertEqual(self.st.breach_get(7)["head"], HEAD_B)
 
     def test_concurrent_delivery_and_failure_recovery(self):
@@ -113,7 +110,7 @@ class AdjudicatorCycleTest(unittest.TestCase):
             results = list(pool.map(lambda _: self.deliver(HEAD_A), range(4)))
         self.assertEqual(results.count("new"), 1)
         self.assertEqual(len(self.requests), 1)
-        self.assertEqual(self.st.breach_get(7)["status"], "adjudicating")
+        self.assertEqual(self.st.breach_get(7)["status"], "delivery-pending")
 
         self.head_file.write_text(HEAD_B)
         # An unsuccessful transport leaves the new head retryable, not consumed.
@@ -125,7 +122,8 @@ class AdjudicatorCycleTest(unittest.TestCase):
             self.server.server_port = original
         self.assertEqual(self.st.breach_get(7)["status"], "delivery-pending")
         self.assertEqual(self.deliver(HEAD_B), "retry")
-        self.assertEqual(self.st.breach_get(7)["status"], "adjudicating")
+        self.assertEqual(self.st.breach_get(7)["status"], "delivery-pending")
+        self.assertEqual(self.requests[-1], "[SILENT]")
 
     def test_late_delivery_does_not_overwrite_newer_head(self):
         entry = lambda head: {"pr": 7, "head": head, "rounds": 3, "reason": "cap"}

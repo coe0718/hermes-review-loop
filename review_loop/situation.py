@@ -58,7 +58,12 @@ def _fields(pr: dict, repo: str) -> tuple[str, str, str, str] | None:
 
 
 def _verify_trunk(loop: dict, base_ref: str, base_sha: str) -> Resolution | None:
-    """Require the live exact commit ref, not a PR's potentially stale base snapshot."""
+    """Require a readable live trunk commit ref.
+
+    A PR's ``base.sha`` is not compared with the trunk tip: trunk moving on does not change
+    what a direct-trunk PR or a stack rooted on trunk is waiting for, and requiring equality
+    would block every stack in an active repository after any merge.
+    """
     path = f"/repos/{loop['repo']}/git/ref/heads/{quote(base_ref, safe='/')}"
     live_ref, error = gh.fetch(loop, path)
     if error or not isinstance(live_ref, dict):
@@ -69,8 +74,6 @@ def _verify_trunk(loop: dict, base_ref: str, base_sha: str) -> Resolution | None
             not isinstance(obj, dict) or obj.get("type") != "commit" or
             not isinstance(live_sha, str) or not SHA.fullmatch(live_sha)):
         return Resolution("blocked", "trunk ref response unverified")
-    if live_sha.lower() != base_sha:
-        return Resolution("blocked", "trunk advanced beyond PR base SHA")
     return None
 
 

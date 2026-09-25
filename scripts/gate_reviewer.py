@@ -14,7 +14,7 @@ when its turn *starts*:
   let it go. No agent runs, no tokens.
 
 stdin : a GitHub webhook payload
-stdout: that payload with a ``_loop`` block, or ``[SILENT]``
+stdout: ``[SILENT]`` (eligible runs queue; whole-agent isolation not available)
 """
 
 from __future__ import annotations
@@ -72,7 +72,7 @@ def main() -> None:
         requested = ((payload.get("requested_reviewer") or {}).get("login") or "").lower()
         if requested != loop["reviewer_seat"]:
             silence(f"review requested from {requested or 'nobody'} — not this seat")
-        if sender not in set(loop["fixers"]) | {"patchhive"} and sender not in loop["reviewers"]:
+        if sender not in set(loop["fixers"]) and sender not in loop["reviewers"]:
             silence(f"sender {sender or 'unknown'} is not a fixer")
 
     if pr.get("draft"):
@@ -98,7 +98,10 @@ def main() -> None:
             or ((current.get("user") or {}).get("login") or "").lower() not in loop["fixers"]):
         silence("current PR is no longer eligible for this review")
     snapshot_base_sha = (pr.get("base") or {}).get("sha")
-    if snapshot_base_sha and snapshot_base_sha != (current.get("base") or {}).get("sha"):
+    # Only a stacked base's generation decides which diff is under review; trunk moving on
+    # does not make a direct-trunk review request stale.
+    if (snapshot_base_sha and (pr.get("base") or {}).get("ref") != loop["base"]
+            and snapshot_base_sha != (current.get("base") or {}).get("sha")):
         silence("review trigger is from an older base generation")
     if transition.record(loop, st, number, head, loop["base"]):
         # A review_requested webhook is not a generation-bound receipt. Even if
@@ -110,6 +113,9 @@ def main() -> None:
     reviews = gate.fetch_reviews(loop, number)
     if gate.reviewed_at_head(reviews, loop, head):
         silence(f"head {head[:7]} already has a reviewer's verdict")
+    dismissed = [int(r['id']) for r in gate.reviews_at_head(reviews, loop, head)
+                 if gh.review_state(r) == 'DISMISSED' and type(r.get('id')) is int and r['id'] > 0]
+    turn_key = f'dismissed:{max(dismissed)}' if dismissed else ''
     if st.inflight(f"review:{number}:{head}"):
         silence(f"a review for head {head[:7]} is already out")
 
@@ -128,21 +134,12 @@ def main() -> None:
         log(f"released fixer seat for {gate.seat_key(loop, number)}")
     gate.drain_seat(loop, "fixer")
 
-    workspace = gate.take_seat(loop, st, seat, number, head, f"review #{number} @ {head[:7]}",
-                               login=(loop["seats"][seat].get("login") or ""))
-
-    payload["_loop"] = gate.loop_block(loop, number, head, workspace, seat=seat, round=rounds + 1,
-                                       role="reviewer")
-    st.inflight(f"review:{number}:{head}", record=True)
-    gate.ping_start(loop, seat, gate.start_text(loop, seat, number, head, rounds + 1))
-    # The feed is told last: by now the seat is claimed, the run is recorded and the seat's own
-    # channel has been pinged, so a destination that hangs costs seconds at the end of a gate and
-    # never a handoff, a queue slot or a seat. `handoff` is the fixer's push-then-ask; everything
-    # else here is a first look at a head nobody has reviewed yet.
-    observer.notify(loop, st, "handoff" if action == "review_requested" else "opened", number, head,
-                    identity=action, actor=sender if action == "review_requested" else author,
-                    next_turn="reviewer", round_no=rounds + 1)
-    print(json.dumps(payload))
+    gate.block_pr_agent(
+        loop, st, seat, number, head, turn_key=turn_key,
+        on_queued=lambda: observer.notify(
+            loop, st, "handoff" if action == "review_requested" else "opened", number, head,
+            identity=action, actor=sender if action == "review_requested" else author,
+            next_turn="reviewer queued", round_no=rounds + 1))
 
 
 if __name__ == "__main__":

@@ -30,6 +30,8 @@ API = "https://api.github.com"
 REVIEW_PAGE_SIZE = 100
 # A persistently full endpoint must not loop forever or authorize a partial history.
 MAX_REVIEW_PAGES = 100
+# The same bound for the open-PR listing: a repository past 10,000 open PRs reads as unknown.
+MAX_PR_PAGES = 100
 
 
 class GitHubError(Exception):
@@ -158,20 +160,28 @@ def reviews_read(loop: dict, number: int) -> tuple[list[dict] | None, str]:
     A full page does not prove it is the last page. The first path remains unchanged for
     existing API stubs; subsequent pages use GitHub's ordinary page query parameter.
     """
-    path = reviews_path(loop, number)
+    return _read_pages(loop, reviews_path(loop, number), "review", MAX_REVIEW_PAGES)
+
+
+def _read_pages(loop: dict, path: str, what: str, max_pages: int) -> tuple[list[dict] | None, str]:
+    """Every page of a ``per_page=100`` listing, or ``(None, reason)`` — never a prefix of it.
+
+    A failed, malformed or oversized page anywhere makes the whole listing unknown: the caller
+    would otherwise read "the first N items" as "all of them".
+    """
     result: list[dict] = []
-    for page in range(1, MAX_REVIEW_PAGES + 1):
+    for page in range(1, max_pages + 1):
         page_path = path if page == 1 else f"{path}&page={page}"
         items, error = fetch(loop, page_path)
         if error:
-            return None, f"review page {page}: {error}"
+            return None, f"{what} page {page}: {error}"
         if not isinstance(items, list) or len(items) > REVIEW_PAGE_SIZE or not all(
                 isinstance(item, dict) for item in items):
-            return None, f"review page {page}: invalid review list"
+            return None, f"{what} page {page}: invalid {what} list"
         result.extend(items)
         if len(items) < REVIEW_PAGE_SIZE:
             return result, ""
-    return None, f"review history exceeds {MAX_REVIEW_PAGES} full pages"
+    return None, f"{what} listing exceeds {max_pages} full pages"
 
 
 def reviews(loop: dict, number: int):
@@ -184,21 +194,15 @@ def reviews(loop: dict, number: int):
 def open_prs_read(loop: dict) -> tuple[list[dict] | None, str]:
     """Complete bounded listing: a full last page cannot authorize a partial chain."""
     path = f"/repos/{loop['repo']}/pulls?state=open&per_page=100"
-    result: list[dict] = []
-    for page in range(1, MAX_REVIEW_PAGES + 1):
-        items, error = fetch(loop, path if page == 1 else f"{path}&page={page}")
-        if error:
-            return None, f"open PR page {page}: {error}"
-        if not isinstance(items, list) or len(items) > REVIEW_PAGE_SIZE or not all(
-                isinstance(item, dict) for item in items):
-            return None, f"open PR page {page}: invalid PR list"
-        result.extend(items)
-        if len(items) < REVIEW_PAGE_SIZE:
-            return result, ""
-    return None, f"open PR list exceeds {MAX_REVIEW_PAGES} full pages"
+    return _read_pages(loop, path, "open PR", MAX_PR_PAGES)
 
 
 def open_prs(loop: dict):
+    """Every open PR, or ``None`` (unknown) when any page could not be read.
+
+    The watchdog treats this as its scheduling view; a repository with more than 100 open PRs
+    read as "the first 100" would silently never scan or drain the rest.
+    """
     result, error = open_prs_read(loop)
     if error:
         log(f"gh open PR list failed: {error}")

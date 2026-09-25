@@ -27,11 +27,10 @@ class SituationTest(unittest.TestCase):
                 situation.gh, "fetch", return_value=({"ref": "refs/heads/main", "object": {"type": "commit", "sha": A}}, "")):
             return situation.resolve(LOOP, child["number"])
 
-    def test_direct_base_requires_live_matching_trunk_ref(self):
+    def test_direct_base_requires_readable_live_trunk_ref(self):
         direct = pr(184, "child", C, "main", A)
         path = "/repos/acme/widgets/git/ref/heads/main"
-        cases = (({"ref": "refs/heads/main", "object": {"type": "commit", "sha": B}}, ""),
-                 ({"ref": "refs/heads/other", "object": {"type": "commit", "sha": A}}, ""),
+        cases = (({"ref": "refs/heads/other", "object": {"type": "commit", "sha": A}}, ""),
                  ({"ref": "refs/heads/main", "object": {"type": "tag", "sha": A}}, ""),
                  ({"ref": "refs/heads/main", "object": {"type": "commit", "sha": "bad"}}, ""),
                  ({"ref": "refs/heads/main", "object": {"type": "commit"}}, ""),
@@ -46,15 +45,20 @@ class SituationTest(unittest.TestCase):
         with mock.patch.object(gh, "pr", return_value=direct), mock.patch.object(
                 gh, "fetch", return_value=({"ref": "refs/heads/main", "object": {"type": "commit", "sha": A.upper()}}, "")):
             self.assertEqual(situation.resolve(LOOP, 184).status, "eligible")
+        # Trunk advancing past the PR's base snapshot is ordinary; it does not block the PR.
+        with mock.patch.object(gh, "pr", return_value=direct), mock.patch.object(
+                gh, "fetch", return_value=({"ref": "refs/heads/main", "object": {"type": "commit", "sha": B}}, "")):
+            self.assertEqual(situation.resolve(LOOP, 184).status, "eligible")
 
-    def test_stacked_root_requires_independent_live_trunk_generation(self):
+    def test_stacked_root_requires_readable_live_trunk_ref(self):
         child = pr(184, "child", D, "middle", C)
         middle = pr(183, "middle", C, "parent", B)
         root = pr(182, "parent", B, "main", A)
         path = "/repos/acme/widgets/git/ref/heads/main"
         valid = {"ref": "refs/heads/main", "object": {"type": "commit", "sha": A.upper()}}
         cases = ((valid, "", "waiting"),
-                 ({"ref": "refs/heads/main", "object": {"type": "commit", "sha": D}}, "", "blocked"),
+                 # Trunk advanced after the root was opened: still waiting on the parent.
+                 ({"ref": "refs/heads/main", "object": {"type": "commit", "sha": D}}, "", "waiting"),
                  ({"ref": "refs/heads/other", "object": {"type": "commit", "sha": A}}, "", "blocked"),
                  ({"ref": "refs/heads/main", "object": {"type": "tag", "sha": A}}, "", "blocked"),
                  ({"ref": "refs/heads/main", "object": {"type": "commit", "sha": "invalid"}}, "", "blocked"),

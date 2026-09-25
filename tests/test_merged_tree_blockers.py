@@ -140,7 +140,9 @@ class EffectiveVerdictTest(unittest.TestCase):
         for reviews, should_fire, should_pop in scenarios:
             with self.subTest(reviews=reviews):
                 st.reset_mock()
-                st.queue_items.return_value = {"acme/widgets#7": {"head": HEAD, "at": 1}}
+                entry = {"head": HEAD, "at": 1}
+                # The gate acknowledges a fired entry by removing it; drain reads that back.
+                st.queue_items.side_effect = [{"acme/widgets#7": entry}, {}]
                 st.active.return_value = {}
                 st.held_by_other.return_value = None
                 st.watch.return_value = {}
@@ -154,10 +156,11 @@ class EffectiveVerdictTest(unittest.TestCase):
                     self.assertEqual(fire.call_args.args[2]["review"]["id"], REJECTED["id"])
                 else:
                     fire.assert_not_called()
-                if should_pop:
-                    st.queue_pop.assert_called_once_with("fixer", "acme/widgets#7")
+                # A superseded entry is dropped by drain; a fired one only by the gate that took it.
+                if should_pop and not should_fire:
+                    st.queue_pop_if.assert_called_once_with("fixer", "acme/widgets#7", entry)
                 else:
-                    st.queue_pop.assert_not_called()
+                    st.queue_pop_if.assert_not_called()
 
     def test_first_armed_sweep_retries_and_flushes_without_stall(self):
         st = mock.Mock()

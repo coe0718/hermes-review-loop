@@ -83,6 +83,43 @@ def artifacts_for(loop: dict, number: int) -> str:
     return str(config.artifacts_dir(loop, number))
 
 
+def block_pr_agent(loop: dict, st: state_mod.LoopState, seat: str,
+                   number: int, head: str, on_queued=None, *, turn_key: str = '') -> None:
+    """Durably enqueue an isolated turn; NEVER return a gateway-dispatch payload.
+
+    An absent/invalid private runtime configuration is a visible fail-closed hold.
+    The ledger's unique repo/PR/head/seat/turn index deduplicates webhook redelivery
+    before launching a detached worker. No checkout or agent runs in this script.
+    """
+    from .run_supervisor import Supervisor
+
+    runtime = config.home() / "review-loop-runtime.json"
+    key = seat_key(loop, number)
+    queued = st.queue_items(seat).get(key)
+    try:
+        supervisor = Supervisor(
+            config.home() / "state" / "review-loop-runs.sqlite",
+            production_config=runtime, hermes_home=config.home(),
+            capacity={s: config.seat_concurrency(loop, s) for s in ("reviewer", "fixer")},
+        )
+        supervisor.recover()
+        delivery = f"{loop['repo']}:{number}:{head}:{seat}"
+        supervisor.enqueue(delivery + (f':{turn_key}' if turn_key else ''),
+                           loop["repo"], number, head, seat, turn_key=turn_key)
+        st.queue_pop_if(seat, key, queued)
+        log(f"#{number} @ {head[:7]} {seat} enqueued for isolated worker")
+    except Exception as exc:
+        reason = f"isolated worker unavailable: {type(exc).__name__}: {exc}"
+        st.queue_replace_if(seat, key, queued, head, pr_url(loop, number), reason)
+        log(f"#{number} @ {head[:7]} {seat} held: {reason}")
+    if on_queued is not None:
+        try:
+            on_queued()
+        except Exception as exc:
+            log(f"#{number} @ {head[:7]} observer notice failed: {type(exc).__name__}: {exc}")
+    silence()
+
+
 def isolation_block(loop: dict, number: int, workspace: dict | None, seat: str) -> dict:
     """Where this run is allowed to work — always present, so no prompt key renders as text.
 
@@ -769,19 +806,11 @@ def wake_adjudicator(loop: dict, number: int, head: str, rounds: int, reason: st
     The rule the adjudicator is given: read the two positions, rule, and do not merge. The
     pending marker written by the caller stays retryable if this POST fails.
     """
-    target = routes.target(loop["adjudicator"]["route"], loop.get("host"))
-    if not target:
-        log("no adjudicator route — the breach marker is the only record")
-        return False
-    payload = {"repository": {"full_name": loop["repo"]},
-               "action": "review_loop_breach", "number": number,
-               "_loop": {**loop_block(loop, number, head, round=rounds, reason=reason),
-                         "role": "adjudicator"}}
-    delivered = routes.fire(loop["adjudicator"]["route"], "pull_request", payload,
-                            f"breach-{number}", loop.get("host"))
-    if delivered:
-        log(f"adjudicator woken for #{number}")
-    return delivered
+    # The adjudicator is also PR-facing. Its legacy route dispatches a normal
+    # credential-owning gateway agent; never wake it until isolated end-to-end.
+    # Return false so the #21 delivery-pending marker remains retryable.
+    log(f"adjudicator blocked for #{number} @ {head[:7]}: no whole-agent isolation")
+    return False
 
 
 def breach(loop: dict, st: state_mod.LoopState, number: int, head: str, rounds: int,
@@ -879,29 +908,33 @@ def take_seat(loop: dict, st: state_mod.LoopState, seat: str, number: int, head:
     key = seat_key(loop, number)
     capacity = config.seat_concurrency(loop, seat)
 
-    if st.is_active(seat, key):
-        log(f"{seat} is already running {key} — refusing a second run at the same PR")
-        silence()
+    # Check and claim are one step under the loop's state lock: two gates reading "one slot
+    # free" and both acquiring would put the seat over its capacity. ``silence()`` raises, and
+    # the lock is released on the way out.
+    with st.locked():
+        if st.is_active(seat, key):
+            log(f"{seat} is already running {key} — refusing a second run at the same PR")
+            silence()
 
-    other = st.held_by_other(seat, key)
-    if other:
-        st.queue_add(seat, key, head, pr_url(loop, number),
-                     f"the {other} seat is working this PR")
-        log(f"{other} holds #{number} — queued {seat} rather than running both on one PR")
-        silence(f"the {other} seat is working this PR — queued until it hands off")
+        other = st.held_by_other(seat, key)
+        if other:
+            st.queue_add(seat, key, head, pr_url(loop, number),
+                         f"the {other} seat is working this PR")
+            log(f"{other} holds #{number} — queued {seat} rather than running both on one PR")
+            silence(f"the {other} seat is working this PR — queued until it hands off")
 
-    live = st.active(seat)
-    used, limit = seat_capacity(loop, st, seat)
-    if used >= limit:
-        held = ", ".join(f"{k} ({int(time.time() - v.get('at', time.time()))}s)"
-                         for k, v in sorted(live.items()))
-        st.queue_add(seat, key, head, pr_url(loop, number),
-                     f"{seat} at capacity {len(live)}/{capacity}: {held}")
-        log(f"{seat} at capacity {len(live)}/{capacity} ({held}) — queued #{number} @ {head[:7]}")
-        silence()
+        live = st.active(seat)
+        used, limit = seat_capacity(loop, st, seat)
+        if used >= limit:
+            held = ", ".join(f"{k} ({int(time.time() - v.get('at', time.time()))}s)"
+                             for k, v in sorted(live.items()))
+            st.queue_add(seat, key, head, pr_url(loop, number),
+                         f"{seat} at capacity {len(live)}/{capacity}: {held}")
+            log(f"{seat} at capacity {len(live)}/{capacity} ({held}) — queued #{number} @ {head[:7]}")
+            silence()
 
-    st.acquire(seat, key, head, why)
-    st.queue_pop(seat, key)        # a direct event can outrun the drain: the entry is stale now
+        st.acquire(seat, key, head, why)
+        st.queue_pop(seat, key)        # a direct event can outrun the drain: the entry is stale now
 
     workspace = isolation.ensure(loop, number, seat, head, login=login or "")
     if workspace is None and capacity > 1:

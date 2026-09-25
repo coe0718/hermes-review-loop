@@ -263,14 +263,12 @@ class ReconciliationTest(unittest.TestCase):
                 fixer.main()
         self.assertFalse(any(n.get("next_turn") == "you merge" for n in notices), notices)
 
-    def test_approval_second_read_retarget_same_head_cannot_announce_merge(self):
+    def test_approval_live_retarget_same_head_cannot_announce_merge(self):
         self.loop.update(reviewers=["vex"], reviewer_seat="vex")
         direct = pr(184, "child", C, "main", A)
-        direct["state"] = "open"
-        direct["draft"] = False
+        direct.update(state="open", draft=False, user={"login": "fixer"})
         stacked = pr(184, "child", C, "parent", B)
-        stacked["state"] = "open"
-        stacked["draft"] = False
+        stacked.update(state="open", draft=False, user={"login": "fixer"})
         approval = {"id": 29, "state": "APPROVED", "commit_id": C,
                     "submitted_at": "2024-01-01T00:00:00Z", "user": {"login": "vex"}}
         payload = {"action": "submitted", "number": 184, "pull_request": direct,
@@ -279,21 +277,21 @@ class ReconciliationTest(unittest.TestCase):
         with mock.patch.object(fixer.sys, "stdin", io.StringIO(json.dumps(payload))), \
              contextlib.redirect_stdout(io.StringIO()), \
              mock.patch.object(fixer.gate, "context", return_value=(self.loop, self.st)), \
-             mock.patch.object(fixer.gh, "pr", side_effect=[direct, stacked]) as reads, \
+             mock.patch.object(fixer.gh, "pr", return_value=stacked) as reads, \
              mock.patch.object(fixer.gh, "reviews", return_value=[approval]), \
              mock.patch.object(fixer.gate, "drain_seat"), \
              mock.patch.object(fixer.observer, "notify", side_effect=lambda *a, **kw: notices.append(kw)):
             with self.assertRaises(SystemExit):
                 fixer.main()
-        self.assertEqual(reads.call_count, 2)
+        self.assertEqual(reads.call_count, 1)
         self.assertFalse(any(n.get("next_turn") == "you merge" for n in notices), notices)
 
-    def test_approval_second_read_base_advance_same_head_cannot_announce_merge(self):
+    def test_approval_live_base_advance_same_head_cannot_announce_merge(self):
         self.loop.update(reviewers=["vex"], reviewer_seat="vex")
         direct = pr(184, "child", C, "main", A)
-        direct.update(state="open", draft=False)
+        direct.update(state="open", draft=False, user={"login": "fixer"})
         advanced = pr(184, "child", C, "main", B)
-        advanced.update(state="open", draft=False)
+        advanced.update(state="open", draft=False, user={"login": "fixer"})
         approval = {"id": 29, "state": "APPROVED", "commit_id": C,
                     "submitted_at": "2024-01-01T00:00:00Z", "user": {"login": "vex"}}
         payload = {"action": "submitted", "number": 184, "pull_request": direct,
@@ -302,13 +300,13 @@ class ReconciliationTest(unittest.TestCase):
         with mock.patch.object(fixer.sys, "stdin", io.StringIO(json.dumps(payload))), \
              contextlib.redirect_stdout(io.StringIO()), \
              mock.patch.object(fixer.gate, "context", return_value=(self.loop, self.st)), \
-             mock.patch.object(fixer.gh, "pr", side_effect=[direct, advanced]) as reads, \
+             mock.patch.object(fixer.gh, "pr", return_value=advanced) as reads, \
              mock.patch.object(fixer.gh, "reviews", return_value=[approval]), \
              mock.patch.object(fixer.gate, "drain_seat"), \
              mock.patch.object(fixer.observer, "notify", side_effect=lambda *a, **kw: notices.append(kw)):
             with self.assertRaises(SystemExit):
                 fixer.main()
-        self.assertEqual(reads.call_count, 2)
+        self.assertEqual(reads.call_count, 1)
         self.assertFalse(any(n.get("next_turn") == "you merge" for n in notices), notices)
 
     def test_new_request_on_held_head_is_not_its_own_receipt(self):
@@ -336,7 +334,7 @@ class ReconciliationTest(unittest.TestCase):
              mock.patch.object(reviewer.gate, "context", return_value=(self.loop, self.st)), \
              mock.patch.object(reviewer.gh, "pr", return_value=self.child), \
              mock.patch.object(reviewer.gh, "reviews", return_value=reviews), \
-             mock.patch.object(reviewer.gate, "take_seat", return_value=None) as seat, \
+             mock.patch.object(reviewer.gate, "block_pr_agent", return_value=None) as seat, \
              mock.patch.object(reviewer.gate, "loop_block", return_value={"pr": 184}), \
              mock.patch.object(reviewer.gate, "drain_seat"), \
              mock.patch.object(reviewer.gate, "start_text", return_value="fixture start"), \

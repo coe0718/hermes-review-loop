@@ -21,6 +21,9 @@ from review_loop.util import silence  # noqa: E402
 def main() -> None:
     payload = json.load(sys.stdin)
     loop, st = gate.context(payload)
+    # This route is still installed in pre-#16 configurations. Even an older
+    # acknowledged marker must not dispatch a credential-owning gateway agent.
+    silence("adjudicator disabled until whole-agent isolation is enforced")
     if payload.get("action") != "review_loop_breach":
         silence("not a breach wake")
     fields = payload.get("_loop")
