@@ -18,6 +18,13 @@ from review_loop.inference_proxy import InferenceCapability, _UnixHTTP, PATH, MA
 SOURCE = Path(os.environ.get('HERMES_AGENT_SOURCE') or Path.home() / '.hermes/hermes-agent')
 
 
+def live_threads(server):
+    """The server's request threads; before the first request socketserver holds a
+    non-iterable placeholder instead of a list, which simply means none yet."""
+    threads = server._threads
+    return list(threads) if isinstance(threads, list) else []
+
+
 class TransportTests(unittest.TestCase):
     def test_slow_incomplete_clients_cannot_spawn_threads_before_quota(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as d:
@@ -37,7 +44,7 @@ class TransportTests(unittest.TestCase):
                                 client.close()
                         self.assertEqual(cap.used, 0)
                         self.assertGreaterEqual(cap.server._connections._value, 0)
-                        self.assertLessEqual(sum(t.is_alive() for t in cap.server._threads),
+                        self.assertLessEqual(sum(t.is_alive() for t in live_threads(cap.server)),
                                              inference_proxy.MAX_CONNECTIONS)
                     finally:
                         for client in clients:
