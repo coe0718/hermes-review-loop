@@ -115,6 +115,11 @@ LOGIN_SETTINGS: dict = {"reviewer": "reviewer_login", "fixer": "fixer_login"}
 # Every role that can own a webhook route. The adjudicator is here but not in ``SEAT_KEYS``: it has
 # a route and a profile, and no login or allowlist of its own.
 ROUTE_ROLES = ("reviewer", "fixer", "adjudicator")
+# Gate scripts an older release of *this* plugin installed for a role. Before the dedicated
+# adjudicator gate (PR #21) the breach route ran gate_reviewer.py. Such a route is still ours —
+# its prompt proves it — so ``apply`` rebinds it in place instead of refusing it as foreign, and
+# ``doctor`` points there rather than at ``init``, which refuses an existing loop.
+LEGACY_GATE_SCRIPTS: dict = {"adjudicator": frozenset({"gate_reviewer.py"})}
 
 # A Hermes profile name is a directory name under ``profiles/``. Refusing separators and dots-only
 # names here is what keeps a typo from resolving to somewhere outside the profiles root.
@@ -569,6 +574,24 @@ def _path(value: str) -> pathlib.Path:
     return pathlib.Path(str(value)).expanduser()
 
 
+def dangerous_root(value: str) -> str:
+    """Why a cleanup root is too broad to accept, or ``""`` when it is fine.
+
+    Cleanup removes PR-named children of every root. ``/``, the home directory and anything
+    above it hold the operator's own projects and dotfiles, which are never a loop's to delete,
+    however they happen to be named.
+    """
+    path = _path(value).resolve()
+    home_dir = pathlib.Path.home().resolve()
+    if path == pathlib.Path(path.anchor):
+        return "the filesystem root"
+    if path == home_dir:
+        return "the home directory"
+    if path in home_dir.parents:
+        return "an ancestor of the home directory"
+    return ""
+
+
 def normalize(raw: dict, source: pathlib.Path | None = None) -> dict:
     """Fill defaults, expand paths, and refuse anything that would make a run ambiguous."""
     if not isinstance(raw, dict):
@@ -628,6 +651,11 @@ def normalize(raw: dict, source: pathlib.Path | None = None) -> dict:
     loop["tokens"] = {k: str(v) for k, v in (loop.get("tokens") or {}).items()}
     loop["read_token"] = str(loop.get("read_token") or (next(iter(loop["tokens"]), "")))
     loop["roots"] = [str(p) for p in (loop.get("roots") or [])]
+    for root in loop["roots"]:
+        reason = dangerous_root(root)
+        if reason:
+            raise ConfigError(f"{where}: root {root!r} is {reason}; cleanup deletes PR-named "
+                              f"children of every root, so a root must be a dedicated directory")
 
     # `or 1` here would swallow a literal 0 into "serialized", which is the worst kind of silent
     # correction: the operator asked for something invalid and got a loop that looks configured.

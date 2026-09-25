@@ -5,7 +5,8 @@ Route this at the fixer's profile, on the ``pull_request_review`` event. It wake
 when a verdict it must answer lands:
 
 * ``submitted`` with state ``changes_requested``, authored by one of the loop's reviewers,
-  **at the current head** (a verdict on an older commit is already superseded);
+  **at the current head** (a verdict on an older commit is already superseded) — current as
+  GitHub says *now*, with this review still the latest effective verdict there;
 * ``commented`` and ``approved`` end here — approval is where the loop stops being useful;
 * the verdict that reaches the cap is **not** a work order. Handing the fixer a fourth fix
   no reviewer will read is how a loop burns a night; the PR goes to adjudication instead.
@@ -90,7 +91,21 @@ def main() -> None:
     if review.get("commit_id") != pr_head:
         silence("verdict is on an older head — superseded")
 
+    # The payload's head is a snapshot from when the review was submitted; the PR may have moved,
+    # closed, or had this verdict superseded (a later approval, a dismissal) since. A fix run is a
+    # work order, so it needs the live PR at this head *and* this review as the latest effective
+    # verdict there — the same chronology rule the approval path uses for a merge handoff.
+    current = gh.pr(loop, number)
+    if (not isinstance(current, dict) or current.get("number") != number
+            or current.get("state") != "open"
+            or (current.get("head") or {}).get("sha") != pr_head):
+        silence("verdict is stale or the current PR is unavailable — no fix run")
     reviews = gate.fetch_reviews(loop, number)
+    latest = gate.latest_effective_review_at_head(reviews, loop, pr_head)
+    if (latest is None or latest.get("id") != review.get("id")
+            or gh.review_state(latest) != "CHANGES_REQUESTED"):
+        silence(f"verdict {review.get('id')} is not the latest effective verdict at "
+                f"{pr_head[:7]} — no fix run")
     prior = len(gate.verdicts(reviews, loop, exclude_id=review.get("id")))
     if st.inflight(f"fix:{number}:{pr_head}"):
         silence(f"a fix run for head {pr_head[:7]} is already out")

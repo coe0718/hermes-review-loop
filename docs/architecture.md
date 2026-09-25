@@ -316,9 +316,13 @@ A finished PR gives its disk back: worktrees, build directories, probe logs, plu
 state (locks, queue, in-flight marks, breach marker). Rails, because this deletes real directories:
 
 - only paths inside non-symlink configured `roots` (or the loop's artifacts directory) are
-  considered; a root's PR-like name does not attribute every child to that PR;
+  considered; a root's PR-like name does not attribute every child to that PR, and a plain root
+  child must name this loop's repository as well as the PR (`widgets-pr7-target`), because roots
+  are shared between loops. `/`, the home directory and its ancestors are refused as roots;
 - detached worktrees must be registered to this clone and inside an allowed root. Other Git
-  checkouts, nested repositories, the clone and its contents are protected even if PR-named;
+  checkouts, nested repositories, the clone and its contents are protected even if PR-named. The
+  one exception is the loop's own `artifacts/<PR>/` under its real (non-symlink) state dir: the
+  isolation clones inside it were made by the loop, so their `.git` does not protect them;
 - a worktree with a **branch** checked out is never touched — that is somebody's working tree, not
   a review artifact (only detached checkouts are cleaned);
 - evidence patterns (`phase3`, `evidence`, `soak`, `release-verification`) are skipped: regenerable
