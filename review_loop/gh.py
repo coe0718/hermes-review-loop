@@ -32,6 +32,9 @@ REVIEW_PAGE_SIZE = 100
 MAX_REVIEW_PAGES = 100
 # The same bound for the open-PR listing: a repository past 10,000 open PRs reads as unknown.
 MAX_PR_PAGES = 100
+# GitHub's pulls/N/files listing stops at 3,000 files (30 full pages); the 31st page is what
+# proves the listing ended, so a PR at GitHub's cap still reads as complete-as-GitHub-lists-it.
+MAX_PR_FILE_PAGES = 31
 
 
 class GitHubError(Exception):
@@ -184,11 +187,31 @@ def _read_pages(loop: dict, path: str, what: str, max_pages: int) -> tuple[list[
     return None, f"{what} listing exceeds {max_pages} full pages"
 
 
+# Issue comments on a PR, read in full for the seats' records (the fixer's answers, #52).
+MAX_COMMENT_PAGES = 30
+
+
+def issue_comments_read(loop: dict, number: int) -> tuple[list[dict] | None, str]:
+    """Every issue comment on the PR, or ``(None, reason)`` — never the oldest page alone."""
+    return _read_pages(loop, f"/repos/{loop['repo']}/issues/{number}/comments?per_page=100",
+                       "comment", MAX_COMMENT_PAGES)
+
+
 def reviews(loop: dict, number: int):
     result, error = reviews_read(loop, number)
     if error:
         log(f"gh GET {reviews_path(loop, number)} failed: {error}")
     return result
+
+
+def pr_files_read(loop: dict, number: int) -> tuple[list[dict] | None, str]:
+    """Every changed file GitHub lists for the PR (``pulls/N/files``), or ``(None, reason)``.
+
+    Read with the loop's read token, like every other listing here. GitHub itself stops listing
+    at 3,000 files; a PR that large reads as its first 3,000 and the caller says so.
+    """
+    path = f"{pr_path(loop, number)}/files?per_page=100"
+    return _read_pages(loop, path, "PR file", MAX_PR_FILE_PAGES)
 
 
 def open_prs_read(loop: dict) -> tuple[list[dict] | None, str]:

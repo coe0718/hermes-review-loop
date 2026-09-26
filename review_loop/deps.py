@@ -283,7 +283,7 @@ def seat_note(results: list[Prefetch], role: str) -> str:
                      f"{commands} will fail on missing {unit}; that is the sandbox, not the PR.")
         if role == "fixer":
             lines.append("  You cannot build or test your fix here: check it by reading, and say "
-                         "in your summary that it is unbuilt.")
+                         "in your published answers that it is unbuilt.")
         elif role == "adjudicator":
             lines.append("  Neither seat could build either. Rule on what can be shown from the "
                          "code; a finding or answer that rests only on the missing build is not "

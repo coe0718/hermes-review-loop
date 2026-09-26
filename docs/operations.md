@@ -51,6 +51,31 @@ If directory sync
 fails after replacement, the plugin raises `RegistryDurabilityError(published=True)`: the new
 registry is visible, but crash durability is unconfirmed; do not assume the operation rolled back.
 
+## First run
+
+1. `init` the loop (above), then give each seat's profile its token file.
+2. `hermes review-loop doctor --loop name` until every line is ✅ (or a ⚠️ you have decided on).
+3. **Decide the fix leg.** A new loop has unattended fixer pushes **off**, and while they are off a
+   changes-requested verdict starts **no** fixer turn — a turn that cannot publish would only spend
+   a model conversation and fail. The verdict is held for you instead: the fixer queue entry, the
+   observer's `verdict` notice (`next: you — fixer held …`), `explain` (next: `operator decision`),
+   `doctor` (`⚠️ fixer-push off — the fix leg cannot run`) and the watchdog (one `fixer held` stall
+   per head) all say so and name the command. To let the fixer answer verdicts:
+
+   ```bash
+   hermes review-loop fixer-push --loop name --enable --acknowledge-pr-race
+   ```
+
+   Read the PR-metadata/ref race it acknowledges ([README](../README.md), and
+   [issue-16-boundary](issue-16-boundary.md#unattended-fixer-push-policy-host-operator-not-github-owner-consent))
+   first. A verdict that was held before you opted in needs no new review: the next watchdog sweep
+   (or `hermes review-loop drain --loop name --seat fixer`) re-checks that it is still the live
+   latest verdict at the PR's current head and starts a fix run, admitted under the policy as it
+   is *now*. Held verdicts never create a run-ledger row, so this is a fresh admission, not a later
+   opt-in upgrading an older run. Or keep pushes off and answer verdicts by hand: push the fix and
+   re-request review.
+4. `hermes review-loop arm --loop name`.
+
 ## Everyday commands
 
 ```bash
@@ -67,6 +92,7 @@ hermes review-loop set --loop name --reviewer-concurrency 2   # two reviews at o
 hermes review-loop arm --loop name      # arm/pause by flipping the repo hooks
 hermes review-loop arm --loop name --pause
 hermes review-loop drain --loop name --seat reviewer
+hermes review-loop fixer-push --loop name --enable --acknowledge-pr-race   # let the fixer publish (off by default)
 hermes review-loop cleanup --loop name --dry-run   # every closed PR; --pr N for one
 hermes review-loop uninstall --loop name
 ```
@@ -207,7 +233,7 @@ One line per check, in one of four states:
 | ✅ verified | checked, and correct |
 | ❌ absent | the thing is not there — a missing profile, token file, route, hook, job or script |
 | ❌ mismatch | present, but not what this loop needs — a route waking another profile, a hook on another gateway, a shim pinned to a stale plugin path, a world-readable PAT |
-| ⚠️ unknown | could not be decided *from here* — a hooks read the token was not allowed to make, or a probe skipped with `--offline` |
+| ⚠️ unknown | could not be decided *from here* — a hooks read the token was not allowed to make, or a probe skipped with `--offline` — or a decision still yours to make: `fixer-push` is ⚠️ while unattended fixer pushes are off, because the fix leg cannot run (verdicts are held for you) |
 
 Each failure is followed by the one command that fixes it, failures exit 1, and `unknown` is never
 reported as `absent`: "the API refused to tell me" and "there are no hooks" are different claims,
@@ -373,6 +399,15 @@ hermes review-loop explain --loop widgets --pr 7    # --loop may be omitted when
   sweep:      no watchdog sweep recorded — nothing has read this loop's PRs yet
   blocked:    the changes-requested verdict at head aaaaaaa has no fix run out — the fixer gate did not start one for that delivery
   next:       re-deliver the changes-requested review event for head aaaaaaa to the fixer gate after checking why its run did not start — no fixer is running to push a fix
+```
+
+On a loop that has not opted in to unattended fixer pushes, the same PR is not broken — it is
+waiting for you, and the last line says exactly what to run:
+
+```
+  queue:      fixer 1 of 1 (waiting 3m) — fixer held: unattended fixer pushes are off for this loop — …
+  blocked:    fixer held: unattended fixer pushes are off for this loop: the changes-requested verdict at head aaaaaaa starts no fixer turn until the loop opts in — `hermes review-loop fixer-push --loop widgets --enable --acknowledge-pr-race`
+  next:       operator decision: unattended fixer pushes are off for this loop, so the changes-requested verdict at head aaaaaaa starts no fixer turn. To let the fixer answer it, run `hermes review-loop fixer-push --loop widgets --enable --acknowledge-pr-race` — the next watchdog sweep (or `hermes review-loop drain --loop widgets --seat fixer`) then starts the fix run for this head; or fix it by hand, push, and re-request review
 ```
 
 A PR that is waiting rather than broken says so, instead of looking like a failure:

@@ -879,6 +879,11 @@ def cmd_init(args) -> int:
              "(docs/configuration.md; selftest names anything missing)",
              f"hermes review-loop doctor --loop {lid}",
              f"hermes review-loop selftest --loop {lid} --no-model, then --pr N, then --pr N --live-turn"]
+    if not config.unattended_fixer_push_enabled(loop):
+        steps.append("decide the fix leg: unattended fixer pushes are off, so a changes-requested "
+                     "verdict is held for you and no fixer turn starts. To let the fixer answer "
+                     f"verdicts: {config.fixer_push_enable_command(loop)} "
+                     "(read docs/operations.md on the PR-metadata race first)")
     if args.hooks and not getattr(args, "arm", False):
         steps.append(f"hermes review-loop arm --loop {lid}   (the hooks were created paused)")
     elif args.hooks:
@@ -1650,6 +1655,17 @@ def _cmd_fixer_push_locked(args) -> int:
     print(f"[{loop['id']}] {loop['repo']}: host-operator unattended fixer push "
           f"{'enabled (not GitHub owner consent; residual PR-metadata/ref race acknowledged)' if enabled else 'disabled'} "
           f"in {path}")
+    if enabled:
+        try:
+            from . import state as state_mod
+            held = [key for key, entry in state_mod.state_for(actual).queue_items("fixer").items()
+                    if config.is_fixer_push_hold(entry)]
+        except Exception:
+            held = []
+        if held:
+            print(f"  {len(held)} held verdict(s) ({', '.join(sorted(held))}) start on the next "
+                  f"watchdog sweep, or now: `hermes review-loop drain --loop {loop['id']} "
+                  "--seat fixer`")
     return 0
 
 

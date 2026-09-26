@@ -185,7 +185,7 @@ The worker claims the turn only after re-reading GitHub (open, not draft, same b
 a configured fixer, cap still spent, no approval at the head, a matching marker); a moved, closed,
 retargeted or approved PR cancels it, an unreadable one waits. Right before launch it re-verifies,
 marks the breach `adjudicating`, and runs the agent credentialless with a read-only export of the
-head, a host-rendered prompt and the reviewer verdicts and fixer comments as data.
+head, a host-rendered prompt and the reviewer verdicts and the fixer's published answers as data.
 
 The adjudicator is told to read both positions and rule — ACCEPT, REJECT or RESPEC — with a reason,
 and **not** merge, push or review (it has no way to). Its one broker `ruling` is recorded in the run
@@ -211,7 +211,8 @@ falsely treated as a recent push. Corrupt observation clocks are also treated as
 shapes are:
 
 1. reviewer never posted a verdict for a quiet head;
-2. fixer never pushed after a verdict;
+2. fixer never pushed after a verdict (on a loop without unattended fixer pushes this is reported
+   as *fixer held*, once per head, with the enable command — no fixer turn starts there);
 3. a PR parked awaiting adjudication;
 4. the cap is spent at this head with no approval and no escalation marker — i.e. *the gate did not
    fire*, which is the failure the loop cannot see about itself.
@@ -268,7 +269,9 @@ loop would stop at:
 7. is it queued for this exact head (a stale queued SHA is dropped, never retargeted; a current
    queue waits for capacity); even without a queue entry, locks held by other PRs can fill a seat;
 8. is this exact head marked in flight (a run is already out for it);
-9. a verdict at this head with no fix run out (retry the fixer gate event, not an absent fixer's push);
+9. a verdict at this head with no fix run out (retry the fixer gate event, not an absent fixer's push)
+   — or, while the loop has not opted in to unattended fixer pushes, an *operator decision*: the
+   verdict is held and the `next:` line names `fixer-push --enable`;
 10. a non-verdict review at this head (a comment consumes no round and does not suppress a new
     review request in the reviewer gate);
 11. nothing at this head: the fixer's request is what wakes the reviewer, and GitHub clears it when
@@ -276,7 +279,8 @@ loop would stop at:
     a run needs its gate event re-delivered, not a verdict from a reviewer who never started.
 
 Every report ends in exactly one `next:` line: a reviewer verdict, a review request, a retry of the
-fixer event, a fixer push plus request when a run exists, a released slot, an adjudication, a re-arm,
+fixer event, a fixer push plus request when a run exists, an operator decision (enable fixer pushes),
+a released slot, an adjudication, a re-arm,
 a read retry, or nothing at all. Timestamps
 carry their source (the read itself, the verdict's `submitted_at`, or the state mark's own epoch),
 and anything that could not be read is printed as unknown with the reason.

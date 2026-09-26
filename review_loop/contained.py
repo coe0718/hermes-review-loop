@@ -30,7 +30,8 @@ def command(*, code: Path, venv: Path, runtime: Path, home: Path,
             broker_socket_dir: Path | None = None,
             client_code: Path | None = None,
             checkout_writable: bool = True,
-            dependency_caches: dict[str, Path] | None = None) -> list[str]:
+            dependency_caches: dict[str, Path] | None = None,
+            review_dir: Path | None = None) -> list[str]:
     """Build an allowlisted mount namespace for the *entire* process tree.
 
     code must be a separately staged, audited, credentialless source snapshot;
@@ -54,6 +55,12 @@ def command(*, code: Path, venv: Path, runtime: Path, home: Path,
             raise FileNotFoundError('live broker capability required')
         if set(broker_dir.iterdir()) != {broker_dir / 'broker.sock'}:
             raise ValueError('broker mount must contain only the capability socket')
+    if review_dir is not None:
+        review = Path(review_dir)
+        diff = review / 'pr.diff'
+        if (review.is_symlink() or not review.is_dir() or diff.is_symlink()
+                or not diff.is_file() or list(review.iterdir()) != [diff]):
+            raise ValueError('review mount must contain only the staged pr.diff')
     if client_code is not None and not (Path(client_code) / 'review_loop/broker_client.py').is_file():
         raise FileNotFoundError('staged broker client required')
     dependency_binds = []
@@ -93,6 +100,9 @@ def command(*, code: Path, venv: Path, runtime: Path, home: Path,
                    "--ro-bind", str(Path(broker_socket_dir)), "/run/review-loop/broker"]
     if client_code is not None:
         mounts += ["--ro-bind", str(Path(client_code)), "/opt/client"]
+    if review_dir is not None:
+        # Read-only and outside /work: the diff is something to read, never something to push.
+        mounts += ["--ro-bind", str(Path(review_dir)), "/opt/review"]
     return mounts + [
             "--setenv", "HOME", "/home/agent", "--setenv", "HERMES_HOME", "/home/agent",
             "--setenv", "PYTHONPATH", "/opt/code:/opt/client" if client_code else "/opt/code", "--setenv", "CARGO_HOME", "/tmp/cargo",

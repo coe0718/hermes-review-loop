@@ -85,6 +85,9 @@ class Fixture:
             return self.pr, ""
         if path.startswith("/repos/acme/widgets/pulls/7/reviews"):
             return [], ""
+        if path == "/repos/acme/widgets/pulls/7/files?per_page=100":
+            return [{"filename": "src/lib.rs", "status": "modified", "additions": 1,
+                     "deletions": 1, "patch": "@@ -1 +1 @@\n-old\n+new"}], ""
         return None, "HTTP 404"
 
     def contained_run(self, **kwargs):
@@ -350,6 +353,7 @@ class LiveTurnTests(SelftestBase):
             sock = str(pathlib.Path(kwargs["broker_socket_dir"]) / "broker.sock")
             self.query_text = pathlib.Path(kwargs["query"]).read_text()
             self.caches = kwargs.get("dependency_caches")
+            self.staged_diff = (pathlib.Path(kwargs["review_dir"]) / "pr.diff").read_text()
             if extra:
                 self.extra_answer = self.raw_request(sock, extra)
             self.answer = broker_ipc.request("review", verdict=verdict, body=body, socket_path=sock)
@@ -377,6 +381,8 @@ class LiveTurnTests(SelftestBase):
         self.assertIn("the agent would submit REQUEST_CHANGES (authorized); NOT posted", text)
         self.assertIn("│ Needs a test.", text)
         self.assertIn("✅ turn:reviewer", text)
+        # The live turn stages the same bounded diff the production worker does (#50).
+        self.assertIn("+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new", self.staged_diff)
         self.assert_no_secrets(text)                     # even inside the model's body
         self.assert_reads_only()
         self.assertFalse((pathlib.Path(self.fx.loop["state_dir"]) / "broker-audit.jsonl").exists())

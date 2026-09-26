@@ -203,6 +203,7 @@ class Base(unittest.TestCase):
                       {"DEEPSEEK_API_KEY": KEYS["adj"]})
         write_profile(self.home, "default", {"default": "claude-x", "provider": "bedrock"})
         self.loop = {"id": "demo", "repo": "acme/widgets", "base": "main", "state_dir": str(self.root / "state"),
+                     "unattended_fixer_push": True,
                      "read_token": "reader", "tokens": {},
                      "seats": {"reviewer": {"profile": "rev", "login": "reviewer"},
                                "fixer": {"profile": "fix", "login": "fixer"}},
@@ -324,8 +325,9 @@ class Worker(Base):
         with mock.patch.object(sup, "_spawn"):
             sup.enqueue(f"d-{seat}", "acme/widgets", 7, HEAD, seat)
         with sqlite3.connect(sup.db) as con:
-            con.execute("UPDATE runs SET state='launching', owner='w', generation='g' "
-                        "WHERE delivery=?", (f"d-{seat}",))
+            # A fixer row is launched only when admitted with pushes on (the gate holds it otherwise).
+            con.execute("UPDATE runs SET state='launching', owner='w', generation='g', "
+                        "push_admitted=1 WHERE delivery=?", (f"d-{seat}",))
             run_id = con.execute("SELECT id FROM runs WHERE delivery=?", (f"d-{seat}",)).fetchone()[0]
         seen = {}
 
@@ -343,6 +345,8 @@ class Worker(Base):
                                return_value=("ok", {"reviews": [], "marker": {"rounds": 3}})), \
              mock.patch("review_loop.state.state_for") as state_for, \
              mock.patch.object(run_supervisor, "isolated_prompt", return_value="PROMPT"), \
+             mock.patch.object(run_supervisor, "pr_change",
+                               return_value=run_supervisor.PRChange("CHANGE", "DIFF")), \
              mock.patch.object(trusted_turn, "run_turn", side_effect=run_turn), \
              mock.patch.object(sup, "recover"):
             state_for.return_value.breach_start.return_value = {"ok": True}
@@ -362,6 +366,8 @@ class Worker(Base):
                 self.assertEqual(row, ("succeeded", None))
                 self.assertEqual((seen["role"], seen["model"], seen["key"]), (seat, model, key))
                 self.assertIn(host, seen["upstream"])
+                # Reviewer and fixer get the staged diff (#50); a ruling has none.
+                self.assertEqual(seen["review_diff"], None if seat == "adjudicator" else "DIFF")
                 others = {k for s, (_, k, _) in expected.items() if s != seat}
                 self.assertFalse(others & {seen["key"]})
 

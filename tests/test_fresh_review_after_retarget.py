@@ -44,6 +44,7 @@ class FreshReviewTest(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
         self.loop = {"id": "fresh", "repo": REPO, "base": "main", "fixers": ["fixer"],
+                     "unattended_fixer_push": True,
                      "reviewers": ["vex"], "reviewer_seat": "vex", "state_dir": str(root / "state"),
                      "cap": 3, "ttl_min": 60, "grace_min": 5, "marker_grace_min": 5,
                      "cooldown_h": 1, "inflight_ttl_min": 60, "read_token": "read",
@@ -389,9 +390,10 @@ class FreshReviewTest(unittest.TestCase):
         self.merge_parent_and_retarget()
         run_id = uuid.uuid4().hex
         with sqlite3.connect(self.db) as con:
-            con.execute("INSERT INTO runs(id,delivery,repo,pr,head,seat,turn_key,state,created,updated) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,?)", (run_id, "fix-184", REPO, 184, C, "fixer", "",
-                                                         "pending", time.time(), time.time()))
+            con.execute("INSERT INTO runs(id,delivery,repo,pr,head,seat,turn_key,state,created,updated,"
+                        "push_admitted) VALUES(?,?,?,?,?,?,?,?,?,?,1)",
+                        (run_id, "fix-184", REPO, 184, C, "fixer", "", "pending", time.time(),
+                         time.time()))
         sup = Supervisor(self.db)
         sup.production_config = pathlib.Path(self.temp.name) / "unused-config"
 

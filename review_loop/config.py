@@ -434,6 +434,29 @@ def unattended_fixer_push_enabled(loop: dict) -> bool:
     """
     return isinstance(loop, dict) and loop.get("unattended_fixer_push") is True
 
+
+# While a loop has not opted in, a changes-requested verdict starts no fixer turn: the turn
+# could not publish, so it would only spend a model conversation and fail. The verdict is held
+# for the operator instead, and every surface (gate queue, explain, doctor, watchdog, observer)
+# names the same reason and the same command. Held verdicts never create a ledger row, so an
+# opt-in afterwards admits a *new* run at that moment; it never upgrades an older one (#22).
+FIXER_PUSH_HOLD = "fixer held: unattended fixer pushes are off for this loop"
+
+
+def fixer_push_enable_command(loop: dict) -> str:
+    return f"hermes review-loop fixer-push --loop {loop['id']} --enable --acknowledge-pr-race"
+
+
+def fixer_push_hold_reason(loop: dict) -> str:
+    return (f"{FIXER_PUSH_HOLD} — the changes-requested verdict waits for you. To let the fixer "
+            f"answer it, run `{fixer_push_enable_command(loop)}`; the next watchdog sweep (or "
+            f"`hermes review-loop drain --loop {loop['id']} --seat fixer`) then starts the fix "
+            "run for this head. Or fix it by hand, push, and re-request review.")
+
+
+def is_fixer_push_hold(entry: object) -> bool:
+    return isinstance(entry, dict) and str(entry.get("reason") or "").startswith(FIXER_PUSH_HOLD)
+
 SEAT_KEYS = ("reviewer", "fixer")
 
 

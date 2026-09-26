@@ -82,6 +82,9 @@ class RunBroker:
         self._used = False
         self.completed = False
         self._pushed_head: str | None = None
+        # How the fixer's answers comment ended ('posted', 'uncertain', 'denied', 'unrecorded'),
+        # a host-chosen word the sandbox may see; None when no answers were sent.
+        self.answers_outcome: str | None = None
         self._stop = threading.Event()
 
     def __enter__(self) -> "RunBroker":
@@ -143,15 +146,20 @@ class RunBroker:
                 raise
             with conn:
                 conn.settimeout(5)
+                self.answers_outcome = None  # reported only on the request that sent them
                 try:
                     self._dispatch(_read_line(conn, MAX_PUSH_REQUEST if self.scope.role == "fixer" else MAX_REQUEST))
                     # Never relay arbitrary GitHub response fields into the namespace.
                     response = {"ok": True, "result": {"accepted": True}}
+                    if self.answers_outcome:
+                        response["result"]["answers"] = self.answers_outcome
                 except (ProtocolError, broker.BrokerDenied, ValueError, UnicodeError, TimeoutError) as exc:
                     response = {"ok": False, "error": str(exc) if isinstance(exc, ProtocolError) else "write denied"}
                 except Exception:
                     # A GitHub, filesystem, or audit failure cannot expose paths or credentials.
                     response = {"ok": False, "error": "write failed"}
+                if not response["ok"] and self.answers_outcome:
+                    response["error"] += f" (answers comment: {self.answers_outcome})"
                 try:
                     conn.sendall(json.dumps(response, separators=(",", ":")).encode() + b"\n")
                 except OSError:
@@ -258,6 +266,19 @@ class RunBroker:
             raise ProtocolError("invalid review fields")
         if self._used and not (operation == "request_review" and self._pushed_head):
             raise ProtocolError("run capability already used")
+        answers = operation == "request_review" and body != ""
+        if answers:
+            # The fixer's answers ride on its one review request (#52): checked here, before the
+            # capability is consumed, so a refusal leaves the request unspent.
+            if not self._pushed_head:
+                raise ProtocolError("answers are published with the review request after a "
+                                    "confirmed push")
+            if verdict or not broker.answers_valid(body):
+                raise ProtocolError(f"answers must be non-empty text of at most "
+                                    f"{broker.ANSWERS_MAX} bytes without the answers marker; "
+                                    "nothing was written, resubmit")
+            if not self.scope.run_id or not self.scope.ledger_db:
+                raise ProtocolError("host run ledger unavailable")
         if operation == "review" and (verdict not in broker.REVIEW_VERDICTS or not body.strip()):
             # Refused before the capability is consumed, so the reviewer can resubmit a real
             # verdict in the same turn. A COMMENT would neither wake the fixer nor cue a merge.
@@ -278,12 +299,63 @@ class RunBroker:
         else:
             if operation == 'review' and self.require_receipt:
                 raise ProtocolError('host review claim required')
+            if answers:
+                # Before the request: the request is what wakes the reviewer, whose record is
+                # read from GitHub, so the answers must already be there. Whatever the comment's
+                # outcome, the loop still continues with the request.
+                self.answers_outcome = self._publish_answers(head, body)
+                body = ''
             result = broker.perform(self._loop, repo=self.scope.repo, number=self.scope.number,
                                     head=head, role=self.scope.role, branch=self.scope.branch,
                                     operation=operation, verdict=verdict, body=body,
                                     require_verdict=not after_push)
         self.completed = True
         return result
+
+    def _publish_answers(self, head: str, text: str) -> str:
+        """Post the fixer's answers as ONE PR comment by the fixer identity; return the outcome.
+
+        Authorized like the fixer's other writes (live open PR at the exact pushed head, fixer
+        author, distinct identities), recorded in the run ledger before the POST, and never
+        retried: a POST whose outcome is unknown stays 'uncertain'.
+        """
+        from .run_supervisor import Supervisor
+        supervisor = Supervisor(self.scope.ledger_db)
+        record = dict(run_id=self.scope.run_id, repo=self.scope.repo, pr=self.scope.number,
+                      base=self.scope.head, head=head, body=text)
+        try:
+            login = broker.authorize(self._loop, repo=self.scope.repo, number=self.scope.number,
+                                     head=head, role="fixer", branch=self.scope.branch,
+                                     operation="answers", require_verdict=False)
+        except Exception as exc:
+            reason = str(exc)[:200] if isinstance(exc, broker.BrokerDenied) else type(exc).__name__
+            try:
+                supervisor.begin_answers(**record, state="denied", error=reason)
+            except Exception:
+                pass
+            return "denied"
+        try:
+            supervisor.begin_answers(**record)
+        except Exception:
+            return "unrecorded"  # no durable intent, so no POST
+        try:
+            comment_id = broker.post_fixer_answers(
+                self._loop, repo=self.scope.repo, number=self.scope.number, head=head,
+                branch=self.scope.branch, login=login,
+                text=broker.answers_comment_body(text, head=head, base=self.scope.head,
+                                                 run_id=self.scope.run_id))
+        except Exception as exc:
+            try:
+                supervisor.answers_status(self.scope.run_id, "uncertain",
+                                          error=f"POST outcome unknown: {type(exc).__name__}")
+            except Exception:
+                pass
+            return "uncertain"
+        try:
+            supervisor.answers_status(self.scope.run_id, "posted", comment_id=comment_id)
+        except Exception:
+            pass
+        return "posted"
 
     def _record_only(self, verdict: str, body: str) -> object:
         """No-write reviewer: the live authorization reads, then record, and never POST.

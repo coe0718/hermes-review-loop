@@ -728,6 +728,20 @@ def check_clone(loop: dict) -> Check:
     return Check("clone", VERIFIED, f"{path} (git checkout){note}")
 
 
+def check_fixer_push(loop: dict) -> Check:
+    """Whether the fix leg can run at all. Off is the safe default, not a fault — but it means
+    every changes-requested verdict is held for the operator instead of starting a fixer turn."""
+    if config.unattended_fixer_push_enabled(loop):
+        return Check("fixer-push", VERIFIED,
+                     "enabled — a changes-requested verdict starts an isolated fixer turn that "
+                     "can publish one push and re-request review")
+    return Check("fixer-push", UNKNOWN,
+                 "off — the fix leg cannot run: changes-requested verdicts are held for you and no "
+                 f"fixer turn starts. To opt in: `{config.fixer_push_enable_command(loop)}` "
+                 "(held verdicts then start on the next watchdog sweep)",
+                 f"`{config.fixer_push_enable_command(loop)}`")
+
+
 def check_state_dir(loop: dict) -> Check:
     path = pathlib.Path(str(loop["state_dir"])).expanduser()
     if path.exists() and not path.is_dir():
@@ -906,6 +920,7 @@ def check_loop(loop: dict, offline: bool = False) -> list[Check]:
     if str((loop.get("adjudicator") or {}).get("route") or ""):
         checks.append(check_adjudicator_profile(loop))
     checks.extend(check_seat_models(loop))
+    checks.append(check_fixer_push(loop))
     identity = check_adjudicator_identity(loop)
     if identity:
         checks.append(identity)

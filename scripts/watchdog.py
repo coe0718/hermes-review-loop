@@ -6,7 +6,8 @@ do". So this reads GitHub state directly instead of trusting pings, markers or l
 names four shapes of stall:
 
 1. the reviewer never posted a verdict for a head that has been sitting there;
-2. the fixer never pushed after a verdict;
+2. the fixer never pushed after a verdict (or is held because the loop has not opted in to
+   unattended fixer pushes — reported once per head, with the command that enables them);
 3. a PR is parked awaiting adjudication;
 4. the cap is spent at this head with no approval and no escalation marker.
 
@@ -41,6 +42,7 @@ from review_loop import config, gate, gh, observer, route_intent, routes, situat
 from review_loop.util import age_min, epoch, log, now_iso  # noqa: E402
 
 TEST = bool(os.environ.get("REVIEW_LOOP_TEST"))
+PUSH_OFF_KIND = "fixer held — unattended fixer pushes are off"
 HEAD_RETENTION_SEC = 30 * 86400  # retain absent PRs long enough for transient listing/state changes
 
 
@@ -80,6 +82,11 @@ def drain(loop: dict, st: state_mod.LoopState, seat: str, quiet: bool = False) -
         entry = items[key]
         if str(entry.get("reason") or "").startswith("route delivery uncertain —"):
             log(f"drain: {key} has an unverified POST — manual reconciliation required")
+            continue
+        if config.is_fixer_push_hold(entry) and not config.unattended_fixer_push_enabled(loop):
+            # Held for the operator, not for capacity: nothing to wake until the loop opts in.
+            # Once it has, this entry drains like any other — the fixer gate re-checks the live
+            # verdict and admits a *new* run under the new policy (no older run is upgraded).
             continue
         try:
             number = int(str(key).split("#")[-1])
@@ -525,6 +532,13 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
         elif len(changes) >= loop["cap"] and head_postdates_arming:
             kind = (f"{len(changes)} verdicts, no approval and NO escalation marker — "
                     f"the cap may not have fired")
+        elif at_head and not config.unattended_fixer_push_enabled(loop):
+            mins = age_min(at_head[-1].get("submitted_at"))
+            if mins > grace:
+                # Not a stall the fixer can end: no fixer turn starts until the loop opts in.
+                kind = (f"{PUSH_OFF_KIND} — changes requested {mins / 60:.1f}h ago at head "
+                        f"{head[:7]} waits for you: run "
+                        f"`{config.fixer_push_enable_command(loop)}` (or fix it by hand)")
         elif at_head:
             mins = age_min(at_head[-1].get("submitted_at"))
             if mins > grace:
@@ -550,6 +564,8 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
                              f"frees itself at {loop['ttl_min']}m")
     for seat, items in st.queue_all().items():
         for key, entry in (items or {}).items():
+            if config.is_fixer_push_hold(entry):
+                continue  # reported once per head as a stall above, not on every sweep
             age = (now - entry.get("at", now)) / 60
             if age > loop["grace_min"]:
                 stuck.append(f"  {seat} queue: {key} waiting {age:.0f}m — {entry.get('reason')}")
@@ -576,7 +592,11 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
     for number, kind, _title in alerts:
         head = next(((pr.get("head") or {}).get("sha", "") for pr in prs
                      if isinstance(pr, dict) and pr.get("number") == number), "")
-        observer.notify(loop, st, "stall", number, head, identity=f"{kind[:40]}#{int(now)}",
+        # A push-off hold is one fact per head: its notice is keyed without the sweep clock,
+        # so a cooldown re-raise in the sweep output never pings the observer twice.
+        identity = ("fixer-push-off" if kind.startswith(PUSH_OFF_KIND)
+                    else f"{kind[:40]}#{int(now)}")
+        observer.notify(loop, st, "stall", number, head, identity=identity,
                         outcome=kind, next_turn="you")
     if observer.retry(loop, st):
         log("observer: retried an undelivered notice")

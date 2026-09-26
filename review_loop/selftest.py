@@ -921,7 +921,7 @@ def check_ledger(report: Report, loop: dict, runtime_file: Path, settings: dict 
 def run_live_turn(report: Report, loop: dict, settings: dict | None, pr: dict | None,
                   timeout: int, reviewer=None) -> None:
     from . import broker_ipc, gh as gh_mod, trusted_turn
-    from .run_supervisor import effective_reviews, isolated_prompt
+    from .run_supervisor import effective_reviews, isolated_prompt, pr_change
     step = "live-turn"
     if settings is None or pr is None or reviewer is None:
         report.add(step, "turn:reviewer", SKIP,
@@ -931,7 +931,8 @@ def run_live_turn(report: Report, loop: dict, settings: dict | None, pr: dict | 
     row = {"seat": "reviewer", "repo": loop["repo"], "pr": number, "head": head}
     try:
         reviews = effective_reviews(loop, row, gh_mod.reviews(loop, number), str(ledger_path()))
-        prompt = isolated_prompt(loop, row, reviews)
+        change = pr_change(loop, row)
+        prompt = isolated_prompt(loop, row, reviews, change=change)
         report.redact.add(reviewer.key)
     except Exception as exc:
         report.add(step, "turn:prompt", FAIL, f"could not build the reviewer prompt: {exc}",
@@ -946,6 +947,7 @@ def run_live_turn(report: Report, loop: dict, settings: dict | None, pr: dict | 
                                    venv=Path(settings["venv"]), runtime=Path(settings["runtime"]),
                                    rust=Path(settings["rust"]), upstream=reviewer.upstream,
                                    key=reviewer.key, model=reviewer.model, prompt=prompt,
+                                   review_diff=change.diff,
                                    api_mode=reviewer.api_mode,
                                    credential=reviewer.credential_provider(),
                                    proxy_model=reviewer.proxy_model,

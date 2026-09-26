@@ -276,6 +276,7 @@ class SeatNoteTests(unittest.TestCase):
         self.assertIn("not by itself a reason to request changes", note)
         fixer = deps.seat_note([deps.Prefetch("rust", deps.UNAVAILABLE, "x")], "fixer")
         self.assertIn("unbuilt", fixer)
+        self.assertIn("answers", fixer)  # the summary is not published; the answers are (#52)
         adjudicator = deps.seat_note([deps.Prefetch("rust", deps.UNAVAILABLE, "x")], "adjudicator")
         self.assertIn("not evidence either way", adjudicator)
 
@@ -309,6 +310,20 @@ class ContainedMountTests(Base):
         bare = contained.command(**self.layout(), entry=["true"])
         self.assertEqual(bare[bare.index("CARGO_NET_OFFLINE") + 1], "true")
         self.assertNotIn("/tmp/cargo/registry", bare)      # no cache, no mount
+
+    def test_cache_and_review_diff_mount_together(self):
+        # #50 and #51 in one turn: the reviewer's diff and the crate cache are both read-only.
+        cache = self.cache_parent / "cargo"
+        (cache / "registry").mkdir(parents=True)
+        review = Path(tempfile.mkdtemp(dir=self.root))
+        (review / "pr.diff").write_text("diff --git a/x b/x\n")
+        argv = contained.command(**self.layout(), entry=["true"],
+                                 dependency_caches={"rust": cache}, review_dir=review)
+        bind = argv.index(str(cache / "registry"))
+        self.assertEqual(argv[bind - 1:bind + 2],
+                         ["--ro-bind", str(cache / "registry"), "/tmp/cargo/registry"])
+        diff = argv.index(str(review))
+        self.assertEqual(argv[diff - 1:diff + 2], ["--ro-bind", str(review), "/opt/review"])
 
     def test_unknown_ecosystem_or_missing_cache_is_refused(self):
         with self.assertRaises(ValueError):

@@ -15,7 +15,8 @@ import shutil
 import subprocess
 import tempfile
 
-from . import broker_ipc, contained, deps, gh, inference_proxy, trusted_fetch
+from . import (broker_client, broker_ipc, contained, deps, gh, inference_proxy, safe_push,
+               trusted_fetch)
 
 
 class TurnDenied(Exception):
@@ -139,6 +140,7 @@ def _export_committed_source(source_fd: int, destination: Path) -> None:
     client.mkdir(exist_ok=True)
     (client / '__init__.py').touch()
     shutil.copyfile(Path(__file__).with_name('broker_client.py'), client / 'broker_client.py')
+    shutil.copyfile(Path(__file__).with_name('wire.py'), client / 'wire.py')
     shutil.copyfile(Path(__file__).with_name('inference_proxy.py'), client / 'inference_proxy.py')
 
 
@@ -152,9 +154,30 @@ TOOLS = {
                  '--verdict APPROVE --body-file /work/review.txt` (or --verdict REQUEST_CHANGES). '
                  'The verdict must be exactly APPROVE or REQUEST_CHANGES; anything else is refused '
                  'without spending the write. A reviewer gets exactly one write. '),
-    'fixer': ('To publish use `python -m review_loop.broker_client push '
-              '--manifest-file /work/manifest.json`, then `python -m review_loop.broker_client '
-              'request_review`. A fixer gets one push followed by one review request. '),
+    'fixer': ('To publish, name the files you changed and write a commit message: '
+              '`python -m review_loop.broker_client push --files src/a.py src/b.py '
+              '--message-file /tmp/commit.txt` (or `--message "..."`; paths are under `/work`). '
+              'Add `--dry-run` first to check it without spending the write. The client builds '
+              'the manifest itself (each file\'s whole new content, base64 and sha256, and this '
+              'turn\'s head as base_head, which the host provides) and refuses before sending '
+              f'anything past the broker\'s limits: at most {safe_push.MAX_FILES} files, '
+              f'{safe_push.MAX_FILE // 1024} KiB per file and {safe_push.MAX_CONTENT // 1024} KiB '
+              f'in total, a non-empty commit message of at most {safe_push.MAX_MESSAGE} bytes, '
+              'path segments of A-Z a-z 0-9 _ . - only, and nothing under `.github/`, no `.git`, '
+              '`.gitmodules`, `.gitattributes` or `CODEOWNERS`. A push only adds or replaces whole '
+              'regular files: it cannot delete or rename a file (a rename would leave the old '
+              'path in place), change a file mode, or write a symlink; if the fix needs one of '
+              'those, say so in your answers. `/work` is a plain export with no `.git`, so keep '
+              'track of which files you changed. Then write your answers to the findings to a file '
+              '(for each: fixed at file:line, or why it is not a defect, with evidence; at most '
+              f'{broker_client.MAX_ANSWERS // 1024} KiB) and run `python -m review_loop.broker_client '
+              'request_review --answers-file /tmp/answers.md`: the host posts the answers once as a '
+              'PR comment by the fixer account, where the next reviewer and the adjudicator read '
+              'them, then requests the review. It is the only way your answers leave the sandbox, '
+              'and the comment is public to everyone who can see the PR. '
+              'A fixer gets one push followed by one review request. '
+              '(`--manifest-file` still takes a hand-built manifest: '
+              '{"base_head", "message", "files": [{"path", "content_b64", "sha256"}]}.) '),
     'adjudicator': ('`/work` is read-only; write files under `/tmp`. To deliver your ruling use '
                     '`python -m review_loop.broker_client ruling --verdict ACCEPT '
                     '--body-file /tmp/ruling.txt` (or REJECT/RESPEC). An adjudicator gets '
@@ -217,7 +240,8 @@ def run_turn(loop: dict, scope: broker_ipc.RunScope, *, source: Path, venv: Path
              prompt: str, timeout: int = 600, work_root: Path | None = None,
              no_write: bool = False, observed: dict | None = None,
              api_mode: str = 'chat_completions', credential=None, proxy_model: str = '',
-             client_identity: str = '', prefetch_timeout: int = deps.FETCH_TIMEOUT) -> int:
+             client_identity: str = '', review_diff: str | None = None,
+             prefetch_timeout: int = deps.FETCH_TIMEOUT) -> int:
     """Stage a live PR head, start host capabilities, execute Hermes within bwrap.
 
     ``api_mode`` picks the proxy contract and the sandbox's provider config; ``credential`` (a
@@ -229,6 +253,10 @@ def run_turn(loop: dict, scope: broker_ipc.RunScope, *, source: Path, venv: Path
     mode: a reviewer's verdict is authorized with live reads and recorded, never POSTed.
     ``observed``, when given, receives the sandbox exit code, bounded output tails and the
     recorded submissions.
+
+    ``review_diff``, when given, is the host-built diff of the PR (``run_supervisor.pr_change``);
+    it is mounted read-only at ``/opt/review/pr.diff``, outside the ``/work`` a fixer publishes
+    from, so it can never become part of a push.
 
     Before launch the host prefetches the staged head's pinned dependencies (``deps``) into the
     loop's private cache, mounted read-only; the seat's query says whether that worked, so an
@@ -252,6 +280,13 @@ def run_turn(loop: dict, scope: broker_ipc.RunScope, *, source: Path, venv: Path
         client.mkdir(mode=0o700, parents=True)
         (client / '__init__.py').touch()
         shutil.copyfile(Path(__file__).with_name('broker_client.py'), client / 'broker_client.py')
+        shutil.copyfile(Path(__file__).with_name('wire.py'), client / 'wire.py')
+        if scope.role == 'fixer':
+            # Host-written and mounted read-only at /opt/client: the push helper's base_head.
+            # A convenience, not an authority — the broker compares it with scope.head itself.
+            turn = client.parent / Path(broker_client.TURN_FILE).name
+            turn.write_text(json.dumps({'head': scope.head}) + '\n')
+            turn.chmod(0o444)
         home.mkdir(mode=0o700)
         config_text, env_text, provider = sandbox_config(model, api_mode, client_identity)
         (home / 'config.yaml').write_text(config_text)
@@ -259,6 +294,12 @@ def run_turn(loop: dict, scope: broker_ipc.RunScope, *, source: Path, venv: Path
         if env_text:
             (home / '.env').write_text(env_text)
             (home / '.env').chmod(0o600)
+        review = None
+        if review_diff is not None:
+            review = root / 'review'
+            review.mkdir(mode=0o700)
+            (review / 'pr.diff').write_text(review_diff)
+            (review / 'pr.diff').chmod(0o444)
         checkout = trusted_fetch.stage(loop, repo=scope.repo, number=scope.number,
                                        head=scope.head, ref=scope.branch, role=scope.role,
                                        sandbox_root=root / 'export')
@@ -299,7 +340,7 @@ def run_turn(loop: dict, scope: broker_ipc.RunScope, *, source: Path, venv: Path
                     home=home, checkout=checkout, rust=rust, query=query, entry=command,
                     inference_socket_dir=inference.directory,
                     broker_socket_dir=broker.socket_path.parent,
-                    client_code=client.parent, timeout=timeout,
+                    client_code=client.parent, review_dir=review, timeout=timeout,
                     dependency_caches={r.ecosystem: r.cache for r in prefetched if r.ready},
                     # A ruling is judgement, not a change: the adjudicator's tree is mounted
                     # read-only so nothing it runs can dress up the head it rules on.
