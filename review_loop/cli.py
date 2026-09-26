@@ -211,7 +211,11 @@ def _seat_lines(loop: dict, title: str = "seat mapping") -> list[str]:
         login = config.seat_login(loop, role) or "(unset)"
         # The adjudicator has no login, so it keeps the column empty rather than shifting the route
         # and URL columns out of line in the one place an operator compares seats side by side.
-        login_cell = f"login {login:<16} " if role != "adjudicator" else " " * 23
+        if role == "adjudicator":
+            adj = config.adjudicator_login(loop)
+            login_cell = f"login {adj:<16} " if adj else " " * 23
+        else:
+            login_cell = f"login {login:<16} "
         lines.append(f"  {role:<12} profile {profile:<16} {login_cell}"
                      f"route {name:<22} {url}".rstrip())
     return lines
@@ -235,7 +239,20 @@ def _credential_lines(loop: dict) -> list[str]:
     if read_token and read_token.lower() not in seen:
         ref = tokens.get(read_token) or tokens.get(read_token.lower()) or ""
         lines.append(f"read {read_token} → {ref or '(no file mapped)'}")
+    adj = config.adjudicator_login(loop)
+    if adj:
+        lines.append(f"adjudicator {adj} → {_token_ref(loop, adj) or '(no file mapped)'}")
     return lines
+
+
+def _token_ref(loop: dict, login: str) -> str:
+    """The token *path* mapped for ``login`` (exact key first, then any case), or ``""``."""
+    tokens = loop.get("tokens") or {}
+    if not login:
+        return ""
+    if tokens.get(login):
+        return str(tokens[login])
+    return next((str(v) for k, v in tokens.items() if str(k).lower() == login.lower() and v), "")
 
 
 def _role_summary(loop: dict, role: str) -> str:
@@ -295,6 +312,24 @@ def _seat_diffs(was: dict, now: dict) -> tuple[list[tuple[str, object, object]],
     if adj_before != adj_after:
         diffs.append(("adjudicator profile", adj_before or "(none)", adj_after or "(none)"))
         touched.add("adjudicator")
+    # A seat's token file is part of who it is: a new path for a login a seat acts as is an
+    # identity change, owed the same in-flight check. Paths only — the file is never opened here.
+    for role in ("reviewer", "fixer"):
+        login = config.seat_login(now, role)
+        before, after = _token_ref(was, login), _token_ref(now, login)
+        if before != after:
+            diffs.append((f"{role} token file ({login})", before or "(none)", after or "(none)"))
+            touched.add(role)
+    # The adjudicator's comment identity has no run of its own to strand: it is reported, and
+    # validated, but it does not rebind a route.
+    login_before, login_after = config.adjudicator_login(was), config.adjudicator_login(now)
+    if login_before != login_after:
+        diffs.append(("adjudicator login", login_before or "(none)", login_after or "(none)"))
+    if login_after:
+        before, after = _token_ref(was, login_after), _token_ref(now, login_after)
+        if before != after:
+            diffs.append((f"adjudicator token file ({login_after})", before or "(none)",
+                          after or "(none)"))
     return diffs, touched
 
 
@@ -631,6 +666,14 @@ def cmd_init(args) -> int:
         login, path = pair.split("=", 1)
         tokens[login] = path
 
+    # Token-file paths from the settings form are checked before anything else is: a path that is
+    # relative, missing, not yours or group/world readable is refused by name, and never opened.
+    try:
+        config.verify_token_settings(_SETTINGS)
+    except config.ConfigError as exc:
+        print(f"config refused: {exc}")
+        return 2
+
     reviewer_profile = args.reviewer_profile or d["reviewer_profile"]
     fixer_profile = args.fixer_profile or d["fixer_profile"]
     fixers = [login for login in (args.fixer or []) if login] or (
@@ -660,6 +703,23 @@ def cmd_init(args) -> int:
     fixer_seat = next((login for login in fixers
                        if login.lower() == configured_fixer.lower()), fixers[0]) if configured_fixer else fixers[0]
     adjudicator_profile = args.adjudicator_profile or d["adjudicator_profile"] or "default"
+    # An explicit --token for a login wins over the form's path for it, as every explicit flag does.
+    mapped = {login.lower() for login in tokens}
+    for seat_login_, key in ((reviewer_seat, "reviewer_token_file"), (fixer_seat, "fixer_token_file")):
+        if d[key] and seat_login_ and seat_login_.lower() not in mapped:
+            tokens[seat_login_] = str(pathlib.Path(d[key]).expanduser())
+    explicit_adj = getattr(args, "adjudicator_login", None)
+    adjudicator_login = (explicit_adj if explicit_adj is not None
+                         else (d["adjudicator_login"] if args.adjudicator_route else "")).strip()
+    if adjudicator_login and not args.adjudicator_route:
+        print("--adjudicator-login needs --adjudicator-route: the comment identity only ever posts "
+              "a ruling, and without a breach route nothing rules")
+        return 2
+    if (adjudicator_login and d["adjudicator_token_file"]
+            and adjudicator_login.lower() not in mapped
+            and (not d["adjudicator_login"]
+                 or d["adjudicator_login"].lower() == adjudicator_login.lower())):
+        tokens[adjudicator_login] = str(pathlib.Path(d["adjudicator_token_file"]).expanduser())
 
     raw = {
         "id": args.id or args.repo.split("/")[-1],
@@ -673,6 +733,7 @@ def cmd_init(args) -> int:
                          "agent": args.reviewer_agent},
             "fixer": {"profile": fixer_profile, "route": "",
                       "login": fixer_seat, "agent": args.fixer_agent},
+            **({"adjudicator": {"login": adjudicator_login}} if adjudicator_login else {}),
         },
         "adjudicator": ({"route": args.adjudicator_route, "profile": adjudicator_profile}
                         if args.adjudicator_route else {}),
@@ -702,6 +763,9 @@ def cmd_init(args) -> int:
         config.webhook_host(loop["host"], required=True)
         # Who does what, and may they: profiles, allowlists, distinct credentials and route
         # ownership are all checked before a single file is written.
+        # The adjudicator's token file is checked first, so a relative, missing or shared-readable
+        # path is refused by its own name rather than as a generic missing file.
+        config.verify_adjudicator_token(loop)
         config.verify_seats(loop, roles)
         _verify_routes(loop, roles)
         _observer_check(loop)
@@ -714,6 +778,7 @@ def cmd_init(args) -> int:
         print(f"  would write: {config.config_dir() / (loop['id'] + '.json')}")
         for line in _seat_lines(loop, "effective seat mapping"):
             print(f"  {line}")
+        print("  credentials: " + " · ".join(_credential_lines(loop)))
         for name in _routes_of(loop).values():
             print(f"  would write route: {name}")
         if args.hooks:
@@ -827,6 +892,46 @@ def cmd_set(args) -> int:
 
     seats = {seat: dict(cfg) for seat, cfg in loop["seats"].items()}
     seat_changes = {}
+
+    # The adjudicator's optional comment identity. `set` maps only *its* credential: the seats'
+    # token files move through the settings form and `apply`, which owns the in-flight rules.
+    tokens = dict(loop.get("tokens") or {})
+    adj_before = config.adjudicator_login(loop)
+    adj_wanted = getattr(args, "adjudicator_login", None)
+    adj_after = adj_before if adj_wanted is None else adj_wanted.strip()
+    for pair in getattr(args, "token", None) or []:
+        if "=" not in pair:
+            print(f"--token expects login=/path/to/pat, got {pair!r}")
+            return 2
+        login, path = pair.split("=", 1)
+        if not adj_after or login.strip().lower() != adj_after.lower():
+            print(f"refused: `set --token` only maps the adjudicator login's token file "
+                  f"(--adjudicator-login); {login!r} is not it — seat token files move through "
+                  "the plugin settings and `apply`")
+            return 2
+        try:
+            config.check_token_file(path, f"--token {login}")
+        except config.ConfigError as exc:
+            print(f"refused: {exc}")
+            return 2
+        for key in [k for k in tokens if str(k).lower() == login.lower()]:
+            del tokens[key]
+        tokens[adj_after] = str(pathlib.Path(path.strip()).expanduser())
+    adj_changed = adj_after != adj_before or tokens != (loop.get("tokens") or {})
+    if adj_after != adj_before:
+        adj_seat = dict(seats.get("adjudicator") or {})
+        if adj_after:
+            if not (loop.get("adjudicator") or {}).get("route"):
+                print("refused: this loop has no adjudicator route, so nothing rules — an "
+                      "adjudicator login would never post")
+                return 2
+            adj_seat["login"] = adj_after
+        else:
+            adj_seat.pop("login", None)
+        if adj_seat:
+            seats["adjudicator"] = adj_seat
+        else:
+            seats.pop("adjudicator", None)
     for seat, value in (("reviewer", args.reviewer_concurrency), ("fixer", args.fixer_concurrency)):
         if value is not None and value != config.seat_concurrency(loop, seat):
             seats[seat]["concurrency"] = value
@@ -862,14 +967,20 @@ def cmd_set(args) -> int:
     if args.observer_unmute:
         observer_cfg["mute"] = False
 
-    if not changes and not seat_changes and observer_cfg == (loop.get("observer") or {}):
+    if (not changes and not seat_changes and not adj_changed
+            and observer_cfg == (loop.get("observer") or {})):
         print("nothing to change — pass at least one setting "
               "(--concurrency, --reviewer-concurrency, --fixer-concurrency, --cap, --clone, "
               "--observer-profile, ...)")
         return 0
 
     try:
-        updated = config.normalize({**loop, **changes, "seats": seats, "observer": observer_cfg})
+        updated = config.normalize({**loop, **changes, "seats": seats, "observer": observer_cfg,
+                                    "tokens": tokens})
+        if adj_changed and config.adjudicator_login(updated):
+            # The same file-level rules init applies, plus: the file must exist and be private.
+            config.verify_adjudicator_token(updated)
+            config.verify_credentials(updated)
         _observer_check(updated)
     except config.ConfigError as exc:
         print(f"refused: {exc}")
@@ -944,6 +1055,12 @@ def cmd_set(args) -> int:
     for seat, value in seat_changes.items():
         was = config.seat_concurrency(loop, seat)
         print(f"  {seat} concurrency: {was} → {value}  (this seat only)")
+    if adj_after != adj_before:
+        shown = adj_after or "(none — rulings go to the operator only)"
+        print(f"  adjudicator login: {adj_before or '(none)'} → {shown}")
+    if adj_after and _token_ref(loop, adj_after) != _token_ref(updated, adj_after):
+        print(f"  adjudicator token file ({adj_after}): {_token_ref(loop, adj_after) or '(none)'}"
+              f" → {_token_ref(updated, adj_after)}")
     if updated.get("observer") != (loop.get("observer") or {}):
         print(f"  observer: {observer.describe(loop.get('observer') or {})} → "
               f"{observer.describe(updated.get('observer') or {})}")
@@ -981,6 +1098,8 @@ def cmd_apply(args) -> int:
         return 2
 
     try:
+        # Token-file paths first: a bad path is refused by name before anything is computed.
+        config.verify_token_settings(_SETTINGS)
         updated = config.normalize(config.apply_settings(loop, _SETTINGS))
     except config.ConfigError as exc:
         print(f"settings refused: {exc}")
@@ -998,6 +1117,11 @@ def cmd_apply(args) -> int:
         # Validate what this apply would *write*: a loop that predates the seat checks keeps
         # loading, but a seat this push moves must be one that can actually run.
         config.verify_seats(updated, rebinding)
+        adj = config.adjudicator_login(updated)
+        if adj and (adj != config.adjudicator_login(loop)
+                    or _token_ref(loop, adj) != _token_ref(updated, adj)):
+            config.verify_adjudicator_token(updated)
+            config.verify_credentials(updated)
         if rebinding:
             _verify_routes(updated, rebinding)
     except config.ConfigError as exc:
@@ -1129,26 +1253,26 @@ def cmd_settings(args) -> int:
     """Show the plugin-level defaults — what a new loop starts from, and what ``apply`` pushes."""
     d = config.settings_defaults(_SETTINGS)
     print("plugin settings (desktop: Capabilities → Plugins → review loop)")
+    width = max(len(key) for key in config.SETTINGS_SCHEMA)
     for key, spec in config.SETTINGS_SCHEMA.items():
         value = d[key]
         source = "set" if str((_SETTINGS or {}).get(key, "")) not in ("", "None") else "default"
-        print(f"  {key:<21} {str(value):<26} [{source}]  {spec['description']}")
+        print(f"  {key:<{width}} {str(value):<26} [{source}]  {spec['description']}")
 
     print("\nseat mapping (blank = not set here: a loop keeps its own answer)")
     mapping = config.seat_mapping(_SETTINGS)
     for role in config.ROUTE_ROLES:
         entry = mapping.get(role) or {}
         profile = entry.get("profile") or "(blank)"
-        if role in config.LOGIN_SETTINGS:
-            cell = f"login {(entry.get('login') or '(blank)'):<30} "
-        else:
-            # The adjudicator reads and rules and never pushes, so there is no login to name — the
-            # cell says so in the same width, which keeps the [set]/[blank] markers in one column.
-            cell = f"{'no login (rules, never pushes)':<36} "
+        login = entry.get("login") or ("(blank)" if role in config.LOGIN_SETTINGS
+                                       else "(blank — operator-only)")
+        cell = f"login {login:<30} "
         print(f"  {role:<12} profile {profile:<20} {cell}[{'set' if entry else 'blank'}]")
+        # The path only, never the file: this is where the login's PAT is read from at use time.
+        print(f"  {'':<12} token file {entry.get('token_file') or '(blank)'}")
     adjudicator_note = ("the adjudicator lands only on a loop that already has an adjudicator "
-                        "route, and it has no login to misattribute a ruling to; route names stay "
-                        "per repository")
+                        "route; its login is optional — a fourth account the ruling is also posted "
+                        "as — and it never pushes or reviews; route names stay per repository")
     print(f"  ({adjudicator_note})")
 
     try:
@@ -1162,6 +1286,9 @@ def cmd_settings(args) -> int:
         for loop in loops:
             print(f"  {loop['id']:<18} "
                   + " · ".join(_role_summary(loop, role) for role in config.ROUTE_ROLES))
+            refs = _credential_lines(loop)
+            if refs:
+                print(f"  {'':<18} token files: " + " · ".join(refs))
     if not _SETTINGS:
         print("\nnothing set — every value above is the schema default")
     print("\napply them to a loop with: hermes review-loop apply --loop <id>"
@@ -1205,8 +1332,10 @@ def cmd_status(args) -> int:
               f"fixer={loop['seats']['fixer']['login']} ({loop['seats']['fixer']['profile']})")
         adjudicator = loop.get("adjudicator") or {}
         if adjudicator.get("route"):
+            adj_login = config.adjudicator_login(loop)
             print(f"  {'adjudicator:':<12} {adjudicator.get('profile', 'default')} "
-                  f"(route {adjudicator['route']})")
+                  f"(route {adjudicator['route']})"
+                  + (f" · comments as {adj_login}" if adj_login else " · operator-only rulings"))
         else:
             print(f"  {'adjudicator:':<12} (no route — the cap only writes a marker)")
         # What the registry actually serves, next to what the config claims: those two facts can
@@ -1611,6 +1740,9 @@ def register_cli(ctx, settings: dict | None = None) -> None:
                           help="skill the seats are told to load. A plugin-provided skill is "
                                "qualified, e.g. hermes-review-loop:review-loop")
         init.add_argument("--adjudicator-route", default="")
+        init.add_argument("--adjudicator-login", default=None,
+                          help="optional fourth GitHub account the ruling is also posted as (needs "
+                               "--adjudicator-route and its own --token LOGIN=/path)")
         init.add_argument("--adjudicator-profile", default="",
                           help="Hermes profile for the adjudicator (default: the plugin setting, "
                                "else the launch profile)")
@@ -1706,6 +1838,12 @@ def register_cli(ctx, settings: dict | None = None) -> None:
         change.add_argument("--ttl-min", type=int, help="how long a run may hold its slot")
         change.add_argument("--inflight-ttl-min", type=int)
         change.add_argument("--host", help="gateway webhook host")
+        change.add_argument("--adjudicator-login", default=None,
+                            help="optional fourth GitHub account the ruling is also posted as; "
+                                 "\"\" clears it (rulings go to the operator only)")
+        change.add_argument("--token", action="append", default=[],
+                            help="LOGIN=/path/to/pat for the adjudicator login only (a path, "
+                                 "never the token)")
         change.add_argument("--observer-route", help="route the observer feed delivers through")
         change.add_argument("--observer-profile", help="profile that owns the observer destination")
         change.add_argument("--observer-deliver",

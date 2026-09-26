@@ -230,6 +230,14 @@ def check_seat_models(loop: dict) -> list[Check]:
         checks.append(Check(f"model:{seat}", status_of[status], detail, fix))
     return checks
 
+def _token_file_facts(path: pathlib.Path) -> str:
+    """``path (exists: yes, private: no)`` — metadata only; the file is never opened here."""
+    exists = path.exists()
+    private = exists and not config.token_file_problem(str(path))
+    return (f"{path} (exists: {'yes' if exists else 'no'}, "
+            f"private: {'yes' if private else 'no'})")
+
+
 def check_credential(loop: dict, seat: str) -> Check:
     """The gates use gh.token_path, not the profile's GH_TOKEN environment variable."""
     login = str(loop["seats"][seat].get("login") or "")
@@ -237,8 +245,14 @@ def check_credential(loop: dict, seat: str) -> Check:
     if login:
         path = gh.token_path(loop, login)
         if path and path.is_file() and path.stat().st_size > 0:
+            facts = _token_file_facts(path)
+            if config.token_file_problem(str(path)):
+                return Check(f"credential:{seat}", MISMATCH,
+                             f"{login} → {facts}: {config.token_file_problem(str(path))}",
+                             f"chmod 600 {path} (and own it): a token file other users can read "
+                             "is a shared credential")
             return Check(f"credential:{seat}", VERIFIED,
-                         f"{login} → a nonempty token file (identity and API access not checked)")
+                         f"{login} → {facts}, nonempty (identity and API access not checked)")
     env = profile_dir(str(loop["seats"][seat].get("profile") or "")) / ".env"
     if "GH_TOKEN" in _env_keys(env):
         return Check(f"credential:{seat}", ABSENT,
@@ -247,6 +261,11 @@ def check_credential(loop: dict, seat: str) -> Check:
                      "gate's configured GitHub identity",
                      f"add --token {login or '<login>'}=/path/to/pat for this seat")
     who = login or f"the {seat} seat"
+    mapped = gh.token_path(loop, login) if login else None
+    if mapped is not None:
+        return Check(f"credential:{seat}", ABSENT,
+                     f"{login} → {_token_file_facts(mapped)}: missing or empty",
+                     f"write the PAT for {login} to {mapped} (chmod 600)")
     return Check(f"credential:{seat}", ABSENT,
                  f"no tokens entry for {who!r} and no GH_TOKEN in {env}",
                  f"re-run init with --token {login or '<login>'}=/path/to/pat, or put "
@@ -280,8 +299,15 @@ def check_adjudicator_identity(loop: dict) -> Check | None:
                      f"add --token {login}=/path/to/pat, or remove seats.adjudicator.login for "
                      "operator-only rulings")
     if not path.is_file() or path.stat().st_size == 0:
-        return Check("credential:adjudicator", ABSENT, f"{login} → no nonempty token file",
+        return Check("credential:adjudicator", ABSENT,
+                     f"{login} → {_token_file_facts(path)}: no nonempty token file",
                      f"write the PAT for {login} (chmod 600)")
+    if config.token_file_problem(str(path)):
+        return Check("credential:adjudicator", MISMATCH,
+                     f"{login} → {_token_file_facts(path)}: "
+                     f"{config.token_file_problem(str(path))}",
+                     f"chmod 600 {path} (and own it): the ruling identity needs a private "
+                     "credential")
     for role, other in others.items():
         theirs = gh.token_path(loop, other) if isinstance(other, str) and other else None
         try:
@@ -293,7 +319,7 @@ def check_adjudicator_identity(loop: dict) -> Check | None:
                          f"{login} reads the same token file as the {role}",
                          f"give {login} its own PAT file: a shared file is one account")
     return Check("credential:adjudicator", VERIFIED,
-                 f"{login} → its own token file; rulings are also posted as a PR comment "
+                 f"{login} → its own token file {_token_file_facts(path)}; rulings are also posted as a PR comment "
                  "(principal checked by the broker before each comment)")
 
 

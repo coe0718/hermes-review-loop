@@ -38,7 +38,7 @@ See [Preflight](architecture.md#preflight-can-this-installation-run) and, for ex
 | `seats.<seat>.emoji` | 🔍 / 🔧 | cosmetic, for the ping |
 | `adjudicator.route` | — | enables adjudication: when the cap is spent an isolated adjudicator turn is enqueued in the host run ledger; omit to only write the marker. The legacy gateway route itself stays silent |
 | `adjudicator.profile` | `default` | profile of the legacy gateway route (validated against the seats; the isolated turn does not run as it) |
-| `seats.adjudicator.login` | unset | **optional** GitHub identity the ruling is *also* posted as, as a PR comment. It needs its own `tokens` entry and must be a fourth account: not the `read_token`, not either seat, not in `fixers`/`reviewers`, and not sharing a token file with any of them. The broker re-checks all of it (plus distinct `/user` principals and the live PR) before each comment. Without it rulings go to the operator only — not an error |
+| `seats.adjudicator.login` | unset | **optional** GitHub identity the ruling is *also* posted as, as a PR comment. Set it with `init`/`set --adjudicator-login LOGIN --token LOGIN=/abs/path` (`set --adjudicator-login ""` clears it) or the `adjudicator_login` setting. It needs its own `tokens` entry (an absolute, private 0600 file) and must be a fourth account: not the `read_token`, not either seat, not in `fixers`/`reviewers`, and not sharing a token file with any of them. The broker re-checks all of it (plus distinct `/user` principals and the live PR) before each comment. Without it rulings go to the operator only — not an error |
 | `seats.adjudicator.concurrency` | `1` | isolated adjudicator turns at once. Does not inherit the loop-level `concurrency` |
 | `skill` | — | skill the seats are told to load |
 | `tokens` | `{}` | `login → path of a file containing that seat's PAT (mode 600)` |
@@ -157,6 +157,9 @@ hermes review-loop apply --loop <id>             # write it
 | `reviewer_login` | — | `seats.reviewer.login` **and** `reviewer_seat` — the login the review route serves |
 | `fixer_login` | — | `seats.fixer.login` |
 | `adjudicator_profile` | — | `adjudicator.profile`, on a loop that already has an `adjudicator.route` |
+| `reviewer_token_file` / `fixer_token_file` | — | `tokens[<that seat's login>]` — a **path** only; checked absolute, existing, yours, mode 600 before any write |
+| `adjudicator_login` | — | `seats.adjudicator.login`, on a loop that already has an `adjudicator.route` |
+| `adjudicator_token_file` | — | `tokens[<adjudicator login>]` — a **path** only, same checks, and not shared with any other login |
 | `clone`, `base`, `host` | —, `main`, unset | the same loop keys; a blank host in the form preserves an existing loop's explicit host |
 | `grace_min`, `ttl_min`, `inflight_ttl_min` | 25, 45, 10 | the same loop keys |
 
@@ -202,6 +205,7 @@ run, and they refuse it *before* the loop config, the routes or the hooks are to
 | reviewer and fixer differ in profile, in login, and in token file | one seat reviewing its own work is not a review |
 | an adjudicator differs from both seats | it is judging them |
 | every `tokens` mapping points at a real, non-empty file, and `read_token` is one of them | a missing PAT reads as an unauthenticated call, hours later, in a log nobody reads |
+| a token path from the settings form (and the adjudicator's) is absolute, yours, and mode 600 | a path is all the form may hold; a group-readable PAT is a shared credential |
 | a loop that maps tokens maps one for each seat it is writing | otherwise that seat pushes as the read identity |
 | a route is not claimed by another loop, and still runs this role's gate script | the registry is shared by every plugin on the host |
 
@@ -223,7 +227,7 @@ read login and both seat logins before any installation writes.
 **A seat with a run in flight is not rewritten underneath itself.** `apply` refuses while the seat
 it would move has a live run, and says who is running and for how long. `--while-busy` is the
 explicit override: the change lands now, and that run finishes under the identity it started with.
-Numeric knobs (`cap`, concurrency, timers) are not gated this way — they take effect on the next
+A new token-file path for a seat's login counts as moving that seat. Numeric knobs (`cap`, concurrency, timers) are not gated this way — they take effect on the next
 event and cannot strand a run.
 
 `status` shows the mapping and checks it against the registry:

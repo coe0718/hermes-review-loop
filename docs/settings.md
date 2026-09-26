@@ -24,6 +24,10 @@ The plugin declares a `config_schema`, so it has a settings form at
 | `reviewer_login` | — | GitHub login the reviewer acts as (and the login the review route serves) |
 | `fixer_login` | — | GitHub login the fixer acts as |
 | `adjudicator_profile` | — | Hermes profile that rules when the budget is spent (optional) |
+| `reviewer_token_file` | — | **path** to the reviewer login's PAT file (never the token itself) |
+| `fixer_token_file` | — | **path** to the fixer login's PAT file (never the token itself) |
+| `adjudicator_login` | — | optional fourth GitHub account the ruling is also posted as (optional) |
+| `adjudicator_token_file` | — | **path** to the adjudicator login's PAT file (never the token itself) |
 | `clone` | — | the local clone runs isolate from (required above 1) |
 | `base` | main | base branch the loop watches |
 | `grace_min` | 25 | quiet minutes before the watchdog speaks |
@@ -42,6 +46,18 @@ are validated before anything is written — the profile must exist on this mach
 in that loop's allowlist, the two seats must not share a profile, a login or a token file, and every
 token the loop names must be a file that is there. A form that names a seat is a promise that the
 seat can run, so `init` and `apply` refuse rather than write a loop that fails at its first event.
+
+**Token files are paths, never tokens.** The four credential fields hold *where* a PAT lives; the
+form (and the Hermes config it writes to) never holds a token value. Before anything is written,
+each path must expand (`~` is fine) to an absolute path that exists, is a regular file you own, and
+is not group- or world-readable (mode 600). A symlink is followed, as every token reader in the
+plugin follows it, and its target must pass the same checks. Nothing opens the file to check it:
+the refusal names the setting and the reason (`reviewer_token_file: … is mode 644 — group/other can
+read it`). `apply` maps each seat's login to its path in the loop's `tokens`; a new path for a seat
+with a run in flight is an identity change, so it needs `--while-busy` like a profile or login
+move. `adjudicator_login` and `adjudicator_token_file` land only on a loop that already has an
+adjudicator route, and must be a fourth identity — see
+[Token files](operations.md#token-files-one-pat-per-account).
 
 Two rules, because a settings form that quietly renumbers a running loop is a miserable thing to
 debug at 2am:
@@ -77,8 +93,9 @@ hermes review-loop status --loop name            # each seat, its profile, and w
 
 `status` is the honest surface: it prints what the *installed* route serves next to what the config
 claims, and says `MISMATCH` with the command to fix it when a seat moved but its route did not.
-Token *references* are shown (which login reads which file); token values never are — they live in
-the per-profile 0600 file the seats read at use time.
+Token *references* are shown (which login reads which file, including the adjudicator's comment
+login); token values never are — they live in the 0600 file the seats read at use time. `settings`
+shows the path each seat's field names, and each loop's current `login → path` mapping.
 
 The form stays a per-profile default on purpose. Fixer/reviewer **allowlists**, route names, the
 adjudicator route and everything else that is per repository stay in the loop config, because one

@@ -557,6 +557,7 @@ class Config(unittest.TestCase):
         self.tokens = {}
         for login in ("rev", "fix", "adj"):
             (root / f"{login}.pat").write_text("x")
+            (root / f"{login}.pat").chmod(0o600)     # doctor reports a group-readable PAT
             self.tokens[login] = str(root / f"{login}.pat")
         self.raw = {"repo": REPO, "fixers": ["fix"], "reviewers": ["rev"], "read_token": "rev",
                     "tokens": self.tokens, "state_dir": str(root / "state"),
