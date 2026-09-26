@@ -201,11 +201,6 @@ use and must not be used to certify this branch.
 
 Historical pre-hold evidence (not current rollout authorization):
 
-- The harness runs in two modes, and a few checks only decide anything in one of them:
-  **standalone** (no `hermes_cli` on the interpreter — what a stdlib-only CI image gives you) and
-  **installed** (Hermes importable, which is every real machine). doctor resolves a seat's model by
-  running Hermes *as that profile* and validates stored cron expressions, so a fixture that builds a
-  "complete installation" must build it in both — CI runs the suite once per mode.
 - `python3 tests/run_tests.py` — full offline suite: every gate branch, the cap, the one-PR-one-
   seat rule (including the handoff that must *not* deadlock the gates), per-seat capacity and
   queueing, an approval freeing its slot and starting the next queued PR, **real isolation** (real
@@ -244,6 +239,20 @@ Not proven, and worth knowing before you trust it:
   hooks; where it cannot, the line says unknown instead of claiming the loop is parked.
 - One gateway host is assumed for the routes (`host` in each loop config). A fleet of gateways is
   untested.
+
+## Running the tests
+
+```bash
+python3 tests/run_tests.py                                # the offline harness
+python3 -m unittest discover -s tests -p 'test_*.py'      # the boundary suite (bubblewrap; skips without it)
+```
+
+The plugin is stdlib-only and so are its tests: there is nothing to install. The harness runs in two
+modes, and a few checks only decide anything in one of them — **standalone** (no `hermes_cli` on the
+interpreter, which is what a stdlib-only CI image gives you) and **installed** (Hermes importable,
+which is every real machine). `doctor` resolves a seat's model by running Hermes *as that profile*
+and validates stored cron expressions, so a fixture that builds a "complete installation" has to
+build it in both, and CI runs the suite once per mode.
 
 ## Documentation
 
