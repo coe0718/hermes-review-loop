@@ -20,9 +20,10 @@ For every mode: the upstream is one fixed HTTP(S) URL with no userinfo, query or
 path ends in the mode's suffix; the sandbox may only POST the mode's fixed local path; the body's
 ``model`` is forced to the seat's model; the output-token cap is enforced in the mode's own field;
 every call spends quota; and a streamed (``text/event-stream``) answer is relayed as it arrives.
-Request headers from the sandbox are dropped except a short per-mode allowlist of non-credential
-headers — ``Authorization``, ``x-api-key``, ``anthropic-beta``/``-version``, account and
-user-agent headers are always the host's. Any other ``api_mode`` (``bedrock_converse``, the
+Request headers from the sandbox are dropped, except a short per-mode allowlist of non-credential
+headers (today only Codex's ``session_id`` and ``x-client-request-id``). ``Authorization``,
+``x-api-key``, ``anthropic-beta``/``-version``, account and user-agent headers are always the host's
+and can never be supplied by the sandbox. Any other ``api_mode`` (``bedrock_converse``, the
 ``codex_app_server`` runtime, …) is refused at construction.
 
 Credentials: the capability takes a *credential provider* (``StaticCredential`` for an API key,
