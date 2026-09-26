@@ -201,6 +201,11 @@ use and must not be used to certify this branch.
 
 Historical pre-hold evidence (not current rollout authorization):
 
+- The harness runs in two modes, and a few checks only decide anything in one of them:
+  **standalone** (no `hermes_cli` on the interpreter — what a stdlib-only CI image gives you) and
+  **installed** (Hermes importable, which is every real machine). doctor resolves a seat's model by
+  running Hermes *as that profile* and validates stored cron expressions, so a fixture that builds a
+  "complete installation" must build it in both — CI runs the suite once per mode.
 - `python3 tests/run_tests.py` — full offline suite: every gate branch, the cap, the one-PR-one-
   seat rule (including the handoff that must *not* deadlock the gates), per-seat capacity and
   queueing, an approval freeing its slot and starting the next queued PR, **real isolation** (real
