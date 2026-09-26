@@ -200,7 +200,7 @@ class RouteWorkerVertical(unittest.TestCase):
             if db.exists():
                 with sqlite3.connect(db) as con:
                     rows = con.execute('SELECT state, attempts, outcome, error FROM runs').fetchall()
-                if rows and rows[0][0] in ('succeeded', 'failed', 'uncertain'):
+                if rows and rows[0][0] in ('succeeded', 'failed', 'uncertain', 'waiting', 'cancelled'):
                     break
             time.sleep(0.1)
         self.assertEqual(len(rows), 1, rows)
@@ -242,7 +242,9 @@ class RouteWorkerVertical(unittest.TestCase):
         self.world['pr']['head']['sha'] = 'c' * 40
         result = self.route()
         self.assertEqual((result.returncode, result.stdout.strip()), (0, '[SILENT]'), result.stderr)
-        row = self.result('failed')
+        # The PR advertises a head GitHub then fails to serve: a transient read, so the pre-write
+        # run waits to retry (#53) rather than failing for good. Still no agent, still no write.
+        row = self.result('waiting')
         self.assertEqual(row[1], 1)
         self.assertEqual(self.world['model'], [])
         self.assertEqual(self.world['writes'], [])
