@@ -575,6 +575,34 @@ def check_scripts() -> Check:
     return Check("scripts", VERIFIED, f"{scripts_dir()} (watchdog, three gates, cleanup)")
 
 
+def check_gate_timeout() -> Check:
+    """Does a gate's time budget fit inside the gateway's route-script timeout (#75)?
+
+    The gateway kills a route script at its webhook ``script_timeout_seconds`` and answers the
+    delivery 200 "ignored" either way. Gates read the same setting and shrink their budget to
+    fit, so a low value is safe but starves them of time for GitHub reads.
+    """
+    from . import gate_failures as gf
+    timeout, where = gf.gateway_script_timeout()
+    if timeout is None:
+        return Check("gate:timeout", UNKNOWN,
+                     f"cannot read the gateway's script timeout: {where}; gates assume "
+                     f"{gf.GATEWAY_DEFAULT_TIMEOUT_S}s")
+    budget, backstop = gf.plan(timeout, gf.DEFAULT_BUDGET_S)
+    if timeout < gf.MIN_TIMEOUT_S:
+        return Check("gate:timeout", MISMATCH,
+                     f"gateway {gf.KEY}={timeout}s ({where}) leaves gates only {budget:g}s for "
+                     f"GitHub reads (they need {gf.DEFAULT_BUDGET_S:g}s, plus a "
+                     f"{gf.BACKSTOP_S:g}s backstop and time to record a failure)",
+                     f"set platforms.webhook.{gf.KEY}: {gf.GATEWAY_DEFAULT_TIMEOUT_S} (at least "
+                     f"{gf.MIN_TIMEOUT_S}) in {gf.gateway_home() / 'config.yaml'} and restart "
+                     f"the gateway; until then an overrun is recorded as a gate timeout and "
+                     f"re-driven by the watchdog")
+    return Check("gate:timeout", VERIFIED,
+                 f"gateway {gf.KEY}={timeout}s ({where}); gate budget {budget:g}s + "
+                 f"{backstop:g}s backstop fits")
+
+
 _WATCHDOG_LINE = re.compile(r"WATCHDOG\s*=\s*pathlib\.Path\((['\"])(?P<path>.+?)\1\)")
 
 
@@ -928,6 +956,7 @@ def check_loop(loop: dict, offline: bool = False) -> list[Check]:
     checks.append(check_read_token(loop))
     checks.extend(check_routes(loop))
     checks.append(check_scripts())
+    checks.append(check_gate_timeout())
     checks.append(check_shim(loop))
     checks.append(check_cron_job(loop))
     checks.append(check_clone(loop))

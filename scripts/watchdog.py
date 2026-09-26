@@ -55,6 +55,24 @@ READ_FAILURE_SWEEPS = 3
 EXPIRY_WARN_DAYS = 7
 EXPIRY_WARN_EVERY_SEC = 86400
 SCRIPTS = pathlib.Path(__file__).resolve().parent
+# A hanging GitHub must not stall the sweep (#75): every read is capped, and the whole run has
+# a budget; when it is spent the sweep stops, says so, and the next cron run starts fresh.
+WATCHDOG_BUDGET_S = 600.0
+WATCHDOG_PER_CALL_S = 20.0
+
+
+def watchdog_budget() -> float:
+    try:
+        value = float(os.environ.get("REVIEW_LOOP_WATCHDOG_BUDGET_S", WATCHDOG_BUDGET_S))
+    except ValueError:
+        value = WATCHDOG_BUDGET_S
+    return value if 0 < value <= 86400 else WATCHDOG_BUDGET_S
+
+
+def budget_spent_line(where: str, budget: float, exc: BaseException) -> str:
+    return (f"⚠️ Review loop {where} watchdog stopped: GitHub did not answer within the "
+            f"sweep's {budget:g}s budget ({exc}) — the rest of this run was skipped; the next "
+            f"sweep starts fresh")
 
 
 def sweep_gate_failures(ledger: gate_failures.Ledger, header: str, cooldown_s: float,
@@ -776,7 +794,15 @@ def main() -> None:
     ap.add_argument("--drain", action="store_true", help="start a queued run and print nothing else")
     ap.add_argument("--seat", default="reviewer", choices=["reviewer", "fixer"])
     args = ap.parse_args()
+    budget = watchdog_budget()
+    gh.begin_gate(time.monotonic() + budget, per_call=min(WATCHDOG_PER_CALL_S, budget))
+    try:
+        run(args, budget)
+    finally:
+        gh.end_gate()
 
+
+def run(args: argparse.Namespace, budget: float) -> None:
     loops = [config.load_id(args.loop)] if args.loop else config.all_loops()
     if not loops and args.loop:
         print(f"no loop config named {args.loop}")
@@ -791,7 +817,11 @@ def main() -> None:
                     print(f"{loop['id']}: hooks are paused — nothing drained" if armed is False
                           else f"{loop['id']}: hook list unreadable ({armed_error}) — nothing drained")
                 continue
-            fired = drain(loop, st, args.seat)
+            try:
+                fired = drain(loop, st, args.seat)
+            except gh.GateBudgetExceeded as exc:
+                print(budget_spent_line(f"[{loop['id']}]", budget, exc))
+                return
             if not fired and not st.queue_items(args.seat) and args.loop:
                 print(f"{loop['id']}: {args.seat} queue empty")
         return
@@ -816,6 +846,10 @@ def main() -> None:
         lines: list[str] = []
         try:
             out.extend(sweep_loop(loop, state_mod.state_for(loop), lines))
+        except gh.GateBudgetExceeded as exc:      # GitHub is hanging: every loop would too
+            out.extend(lines)
+            out.append(budget_spent_line(f"[{loop.get('id', '?')}]", budget, exc))
+            break
         except Exception as exc:                  # one bad loop must not hide the others
             out.extend(lines)
             out.append(f"⚠️ Review loop [{loop.get('id', '?')}] watchdog failed: "

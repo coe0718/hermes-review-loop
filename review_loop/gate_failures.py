@@ -85,6 +85,110 @@ def budget_s() -> float:
     return value if 0 < value < 600 else DEFAULT_BUDGET_S
 
 
+# -- the gateway's script timeout ----------------------------------------------------------
+#
+# The gateway reads ``script_timeout_seconds`` from its webhook platform block (default 30) and
+# kills a route script when it runs out. The gate cannot be told the value, so it reads the
+# same files the gateway does and fits its own budget inside it; ``doctor`` reports the fit.
+
+GATEWAY_DEFAULT_TIMEOUT_S = 30   # gateway/platforms/webhook_filters.py DEFAULT_SCRIPT_TIMEOUT_SECONDS
+KEY = "script_timeout_seconds"
+
+
+def gateway_home() -> pathlib.Path:
+    """The home the gateway process read its config from: a routed script's HERMES_HOME may be
+    a profile's (``<root>/profiles/<name>``), but the webhook platform is configured at launch."""
+    home = config.home()
+    return home.parent.parent if home.parent.name == "profiles" else home
+
+
+def _read_yaml(raw: str):
+    for name in ("yaml", "ruamel.yaml"):
+        try:
+            if name == "yaml":
+                import yaml as module
+                return module.safe_load(raw) or {}
+            from ruamel.yaml import YAML
+            return YAML(typ="safe").load(raw) or {}
+        except ImportError:
+            continue
+    return json.loads(raw)       # a JSON config is valid YAML; otherwise ValueError: no reader
+
+
+def gateway_script_timeout(home: pathlib.Path | None = None) -> tuple[int | None, str]:
+    """``(seconds, where)`` — what the gateway will allow a route script, as it computes it.
+
+    Layers, later winning (``gateway/config_loader.py`` ``merge_platform_sections``):
+    ``gateway.json`` ``platforms.webhook``, then ``config.yaml`` ``gateway.platforms.webhook``,
+    ``platforms.webhook``, ``gateway.webhook``. Inside a block an ``extra:`` value beats a
+    top-level one (``PlatformConfig.from_dict``). ``(None, reason)`` when a file names the key
+    but cannot be read here.
+    """
+    home = home or gateway_home()
+    blocks: list[tuple[str, object]] = []
+    legacy = home / "gateway.json"
+    try:
+        text = legacy.read_text(encoding="utf-8-sig") if legacy.is_file() else ""
+        if KEY in text:
+            data = json.loads(text)
+            blocks.append((f"{legacy}", ((data.get("platforms") or {}).get("webhook"))
+                           if isinstance(data, dict) else None))
+    except (OSError, ValueError, AttributeError) as exc:
+        return None, f"{legacy} unreadable ({type(exc).__name__})"
+    path = home / "config.yaml"
+    try:
+        text = path.read_text(encoding="utf-8-sig") if path.is_file() else ""
+    except OSError as exc:
+        return None, f"{path} unreadable ({type(exc).__name__})"
+    if KEY in text:
+        try:
+            data = _read_yaml(text)
+        except ValueError:
+            return None, (f"{path} sets {KEY} but this interpreter ({sys.executable}) has no "
+                          f"YAML reader")
+        except Exception as exc:  # noqa: BLE001 - a broken file is "unknown", never "30"
+            return None, f"{path} unreadable ({type(exc).__name__})"
+        data = data if isinstance(data, dict) else {}
+        gw = data.get("gateway") if isinstance(data.get("gateway"), dict) else {}
+        plat = gw.get("platforms") if isinstance(gw.get("platforms"), dict) else {}
+        top = data.get("platforms") if isinstance(data.get("platforms"), dict) else {}
+        blocks += [(f"{path} gateway.platforms.webhook", plat.get("webhook")),
+                   (f"{path} platforms.webhook", top.get("webhook")),
+                   (f"{path} gateway.webhook", gw.get("webhook"))]
+    top_value = extra_value = None
+    top_where = extra_where = ""
+    for where, block in blocks:
+        if not isinstance(block, dict):
+            continue
+        if KEY in block:
+            top_value, top_where = block[KEY], where
+        extra = block.get("extra")
+        if isinstance(extra, dict) and KEY in extra:
+            extra_value, extra_where = extra[KEY], where + ".extra"
+    value, where = ((extra_value, extra_where) if extra_value is not None
+                    else (top_value, top_where))
+    if value is None:
+        return GATEWAY_DEFAULT_TIMEOUT_S, "gateway default (not set)"
+    try:
+        return max(1, int(value)), where
+    except (TypeError, ValueError):
+        return None, f"{where}: {KEY} is not a number ({str(value)[:40]!r})"
+
+
+def plan(timeout: float, base: float | None = None) -> tuple[float, float]:
+    """``(budget, backstop)`` that fit inside the gateway's timeout with room to record."""
+    base = budget_s() if base is None else base
+    # budget + backstop + up to RECORD_S of bookkeeping + interpreter start-up < timeout
+    if timeout >= 13:
+        return min(base, timeout - 8), BACKSTOP_S
+    return min(base, timeout * 0.4), timeout * 0.15
+
+
+# The lowest gateway timeout at which the full default budget, its backstop, the bookkeeping
+# after a failure and the interpreter's start-up all still fit.
+MIN_TIMEOUT_S = int(DEFAULT_BUDGET_S) + 8
+
+
 def fingerprint(gate: str, raw: str) -> str:
     """The event's identity. The gateway never hands a script the delivery id, but a GitHub
     redelivery is byte-for-byte the same payload, so its canonical form names the event."""
@@ -245,17 +349,33 @@ def _backstop(_signum, _frame):
     raise gh.GateBudgetExceeded("gate exceeded its hard time budget (not in a GitHub read)")
 
 
+RECORD_S = 3.0   # the most the bookkeeping after a failure may take (lock waits included)
+
+
+class _RecordTimeout(Exception):
+    """Raised into the post-failure bookkeeping when it overruns; every step there catches
+    ``Exception`` and moves on, so the gate still exits before the gateway kills it."""
+
+
+def _record_overrun(_signum, _frame):
+    raise _RecordTimeout(f"post-failure bookkeeping exceeded {RECORD_S:g}s")
+
+
 def run(gate: str, main: Callable[[], None]) -> None:
     """Run one gate's ``main`` with a budget, and never let a failure pass as ``[SILENT]``."""
     raw = sys.stdin.read()
     sys.stdin = io.StringIO(raw)
-    budget = budget_s()
     started = time.monotonic()
+    try:
+        limit, _where = gateway_script_timeout()
+    except Exception:  # noqa: BLE001 - never let the fit check stop the gate
+        limit = None
+    budget, backstop = plan(limit or GATEWAY_DEFAULT_TIMEOUT_S)
     gh.begin_gate(started + budget)
     alarm = hasattr(signal, "setitimer")
     if alarm:
         signal.signal(signal.SIGALRM, _backstop)
-        signal.setitimer(signal.ITIMER_REAL, budget + BACKSTOP_S)
+        signal.setitimer(signal.ITIMER_REAL, budget + backstop)
     kind, exc, code = "", None, 0
     try:
         try:
@@ -292,7 +412,19 @@ def run(gate: str, main: Callable[[], None]) -> None:
                 log(f"gate-failure ledger resolve failed: {type(err).__name__}: {err}")
         raise SystemExit(code)
 
+    if alarm:
+        signal.signal(signal.SIGALRM, _record_overrun)
+        signal.setitimer(signal.ITIMER_REAL, RECORD_S)
     facts = describe(payload)
+    freed: list[str] = []
+    if kind in ("crash", "timeout"):
+        # A gate that claimed a seat and then died must not hold it until the TTL: the
+        # re-drive (or the next event) has to find the seat free.
+        from . import state as state_mod
+        try:
+            freed = state_mod.release_process_claims()
+        except Exception as err:  # noqa: BLE001
+            log(f"seat claim release failed: {type(err).__name__}: {err}")
     if kind == "incomplete":
         error_type = "GitHubReadFailed"
         message = "; ".join(f"{m} {p}: {e}" for m, p, e in failed_reads[:4])
@@ -304,7 +436,7 @@ def run(gate: str, main: Callable[[], None]) -> None:
     entry = {"gate": gate, "kind": kind, **facts, "error_type": error_type,
              "error": _bounded(message, 500), "traceback": _bounded(trace, 4000),
              "elapsed_s": round(elapsed, 2), "budget_s": budget,
-             "redrivable": gate in REDRIVABLE}
+             "redrivable": gate in REDRIVABLE, "released_claims": freed}
     recorded = ""
     for ledger in _ledgers_for(payload):
         try:
@@ -317,6 +449,8 @@ def run(gate: str, main: Callable[[], None]) -> None:
     log(f"GATE FAILURE ({kind}) {gate} {facts['repo'] or '?'} {where}: {error_type}: "
         f"{_bounded(message, 200)} — recorded {key} in {recorded or 'NOWHERE (ledger unwritable)'}"
         f"; the watchdog alerts and re-drives it")
+    if alarm:
+        signal.setitimer(signal.ITIMER_REAL, 0)
     if kind == "incomplete":
         raise SystemExit(0)   # the gate already printed its [SILENT]; the ledger tells them apart
     raise SystemExit(3 if kind == "timeout" else 2)
@@ -337,8 +471,10 @@ def redrive(ledger: Ledger, key: str, gate: str, scripts_dir: pathlib.Path) -> s
     ledger.update(key, {"redrives": int((ledger.entries().get(key) or {}).get("redrives") or 0) + 1,
                         "last_redrive_at": time.time()})
     try:
+        left = gh.remaining()
         proc = subprocess.run([sys.executable, str(script)], input=raw, capture_output=True,
-                              text=True, cwd=str(scripts_dir), timeout=60,
+                              text=True, cwd=str(scripts_dir),
+                              timeout=60 if left is None else max(1.0, min(60.0, left)),
                               env={**os.environ, REDRIVE_ENV: key})
     except subprocess.TimeoutExpired:
         return "re-drive timed out"

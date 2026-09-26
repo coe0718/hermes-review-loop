@@ -462,9 +462,14 @@ the gate is killed. A crash, a timeout, empty output and `[SILENT]` all get the 
 deliveries by itself, so a non-2xx "retry me" is neither available nor useful. The loop keeps its
 own record instead:
 
-* **Budget.** Each gate has 20s (`REVIEW_LOOP_GATE_BUDGET_S`; lower it if you lower the
-  gateway's timeout). Every GitHub call is clipped to what is left, and a timer 3s later
-  interrupts anything else that hangs.
+* **Budget.** Each gate has 20s (`REVIEW_LOOP_GATE_BUDGET_S`). It also reads the gateway's
+  `script_timeout_seconds` from the same files the gateway does and shrinks that budget to fit.
+  Every GitHub call is clipped to what is left, a timer 3s later interrupts anything else that
+  hangs, and a gate-triggered queue drain gets at most half of the time remaining. `doctor`
+  flags a gateway timeout below 28s (`gate:timeout`) and prints the setting to fix.
+* **Seats.** Gates enqueue isolated turns and do not hold seat locks. Still, a gate that
+  crashes or times out releases any seat claim its own process made, so a failed delivery never
+  keeps a seat until `ttl_min`.
 * **Ledger.** A crash (exit 2), a timeout (exit 3), or a `[SILENT]` that followed a failed GitHub
   read is written to `gate-failures.json` in the loop's state directory. The entry holds the gate,
   repo, PR, head, action, exception type and message, and a bounded traceback, and the payload is
@@ -478,6 +483,9 @@ own record instead:
   because that gate's output is its dispatch. An entry resolves when the same event later
   completes cleanly, whether through a re-drive or a manual redelivery from GitHub.
 * **`explain`** lists unresolved gate failures for the PR as blockers.
+* **The watchdog is budgeted too.** Its GitHub reads are capped at 20s each and the run at
+  600s (`REVIEW_LOOP_WATCHDOG_BUDGET_S`). When GitHub hangs, the sweep stops with one "watchdog
+  stopped" line and the next cron run starts fresh.
 
 ## How it handles a burst
 

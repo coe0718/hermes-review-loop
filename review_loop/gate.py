@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -916,12 +917,23 @@ def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> di
 
 
 def drain_seat(loop: dict, seat: str) -> None:
-    """Start whatever queued for a seat now that its turn is over. Best effort, never fatal."""
+    """Start whatever queued for a seat now that its turn is over. Best effort, never fatal.
+
+    Inside a gate this runs on the gate's clock (#75): the drain gets at most half of what is
+    left, and its own GitHub reads are budgeted to that, so a slow drain cannot spend the
+    gateway's script timeout. The watchdog's sweep drains whatever this one had to leave.
+    """
+    left = gh.remaining()
+    timeout = 180.0 if left is None else left / 2
+    if timeout < 1:
+        log(f"drain {seat} deferred to the watchdog — the gate's time budget is nearly spent")
+        return
+    env = {**os.environ, "REVIEW_LOOP_WATCHDOG_BUDGET_S": f"{max(0.5, timeout - 0.5):.1f}"}
     try:
         subprocess.run([sys.executable, str(pathlib.Path(__file__).resolve().parents[1]
                                             / "scripts" / "watchdog.py"),
                         "--loop", loop["id"], "--drain", "--seat", seat],
-                       capture_output=True, text=True, timeout=180)
+                       capture_output=True, text=True, timeout=timeout, env=env)
     except Exception as exc:
         log(f"drain {seat} failed: {exc}")
 
