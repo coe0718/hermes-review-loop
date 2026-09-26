@@ -418,6 +418,35 @@ def group_watchdog() -> None:
     check("stuck: dead slot reported", "slot held 120m" in out, True)
     check("stuck: waiting request reported", "waiting 90m" in out, True)
 
+    # A dead mark is warned about once and pruned by the sweep that warned, so the next sweep
+    # has nothing left to repeat. This pair runs with TEST's zeroed cooldown on purpose: the
+    # only reason the second sweep is quiet is that the first cleared locks.json.
+    reset(prs={})
+    state_file("watchdog.json").write_text(json.dumps({"armed_since": time.time() - 86400}))
+    state_file("locks.json").write_text(json.dumps(
+        {"reviewer": {f"{REPO}#7": {"at": time.time() - 120 * 60, "head": HEAD_A, "why": "died"}}}))
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets")
+    check("stuck: dead slot is reported on the first sweep", "slot held 120m" in out, True)
+    check("  that sweep prunes the expired mark", load_state("locks.json"), {})
+    check("  and does not promise a self-freeing slot", "frees itself" in out, False)
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets")
+    check("  the same dead slot is not reported again", "slot held" in out, False)
+
+    # The report is cooldown-bounded like a stall alert rather than reprinted on every sweep.
+    # TEST zeroes that window, so this pair runs with the loop's real 6h cooldown; the queue
+    # entry survives both sweeps, so the second sweep's silence is the cooldown, not a drop.
+    reset(prs={})
+    state_file("watchdog.json").write_text(json.dumps({"armed_since": time.time() - 86400}))
+    state_file("pending.json").write_text(json.dumps({"fixer": {
+        f"{REPO}#7": {"at": time.time() - 90 * 60, "head": HEAD_A, "url": "u", "reason": "busy"}}}))
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    check("stuck: waiting request reported on the first sweep", "waiting 90m" in out, True)
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=normal)
+    check("stuck: the identical warning is not repeated inside the cooldown",
+          "waiting 90m" in out, False)
+    check("  it is still queued — suppressed, not silently dropped", f"{REPO}#7" in
+          load_state("pending.json").get("fixer", {}), True)
+
     reset(prs={"7": pr(7)}, hooks_active=False)
     out, _, _ = run("watchdog.py", None, "--loop", "widgets", "--drain", "--seat", "reviewer",
                     extra_env={"REVIEW_LOOP_TEST": ""})
