@@ -26,6 +26,23 @@ def run_doctor(*argv) -> tuple[int, str]:
     return rc, buf.getvalue()
 
 
+def pinned_host_memory():
+    """A host with room to spare, whatever machine the suite is running on.
+
+    The sandbox caps are compared against the host's memory, so a small runner (CI's has ~7 GiB
+    against caps of 10 GiB) would fail "a correct install passes" — and every other preflight that
+    asserts doctor exits 0 — for a reason that has nothing to do with any fixture here. Pin it once,
+    at module scope, where every section inherits it; the caps-vs-memory section overrides it
+    locally on purpose.
+    """
+    return 256 * 1024 ** 3, 256 * 1024 ** 3
+
+
+from review_loop import doctor as _doctor_module  # the same object the harness namespace re-exports
+
+_doctor_module._host_memory = pinned_host_memory
+
+
 def loop_file() -> pathlib.Path:
     return LOOPS_DIR / "widgets.json"
 
@@ -234,13 +251,7 @@ def group_doctor() -> None:
     added = doctor_runtime_fixture()
     before_files = tree_digest(TMP)
     before_posts = len(RECEIVED)
-    # Pinned rather than read from the host: the caps check reports its worst case against what
-    # memory is available, so a small runner would fail "a correct install passes" for a reason
-    # that has nothing to do with this fixture.
-    real_memory = doctor._host_memory
-    doctor._host_memory = lambda: (256 * 1024 ** 3, 256 * 1024 ** 3)
-    rc, out = run_doctor("--loop", "widgets")
-    doctor._host_memory = real_memory
+    rc, out = run_doctor("--loop", "widgets")   # host memory is pinned at module scope
     check("a correct install passes", rc, 0)
     check("  every check verified", "widgets: 26 verified, 0 failed, 0 unknown (of 26 checks)" in out,
           True)
@@ -267,7 +278,7 @@ def group_doctor() -> None:
     install_doctor_fixture()
     doctor._host_memory = lambda: (4 * 1024 ** 3, 8 * 1024 ** 3)
     rc, out = run_doctor("--loop", "widgets")
-    doctor._host_memory = real_memory
+    doctor._host_memory = pinned_host_memory
     check("caps that cannot fit the host fail the preflight", rc, 1)
     check("  and the line carries both numbers",
           "sandbox:caps" in out and "more than the 4.0 GiB available" in out, True)
