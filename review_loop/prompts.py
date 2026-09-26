@@ -149,7 +149,9 @@ What to do:
 1. Read the code at `/work` and the earlier verdicts below — earlier rounds may already answer
    what you are about to ask.
 2. Verify the claims yourself in `/work`: build it, run the tests it touches, reproduce the bug it
-   says it fixed. A claim you did not check is not a finding, it is a rumor.
+   says it fixed. A claim you did not check is not a finding, it is a rumor. The host's
+   "Build environment" note at the top of this message says whether dependencies are available
+   offline; if they are not, verify by reading instead.
 3. Write the review body to a file and submit it through the broker (command below). Your review
    must end with exactly one verdict, APPROVE or REQUEST_CHANGES — a comment-only review is
    refused, because it would neither wake the fixer nor cue a merge. For every finding give the
@@ -160,7 +162,11 @@ What to do:
 5. Finish with a 3-5 line summary: verdict, what you verified, what you did not verify.
 
 Never approve what you did not verify. If you are uncertain — something you could not verify —
-the verdict is REQUEST_CHANGES, naming exactly what could not be verified, instead of guessing."""
+the verdict is REQUEST_CHANGES, naming exactly what could not be verified, instead of guessing.
+One exception: when the host's build environment note says dependencies are unavailable, that the
+sandbox could not build or run the tests is not itself a defect of the PR. Judge the code by
+reading it, say plainly in the review what you could not run, and base the verdict on what you
+can show from the code — not on the missing build."""
 
 ISOLATED_FIXER = """A review on your pull request in {repo} needs an answer.
 
@@ -180,7 +186,9 @@ What to do:
 
 1. Read the verdict below. Fix what was actually found in `/work` — a rewritten file that dodges
    the finding is not a fix, and the next round will say so.
-2. Verify your fix in `/work`: build it and run the tests the finding touches.
+2. Verify your fix in `/work`: build it and run the tests the finding touches. If the host's
+   build environment note at the top says dependencies are unavailable, check it by reading and say in your
+   summary that it is unbuilt.
 3. Publish the fix through the broker's push (command below). The host pushes it to the PR
    branch only if the branch is still at {head}; you cannot push any other way.
 4. **Then ask for the next review through the broker** — GitHub clears a pending review request

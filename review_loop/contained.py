@@ -10,6 +10,16 @@ import time
 
 MAX_CAPTURE = 256 * 1024
 
+# Where each ecosystem's host-prefetched dependency cache (``review_loop.deps``) is mounted, always
+# read-only, and the environment that keeps its tool offline. Fixed here, not by the caller: a
+# prefetched cache is the only extra host directory a turn may bind. Cargo's own home stays the
+# writable scratch ``/tmp/cargo`` (locks, the last-use tracker); only its ``registry`` (index,
+# downloaded ``.crate`` files, unpacked sources) comes from the host.
+DEPENDENCY_MOUNTS = {"rust": ("registry", "/tmp/cargo/registry")}
+# Always set, cache or not: the sandbox has no network either way, and cargo's offline mode turns a
+# resolver's DNS failure into a plain "not available offline" error.
+OFFLINE_ENV = ("CARGO_NET_OFFLINE", "true")
+
 class OutputLimitExceeded(RuntimeError):
     """The sandbox produced more output than the control plane will retain."""
 
@@ -19,7 +29,8 @@ def command(*, code: Path, venv: Path, runtime: Path, home: Path,
             network: bool = False, inference_socket_dir: Path | None = None,
             broker_socket_dir: Path | None = None,
             client_code: Path | None = None,
-            checkout_writable: bool = True) -> list[str]:
+            checkout_writable: bool = True,
+            dependency_caches: dict[str, Path] | None = None) -> list[str]:
     """Build an allowlisted mount namespace for the *entire* process tree.
 
     code must be a separately staged, audited, credentialless source snapshot;
@@ -45,6 +56,15 @@ def command(*, code: Path, venv: Path, runtime: Path, home: Path,
             raise ValueError('broker mount must contain only the capability socket')
     if client_code is not None and not (Path(client_code) / 'review_loop/broker_client.py').is_file():
         raise FileNotFoundError('staged broker client required')
+    dependency_binds = []
+    for ecosystem, cache in sorted((dependency_caches or {}).items()):
+        if ecosystem not in DEPENDENCY_MOUNTS:
+            raise ValueError(f'no dependency mount for {ecosystem!r}')
+        subdir, target = DEPENDENCY_MOUNTS[ecosystem]
+        source = Path(cache) / subdir
+        if source.is_symlink() or not source.is_dir():
+            raise FileNotFoundError(f'{ecosystem} dependency cache missing')
+        dependency_binds += ["--ro-bind", str(source), target]
     # The venv's interpreter symlinks point at the runtime's absolute host path, so the
     # runtime is mounted at that same path; its ancestors are empty directories.
     runtime_parents = [arg for parent in reversed(Path(runtime).parents[:-1])
@@ -63,7 +83,9 @@ def command(*, code: Path, venv: Path, runtime: Path, home: Path,
             "--ro-bind", str(rust), "/opt/rust",
             "--bind", str(home), "/home/agent",
             "--bind" if checkout_writable else "--ro-bind", str(checkout), "/work",
-            "--ro-bind", str(query), "/opt/query"]
+            "--ro-bind", str(query), "/opt/query",
+            # After the /tmp tmpfs above, so the read-only cache sits inside it.
+            *dependency_binds]
     if inference_socket_dir is not None:
         mounts += ["--dir", "/opt/inference", "--ro-bind", str(Path(inference_socket_dir)), "/opt/inference"]
     if broker_socket_dir is not None:
@@ -77,7 +99,7 @@ def command(*, code: Path, venv: Path, runtime: Path, home: Path,
             "--setenv", "RUSTUP_HOME", "/tmp/rustup", "--setenv", "CARGO_TARGET_DIR", "/work/target" if checkout_writable else "/tmp/target",
             "--setenv", "TMPDIR", "/tmp", "--setenv", "PATH", "/opt/venv/bin:/opt/rust/bin:/usr/bin:/bin",
             "--setenv", "GIT_CONFIG_GLOBAL", "/dev/null", "--setenv", "GIT_CONFIG_SYSTEM", "/dev/null",
-            "--setenv", "GIT_TERMINAL_PROMPT", "0", "--chdir", "/work", "--", *entry]
+            "--setenv", "GIT_TERMINAL_PROMPT", "0", "--setenv", *OFFLINE_ENV, "--chdir", "/work", "--", *entry]
 
 
 def run(*, timeout: int = 180, **kwargs) -> subprocess.CompletedProcess:
