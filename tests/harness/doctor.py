@@ -571,7 +571,7 @@ def group_doctor() -> None:
     check("a denied hooks read is not a failure", rc, 0)
     check("  reported as unknown", "⚠️ hooks" in out and "could not read" in out, True)
     check("  never as a missing hook", "❌ hook:" in out, False)
-    check("  with the permission to fix", "admin:repo_hook" in out, True)
+    check("  with the permission to fix", "read:repo_hook" in out, True)
 
     install_doctor_fixture()
     denial = os.environ["REVIEW_LOOP_GH_STUB"]

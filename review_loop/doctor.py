@@ -823,9 +823,9 @@ def check_hooks(loop: dict, offline: bool) -> list[Check]:
         return [Check("hooks", UNKNOWN,
                       f"could not read the complete /repos/{loop['repo']}/hooks listing — nothing was proved about "
                       f"{len(expected)} hook(s) (a token without hook read access — `repo`, or the "
-                      f"narrower `admin:repo_hook` — reads as denied)",
+                      f"narrower `read:repo_hook` — reads as denied)",
                       f"give the read token hook read access — `repo`, or the narrower "
-                      f"`admin:repo_hook` — and re-run; check by hand with "
+                      f"`read:repo_hook` — and re-run; check by hand with "
                       f"`gh api repos/{loop['repo']}/hooks`")]
     checks = []
     for seat, name, url in expected:

@@ -275,7 +275,7 @@ $ hermes review-loop doctor --loop widgets
   ✅ state_dir            doctor-demo/state (created under doctor-demo on the first run)
   ✅ roots                1 configured: doctor-demo/reviews
   ✅ gateway              127.0.0.1:43651 accepts a connection
-  ⚠️ hooks                could not read /repos/acme/widgets/hooks — nothing was proved about 2 hook(s) (a token without hook read access — `repo`, or the narrower `admin:repo_hook` — reads as denied)
+  ⚠️ hooks                could not read /repos/acme/widgets/hooks — nothing was proved about 2 hook(s) (a token without hook read access — `repo`, or the narrower `read:repo_hook` — reads as denied)
 
 widgets: 12 verified, 6 failed, 1 unknown (of 19 checks)
   6 failed: profile:fixer, token:dev-fixer, route:widgets-review, route:widgets-fix, cron:shim, cron:job — fix the ❌ lines above before this loop is armed.
