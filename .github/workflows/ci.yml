@@ -14,6 +14,11 @@ concurrency:
   group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Bump deliberately with the Hermes version the loop runs on: `plugin-guard` scans the plugin with
+  # this Hermes, and `installed-mode` runs the suite with it on the interpreter.
+  HERMES_PINNED: f84db42a32b28a00a2ef1e11e5471a27d22cc37f
+
 jobs:
   tests:
     runs-on: ubuntu-latest
@@ -54,9 +59,6 @@ jobs:
       fail-fast: false
       matrix:
         hermes: [pinned, main]
-    env:
-      # Bump deliberately with the Hermes version the loop runs on.
-      HERMES_PINNED: f84db42a32b28a00a2ef1e11e5471a27d22cc37f
     steps:
       - name: Skip Hermes main outside the scheduled run
         if: matrix.hermes == 'main' && github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
@@ -80,3 +82,36 @@ jobs:
       - name: Scan the plugin as `hermes plugins install` would
         if: matrix.hermes == 'pinned' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
         run: python plugin/.github/scripts/plugin_guard.py hermes plugin
+
+  # The suite runs in two modes, and they do not agree on every check. With Hermes importable a
+  # seat's model resolves for real and stored cron expressions are validated — the mode every
+  # installed machine is in, and not the one a stdlib-only image hands you. Only the other mode was
+  # ever run here, so the harness could call itself "a complete installation" while nine checks were
+  # red on a real box. Run the same suite once with the pinned Hermes on the interpreter.
+  installed-mode:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ env.HERMES_PINNED }}
+          path: hermes
+          fetch-depth: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      # Hermes itself is not installed — it builds a native extension the resolver does not need —
+      # but the two packages its pinned commit declares for this interpreter are, so the lane moves
+      # only when the pin moves: croniter for stored cron expressions, ruamel.yaml for a profile's
+      # config.yaml. (Hermes declares both for 3.14 and above, which is why this job runs there; the
+      # 3.11/3.13 standalone coverage lives in `tests`.)
+      - name: Put the pinned Hermes on the interpreter's path
+        run: |
+          pip install -q "croniter==6.0.0" "ruamel.yaml==0.18.16"
+          echo "PYTHONPATH=$GITHUB_WORKSPACE/hermes" >> "$GITHUB_ENV"
+      # Fail here rather than quietly re-running the standalone mode under a different name.
+      - name: Confirm the suite will run in the installed mode
+        run: python -c "import hermes_cli; print('installed mode:', hermes_cli.__file__)"
+      - name: Loop tests (installed mode)
+        run: python tests/run_tests.py

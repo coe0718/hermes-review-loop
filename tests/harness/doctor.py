@@ -54,8 +54,9 @@ def install_doctor_fixture() -> dict:
 
     `reset()` gives the loop, the clone and the three routes. The parts doctor exists to check
     beyond those are built here explicitly: the two profile homes (with the GH_TOKEN a seat
-    pushes with), owner-only PAT files, the cron shim pinned to *this* plugin install, the
-    scheduler's job store, and two repo hooks pointing at this loop's own gateway.
+    pushes with, and the model doctor resolves as that profile), owner-only PAT files, the cron
+    shim pinned to *this* plugin install, the scheduler's job store, and two repo hooks pointing
+    at this loop's own gateway.
     """
     from review_loop import cli, config
 
@@ -69,6 +70,7 @@ def install_doctor_fixture() -> dict:
         home.mkdir(parents=True, exist_ok=True)
         (home / ".env").write_text("DISCORD_BOT_TOKEN=unused\nDISCORD_HOME_CHANNEL=0\n"
                                    "GH_TOKEN=unused\n")
+    write_seat_models()
     for pat in (TMP / "rev.pat", TMP / "fix.pat"):
         pat.chmod(0o600)
     scripts = TMP / "hermes-home" / "scripts"
@@ -93,6 +95,30 @@ def install_doctor_fixture() -> dict:
     return config.load_id("widgets")
 
 
+def write_seat_models() -> list[pathlib.Path]:
+    """Give every seat profile — and the runtime home — a model a resolver can report.
+
+    doctor resolves a seat's model by running Hermes *as that profile*, so a profile home without a
+    ``model.provider`` is a real failure wherever Hermes is importable — which is every installed
+    machine, and not the interpreter a stdlib-only CI image hands you. A fixture that omits it is
+    "a complete installation" only in the one mode no user runs.
+
+    JSON is valid YAML, and the reader falls back to json without PyYAML (CI has none).
+    Returns the paths it created, for the caller to remove.
+    """
+    home = TMP / "hermes-home"
+    model = json.dumps({"model": {"default": "test-model", "provider": "openrouter"}}) + "\n"
+    added = []
+    for profile in ("reviewer-profile", "fixer-profile"):
+        profile_home = home / "profiles" / profile
+        profile_home.mkdir(parents=True, exist_ok=True)
+        (profile_home / "config.yaml").write_text(model)
+    if not (home / "config.yaml").exists():
+        (home / "config.yaml").write_text(model)
+        added.append(home / "config.yaml")
+    return added
+
+
 def doctor_runtime_fixture() -> list[pathlib.Path]:
     """A runtime file whose "Hermes" is this interpreter, and a provider in each seat profile.
 
@@ -109,15 +135,7 @@ def doctor_runtime_fixture() -> list[pathlib.Path]:
     runtime.write_text(json.dumps({"source": str(TMP), "venv": str(venv),
                                    "runtime": str(TMP), "rust": str(TMP)}))
     runtime.chmod(0o600)
-    added = [runtime]
-    # JSON is valid YAML, and the reader falls back to json without PyYAML (CI has none).
-    model = json.dumps({"model": {"default": "test-model", "provider": "openrouter"}}) + "\n"
-    for profile in (home / "profiles" / "reviewer-profile", home / "profiles" / "fixer-profile"):
-        (profile / "config.yaml").write_text(model)
-    if not (home / "config.yaml").exists():
-        (home / "config.yaml").write_text(model)
-        added.append(home / "config.yaml")
-    return added
+    return [runtime] + write_seat_models()
 
 
 def edit_subs(mutate) -> dict:
