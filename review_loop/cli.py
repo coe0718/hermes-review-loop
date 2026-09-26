@@ -577,7 +577,7 @@ def _install_schedule(loop: dict, schedule: str, deliver: str) -> list[str]:
     shim = scripts / SHIM_NAME
     shim.write_text(SHIM.format(watchdog=watchdog))
     shim.chmod(0o755)
-    hermes = shutil.which("hermes") or "hermes"
+    hermes = config.guard_real_hermes(shutil.which("hermes") or "hermes")
     cmd = [hermes, "cron", "create", schedule, "--name", watchdog_job_name(loop),
            "--no-agent", "--script", SHIM_NAME, "--deliver", deliver]
     try:

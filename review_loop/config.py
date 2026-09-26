@@ -836,6 +836,22 @@ def guard_real_home(path: pathlib.Path | str) -> pathlib.Path:
     return path
 
 
+def guard_real_hermes(executable: str) -> str:
+    """Return ``executable``; under the test guard, raise if it is a ``hermes`` in the real home.
+
+    The guard also shadows ``hermes`` on PATH with a shim that refuses to run; this is the second
+    layer, for a PATH the shim is missing from.
+    """
+    if not os.environ.get(TEST_HOME_GUARD_ENV) or not os.path.isabs(executable):
+        return executable
+    found = pathlib.Path(executable)
+    resolved = [pathlib.Path(os.path.normpath(found.absolute())), found.resolve()]
+    for real in _real_homes():
+        if any(real in path.parents for path in resolved):
+            raise RealHomeError(f"test home guard: refusing to run the real {executable}")
+    return executable
+
+
 def home() -> pathlib.Path:
     return guard_real_home(pathlib.Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser())
 

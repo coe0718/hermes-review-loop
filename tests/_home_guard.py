@@ -10,6 +10,7 @@ import in a process it:
 * points ``HOME`` and ``HERMES_HOME`` at a fresh temp directory and drops inherited overrides that
   could name real state, so ``config.home()``, ``Path.home()``, ``~`` and every subprocess that
   inherits the environment (gate scripts, run_supervisor workers, the watchdog) land there;
+* puts a ``hermes`` shim first on PATH that refuses to run (see ``FAKE_HERMES_ENV``);
 * arms the plugin's tripwire (``REVIEW_LOOP_TEST_HOME_GUARD``): while it is set, resolving the
   Hermes home, a ledger, a state dir or a cleanup root inside the real home's ``.hermes`` raises
   ``config.RealHomeError`` — so a test that escapes this guard fails instead of writing.
@@ -45,6 +46,38 @@ else:
         os.environ.pop(_var, None)
     os.environ.update({"HOME": str(TEST_HOME), "HERMES_HOME": str(TEST_HOME / ".hermes"),
                        "REVIEW_LOOP_TEST_USER_HOME": str(USER_HOME), GUARD_ENV: "1"})
+
+# No guarded test, nor any process it starts, may run the operator's real `hermes` CLI: it acts on
+# the real install (a bare `hermes` once resumed an interrupted source update and rebuilt the real
+# hermes-agent's UI builds). A shim goes FIRST on PATH and fails loudly, unless a test names its
+# own fake in FAKE_HERMES_ENV — and even then never the real binary.
+FAKE_HERMES_ENV = "REVIEW_LOOP_TEST_FAKE_HERMES"
+BLOCKED = "real hermes blocked under test guard"
+SHIM_EXIT = 97
+_SHIM = """#!/bin/sh
+real={real}
+if [ -n "$REVIEW_LOOP_TEST_FAKE_HERMES" ]; then
+  fake=$(readlink -f -- "$REVIEW_LOOP_TEST_FAKE_HERMES")
+  if [ -n "$real" ] && [ "$fake" = "$(readlink -f -- "$real")" ]; then
+    echo "{blocked}: REVIEW_LOOP_TEST_FAKE_HERMES names the real binary" >&2
+    exit {code}
+  fi
+  exec "$REVIEW_LOOP_TEST_FAKE_HERMES" "$@"
+fi
+echo "{blocked}: set REVIEW_LOOP_TEST_FAKE_HERMES to a fake (tests/_home_guard.py)" >&2
+exit {code}
+"""
+SHIM_DIR = pathlib.Path(os.environ.get("REVIEW_LOOP_TEST_SHIM_DIR") or TEST_HOME / ".review-loop-test-bin")
+if not (SHIM_DIR / "hermes").exists():
+    import shlex
+    _real = shutil.which("hermes") or ""
+    SHIM_DIR.mkdir(parents=True, exist_ok=True)
+    (SHIM_DIR / "hermes").write_text(_SHIM.format(real=shlex.quote(_real), blocked=BLOCKED,
+                                                  code=SHIM_EXIT))
+    (SHIM_DIR / "hermes").chmod(0o755)
+_path = os.environ.get("PATH", "/usr/bin:/bin").split(os.pathsep)
+os.environ["PATH"] = os.pathsep.join([str(SHIM_DIR), *(p for p in _path if p != str(SHIM_DIR))])
+os.environ["REVIEW_LOOP_TEST_SHIM_DIR"] = str(SHIM_DIR)
 
 # Read-only Hermes source for the real-Hermes vertical tests, captured from the real account.
 os.environ.setdefault("HERMES_AGENT_SOURCE", str(USER_HOME / ".hermes" / "hermes-agent"))

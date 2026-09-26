@@ -9,6 +9,7 @@ import ast
 import os
 import pathlib
 import pwd
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -17,7 +18,7 @@ from unittest import mock
 
 TESTS = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(TESTS.parent))
-from review_loop import config, state  # noqa: E402
+from review_loop import cli, config, state  # noqa: E402
 from review_loop.run_supervisor import Supervisor  # noqa: E402
 
 LEAKING = "test_boundary.BoundaryTests.test_gate_blocks_before_workspace_or_gateway_payload"
@@ -88,6 +89,68 @@ class HomeGuard(unittest.TestCase):
             result = self._run_leaking_test(fake_home, escaped=False)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(list(fake_home.rglob("*")), [])
+
+
+
+class HermesShim(unittest.TestCase):
+    """No guarded test may run the operator's real ``hermes``; plugin code gets the shim."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = pathlib.Path(self.temp.name)
+
+    def test_hermes_on_path_is_the_shim_and_it_refuses(self):
+        shim = _home_guard.SHIM_DIR / "hermes"
+        self.assertEqual(shutil.which("hermes"), str(shim))
+        self.assertEqual(os.environ["PATH"].split(os.pathsep)[0], str(_home_guard.SHIM_DIR))
+        result = subprocess.run([str(shim), "update"], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, _home_guard.SHIM_EXIT)
+        self.assertIn(_home_guard.BLOCKED, result.stderr)
+
+    def test_plugin_cron_create_hits_the_shim_not_the_real_binary(self):
+        # cli._install_schedule is the plugin's one PATH lookup of `hermes` (`init --schedule`).
+        with mock.patch.dict(os.environ, {"HERMES_HOME": str(self.root / "hermes")}):
+            os.environ.pop(_home_guard.FAKE_HERMES_ENV, None)
+            lines = cli._install_schedule({"id": "widgets"}, "15m", "local")
+        self.assertIn("cron create failed", lines[0])
+        self.assertIn(_home_guard.BLOCKED, lines[0])
+
+    def test_plugin_cron_create_runs_an_explicit_fake(self):
+        record = self.root / "argv"
+        fake = self.root / "fake-hermes"
+        fake.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > {record}\n')
+        fake.chmod(0o755)
+        with mock.patch.dict(os.environ, {"HERMES_HOME": str(self.root / "hermes"),
+                                          _home_guard.FAKE_HERMES_ENV: str(fake)}):
+            lines = cli._install_schedule({"id": "widgets"}, "15m", "local")
+        self.assertIn("scheduled the watchdog", lines[0])
+        self.assertEqual(record.read_text().split("\n")[:5],
+                         ["cron", "create", "15m", "--name", cli.watchdog_job_name({"id": "widgets"})])
+
+    def test_a_fake_naming_the_real_binary_is_refused(self):
+        # A stand-in "real hermes" that would leave a marker if the shim ever ran it.
+        marker = self.root / "ran"
+        real = self.root / "real-hermes"
+        real.write_text(f"#!/bin/sh\ntouch {marker}\n")
+        real.chmod(0o755)
+        shim = self.root / "hermes"
+        shim.write_text(_home_guard._SHIM.format(real=str(real), blocked=_home_guard.BLOCKED,
+                                                 code=_home_guard.SHIM_EXIT))
+        shim.chmod(0o755)
+        result = subprocess.run([str(shim)], capture_output=True, text=True, timeout=10,
+                                env={**os.environ, _home_guard.FAKE_HERMES_ENV: str(real)})
+        self.assertEqual(result.returncode, _home_guard.SHIM_EXIT)
+        self.assertIn("names the real binary", result.stderr)
+        self.assertFalse(marker.exists())
+
+    def test_plugin_refuses_a_hermes_inside_the_real_home(self):
+        fake_home = self.root / "home"
+        with mock.patch.dict(os.environ, {config.TEST_REAL_HOME_ENV: str(fake_home)}):
+            with self.assertRaises(config.RealHomeError):
+                config.guard_real_hermes(str(fake_home / ".local/bin/hermes"))
+            self.assertEqual(config.guard_real_hermes(str(_home_guard.SHIM_DIR / "hermes")),
+                             str(_home_guard.SHIM_DIR / "hermes"))
 
 
 if __name__ == "__main__":
