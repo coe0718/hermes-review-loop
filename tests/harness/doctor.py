@@ -234,9 +234,15 @@ def group_doctor() -> None:
     added = doctor_runtime_fixture()
     before_files = tree_digest(TMP)
     before_posts = len(RECEIVED)
+    # Pinned rather than read from the host: the caps check reports its worst case against what
+    # memory is available, so a small runner would fail "a correct install passes" for a reason
+    # that has nothing to do with this fixture.
+    real_memory = doctor._host_memory
+    doctor._host_memory = lambda: (256 * 1024 ** 3, 256 * 1024 ** 3)
     rc, out = run_doctor("--loop", "widgets")
+    doctor._host_memory = real_memory
     check("a correct install passes", rc, 0)
-    check("  every check verified", "widgets: 25 verified, 0 failed, 0 unknown (of 25 checks)" in out,
+    check("  every check verified", "widgets: 26 verified, 0 failed, 0 unknown (of 26 checks)" in out,
           True)
     check("  nothing is marked failed", "❌" in out, False)
     check("  the header says it is read-only",
@@ -245,6 +251,7 @@ def group_doctor() -> None:
                  "credential:fixer", "token:rev-coach", "token:dev-fixer", "read_token",
                  "route:widgets-review", "route:widgets-fix", "route:widgets-breach", "scripts",
                  "cron:shim", "cron:job", "clone", "state_dir", "roots", "gateway",
+                 "sandbox:caps",
                  "hook:widgets-review", "hook:widgets-fix",
                  "model:reviewer", "model:fixer", "model:adjudicator"):
         check(f"  ✅ {name}", f"✅ {name}" in out, True)
@@ -255,6 +262,15 @@ def group_doctor() -> None:
     check("  no token value appears in the report", "token-reviewer" in out, False)
     check("  nor a route secret",
           hashlib.sha256(b"widgets-review").hexdigest() in out, False)
+
+    section("doctor — the sandbox caps against the host's memory")
+    install_doctor_fixture()
+    doctor._host_memory = lambda: (4 * 1024 ** 3, 8 * 1024 ** 3)
+    rc, out = run_doctor("--loop", "widgets")
+    doctor._host_memory = real_memory
+    check("caps that cannot fit the host fail the preflight", rc, 1)
+    check("  and the line carries both numbers",
+          "sandbox:caps" in out and "more than the 4.0 GiB available" in out, True)
 
     section("doctor — route/profile/secret correspondence")
     install_doctor_fixture()
