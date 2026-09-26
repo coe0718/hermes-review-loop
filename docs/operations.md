@@ -492,6 +492,12 @@ own record instead:
   because that gate's output is its dispatch. An entry resolves when the same event later
   completes cleanly, whether through a re-drive or a manual redelivery from GitHub.
 * **`explain`** lists unresolved gate failures for the PR as blockers.
+* **One owner per failed read.** When a gate's GitHub read fails, the event's
+  `gate-failures.json` entry owns it: that is what raises the alert and triggers the re-drive.
+  `github-reads.json` still records it as the last failed call, which `explain` shows on its
+  `github:` line, but marks it `owned_by`. The watchdog's GitHub-health check therefore doesn't
+  announce it again. The watchdog's own reads (the `/user` probe and the hook list) and any
+  failed read no gate-failure entry claims are still reported by the health check.
 * **The watchdog is budgeted too.** Its GitHub reads are capped at 20s each and the run at
   600s (`REVIEW_LOOP_WATCHDOG_BUDGET_S`). When GitHub hangs, the sweep stops with one "watchdog
   stopped" line and the next cron run starts fresh.

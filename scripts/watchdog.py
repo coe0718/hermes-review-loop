@@ -185,7 +185,9 @@ def github_health(loop: dict, st: state_mod.LoopState, watch: dict, now: float,
     failure = st.github_failure()
     at = valid_clock(failure.get("at"), now)
     seen = valid_clock(watch.get("gate_failure_seen"), now) or 0.0
-    if at is not None and at > seen:
+    # A gate's failed read that its gate-failure entry owns is alerted (and re-driven) by that
+    # ledger's sweep; saying it here too would report one read twice.
+    if at is not None and at > seen and not failure.get("owned_by"):
         watch["gate_failure_seen"] = at
         status = failure.get("status") if type(failure.get("status")) is int else None
         if alert_due(watch, f"gate:{failure.get('where')}:{status or 'none'}", now, cooldown):
@@ -798,6 +800,8 @@ def main() -> None:
     gh.begin_gate(time.monotonic() + budget, per_call=min(WATCHDOG_PER_CALL_S, budget))
     try:
         run(args, budget)
+    except gh.GateBudgetExceeded as exc:          # e.g. the drain path's hook read
+        print(budget_spent_line(f"[{args.loop or 'all loops'}]", budget, exc))
     finally:
         gh.end_gate()
 

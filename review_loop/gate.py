@@ -450,7 +450,9 @@ def _explain_state(loop: dict, st: state_mod.LoopState, key: str, number: int, h
                            f"{failure.get('error')} — "
                            + ("a gate that hit it treated the PR as unavailable and started nothing"
                               if (failure.get("method") or "GET") == "GET"
-                              else "that call did not take effect"))
+                              else "that call did not take effect")
+                           + (f" (tracked as {failure['owned_by']}; the watchdog re-drives it)"
+                              if failure.get("owned_by") else ""))
     github_line = " · ".join(github_bits) or "no failed GitHub call recorded"
 
     return {"seat": seat_line, "queue": queue_line, "inflight": inflight_line,

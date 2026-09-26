@@ -150,8 +150,23 @@ class GateFailureTest(unittest.TestCase):
         proc, _ = gateway_run("gate_reviewer.py", t.pr_payload(7),
                               {"REVIEW_LOOP_GH_STUB": str(failing)})
         self.assertEqual((proc.returncode, proc.stdout.strip()), (0, "[SILENT]"))
-        (entry,) = loop_entries().values()
+        (key, entry), = loop_entries().items()
         self.assertEqual((entry["kind"], entry["error_type"]), ("incomplete", "GitHubReadFailed"))
+        # One owner per failed read (#75 with #54): github-reads.json keeps it as the last failed
+        # call, marked as owned by this entry, so the health sweep does not report it again.
+        st = state_mod.LoopState(config.load_id("widgets"))
+        failure = st.github_failure()
+        self.assertEqual(failure.get("owned_by"), f"gate-failures:{key}")
+        from unittest import mock
+        from scripts import watchdog as wd
+        ok = wd.gh.Response({"login": t.REVIEWER}, "", 200, {})
+        with mock.patch.object(wd, "TEST", False), \
+             mock.patch.object(wd.gh, "auth_probe", return_value=ok):
+            quiet = wd.github_health(config.load_id("widgets"), st, {}, time.time(), True, "")
+            st.github_failure_record({k: v for k, v in failure.items() if k != "owned_by"})
+            loud = wd.github_health(config.load_id("widgets"), st, {}, time.time(), True, "")
+        self.assertEqual([line for line in quiet if "could not" in line], [])
+        self.assertEqual(len([line for line in loud if "could not" in line]), 1)
 
     def test_deliberate_silence_records_nothing(self):
         proc, _ = gateway_run("gate_reviewer.py", t.pr_payload(7, action="labeled"))

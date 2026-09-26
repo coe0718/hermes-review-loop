@@ -396,6 +396,25 @@ def _ledgers_for(payload) -> list[Ledger]:
 # -- the guard ------------------------------------------------------------------------------
 
 
+def _claim_github_read(payload, key: str, since: float) -> None:
+    """One owner per failed GitHub read (#75 with #54). A read a gate made, and this ledger
+    recorded as the event's failure, is alerted and re-driven from here; ``github-reads.json``
+    keeps it only as the "last failed call" diagnostic (``explain``), marked ``owned_by`` so the
+    watchdog's GitHub-health sweep does not announce the same read a second time."""
+    loop = _loop_for(payload)
+    if not loop or not loop.get("state_dir"):
+        return
+    try:
+        from . import state as state_mod
+        st = state_mod.state_for(loop)
+        failure = st.github_failure()
+        at = failure.get("at")
+        if isinstance(at, (int, float)) and not isinstance(at, bool) and at >= since:
+            st.github_failure_record({**failure, "owned_by": f"gate-failures:{key}"})
+    except Exception as err:  # noqa: BLE001 - the health sweep then reports it; never silent
+        log(f"could not mark the failed read as owned: {type(err).__name__}: {err}")
+
+
 def _backstop(_signum, _frame):
     raise gh.GateBudgetExceeded("gate exceeded its hard time budget (not in a GitHub read)")
 
@@ -417,6 +436,7 @@ def run(gate: str, main: Callable[[], None]) -> None:
     raw = sys.stdin.read()
     sys.stdin = io.StringIO(raw)
     started = time.monotonic()
+    started_wall = time.time()
     try:
         limit, _rows = effective_timeout()
     except Exception:  # noqa: BLE001 - never let the fit check stop the gate
@@ -496,6 +516,8 @@ def run(gate: str, main: Callable[[], None]) -> None:
             break
         except Exception as err:  # noqa: BLE001 - fall through to the next ledger
             log(f"gate-failure ledger write failed ({ledger.path}): {type(err).__name__}: {err}")
+    if recorded:
+        _claim_github_read(payload, key, started_wall)
     where = f"#{facts['pr']}" if facts["pr"] else "an unnamed PR"
     log(f"GATE FAILURE ({kind}) {gate} {facts['repo'] or '?'} {where}: {error_type}: "
         f"{_bounded(message, 200)} — recorded {key} in {recorded or 'NOWHERE (ledger unwritable)'}"
