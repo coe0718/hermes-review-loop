@@ -428,12 +428,16 @@ class InferenceCapability:
 
             def do_POST(self):
                 length = self.headers.get('Content-Length', '')
-                if (self.path != capability.contract.local_path or
-                        self.headers.get('Transfer-Encoding') or
+                if (self.headers.get('Transfer-Encoding') or
                         not length.isdecimal() or not 0 < int(length) <= MAX_REQUEST):
                     self.send_error(400)
                     return
                 body = self.rfile.read(int(length))
+                if self.path != capability.contract.local_path:
+                    # Refused after reading the (bounded) body, so the client gets its 400
+                    # instead of a reset while it is still sending.
+                    self.send_error(400)
+                    return
                 if len(body) != int(length):
                     self.send_error(400)
                     return
@@ -578,11 +582,14 @@ def bridge(entry: list[str], socket_path: str = '/opt/inference/model.sock') -> 
 
         def do_POST(self):
             length = self.headers.get('Content-Length', '')
-            if (self.path not in LOCAL_PATHS or self.headers.get('Transfer-Encoding') or
+            if (self.headers.get('Transfer-Encoding') or
                     not length.isdecimal() or not 0 < int(length) <= MAX_REQUEST):
                 self.send_error(400)
                 return
             body = self.rfile.read(int(length))
+            if self.path not in LOCAL_PATHS:
+                self.send_error(400)
+                return
             conn = _UnixHTTP(socket_path)
             try:
                 # Never forward Hermes's dummy Authorization or caller-selected headers.

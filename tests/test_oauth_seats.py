@@ -847,7 +847,8 @@ class RealHermesWireFormats(unittest.TestCase):
             self.assertNotIn("sandbox-dummy", json.dumps(h))
             self.assertEqual(request["body"]["model"], "gpt-5.3-codex")
             self.assertLessEqual(request["body"]["max_output_tokens"], CONTRACTS["codex_responses"].cap)
-        outputs = [item for item in requests[-1]["body"]["input"]
+        # Any request, not the last: Hermes's session-title call may race in after it.
+        outputs = [item for request in requests for item in request["body"].get("input", [])
                    if isinstance(item, dict) and item.get("type") == "function_call_output"]
         self.assertIn("TOOL-RAN", json.dumps(outputs))
 
@@ -865,7 +866,7 @@ class RealHermesWireFormats(unittest.TestCase):
             self.assertLessEqual(body["max_tokens"], CONTRACTS["anthropic_messages"].cap)
             self.assertTrue(body["system"][0]["text"].startswith("You are Claude Code"))
             self.assertTrue(all(tool["name"].startswith("mcp__") for tool in body.get("tools", [])))
-        results = [block for message in requests[-1]["body"]["messages"]
+        results = [block for request in requests for message in request["body"].get("messages", [])
                    if isinstance(message.get("content"), list) for block in message["content"]
                    if block.get("type") == "tool_result"]
         self.assertIn("TOOL-RAN", json.dumps(results))
