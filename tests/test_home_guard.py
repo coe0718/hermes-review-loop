@@ -153,5 +153,51 @@ class HermesShim(unittest.TestCase):
                              str(_home_guard.SHIM_DIR / "hermes"))
 
 
+
+class LiveHermesSource(unittest.TestCase):
+    """The opt-in real-Hermes tests refuse a HERMES_AGENT_SOURCE inside the live install."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.home = pathlib.Path(self.temp.name) / "home"          # a fake "real home"
+        self.live = self.home / ".hermes/hermes-agent"
+        self.marker = pathlib.Path(self.temp.name) / "fake-hermes-ran"
+        hermes = self.live / "venv/bin/hermes"
+        hermes.parent.mkdir(parents=True)
+        hermes.write_text(f"#!/bin/sh\ntouch {self.marker}\n")
+        hermes.chmod(0o755)
+        patch = mock.patch.dict(os.environ, {config.TEST_REAL_HOME_ENV: str(self.home)})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_refusal_covers_the_live_tree_and_symlinks_into_it_only(self):
+        self.assertIn("disposable", _home_guard.source_refusal(self.live))
+        self.assertIn("disposable", _home_guard.source_refusal(self.home / ".hermes"))
+        link = pathlib.Path(self.temp.name) / "checkout-link"
+        link.symlink_to(self.live)
+        self.assertIn("disposable", _home_guard.source_refusal(link))
+        disposable = pathlib.Path(self.temp.name) / "hermes-agent-copy"
+        disposable.mkdir()
+        self.assertEqual(_home_guard.source_refusal(disposable), "")
+        self.assertEqual(_home_guard.source_refusal(self.home / "src/hermes-agent"), "")
+
+    def test_real_hermes_suites_fail_loudly_not_skip(self):
+        env = {k: v for k, v in os.environ.items()
+               if k not in (config.TEST_HOME_GUARD_ENV, "REVIEW_LOOP_TEST_USER_HOME", "HERMES_HOME")}
+        env.update(HOME=str(self.home), HERMES_AGENT_SOURCE=str(self.live),
+                   PYTHONPATH=os.pathsep.join([str(TESTS), str(TESTS.parent)]))
+        suites = ["test_contained_agent", "test_inference_proxy", "test_turn_vertical",
+                  "test_route_worker_vertical", "test_oauth_seats.RealHermesWireFormats"]
+        result = subprocess.run([sys.executable, "-m", "unittest", *suites], cwd=TESTS.parent, env=env,
+                                text=True, capture_output=True, timeout=120)
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        # One refusal per real-Hermes test or class, none of them skipped.
+        self.assertEqual(result.stderr.count("Point HERMES_AGENT_SOURCE at a disposable"), 5,
+                         result.stderr)
+        self.assertNotIn("skipped", result.stderr)
+        self.assertFalse(self.marker.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

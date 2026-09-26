@@ -104,8 +104,8 @@ class Fixture(http.server.BaseHTTPRequestHandler):
             self._send(404, {})
 
 
-@unittest.skipUnless(shutil.which('bwrap') and (SOURCE / 'venv/bin/hermes').exists()
-                     and (RUST / 'bin/cargo').exists(), 'offline sandbox prerequisites absent')
+@_home_guard.needs_real_hermes(bool(shutil.which('bwrap')), (RUST / 'bin/cargo').exists(),
+                               reason='offline sandbox prerequisites absent')
 class RouteWorkerVertical(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR'))

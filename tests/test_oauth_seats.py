@@ -778,8 +778,7 @@ def messages_reply(request):
                  ("message_stop", {"type": "message_stop"})])
 
 
-@unittest.skipUnless(_bwrap_works() and (SOURCE / "venv/bin/hermes").exists(),
-                     "bubblewrap or Hermes checkout unavailable")
+@_home_guard.needs_real_hermes(_bwrap_works(), reason="bubblewrap or Hermes checkout unavailable")
 class RealHermesWireFormats(unittest.TestCase):
     """The sandboxed Hermes, configured by ``sandbox_config``, completes a tool turn in each mode."""
 

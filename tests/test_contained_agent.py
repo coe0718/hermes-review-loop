@@ -32,8 +32,8 @@ class WholeAgentFixture(unittest.TestCase):
             self.assertEqual((result.returncode, result.stdout, result.stderr),
                              (0, 'ok\n', 'warning\n'))
 
-    @unittest.skipUnless(shutil.which('bwrap') and (SOURCE / 'venv/bin/hermes').exists(),
-                         'bubblewrap or Hermes checkout unavailable')
+    @_home_guard.needs_real_hermes(bool(shutil.which('bwrap')),
+                                   reason='bubblewrap or Hermes checkout unavailable')
     def test_real_agent_cannot_read_host_dummy_credentials(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as directory:
             root = Path(directory)

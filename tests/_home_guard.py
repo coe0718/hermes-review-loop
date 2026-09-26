@@ -4,9 +4,10 @@ Import this before anything from ``review_loop`` — every ``tests/test_*.py`` d
 import (``test_home_guard.py`` enforces that), and ``run_tests.py`` does for the harness. On first
 import in a process it:
 
-* captures, for read-only use, what the tests legitimately take from the real account: the Hermes
-  *source* (``HERMES_AGENT_SOURCE``, default ``~/.hermes/hermes-agent``) and the Rust toolchain
-  (``RUSTUP_HOME``/``CARGO_HOME`` and ``USER_HOME`` below) — reading those is fine;
+* captures, for read-only use, the Rust toolchain (``RUSTUP_HOME``/``CARGO_HOME`` and
+  ``USER_HOME`` below). The real-Hermes tests take their Hermes source only from an explicit
+  ``HERMES_AGENT_SOURCE`` — a disposable checkout, never the live ``~/.hermes/hermes-agent``
+  (``needs_real_hermes`` fails them loudly if it points there);
 * points ``HOME`` and ``HERMES_HOME`` at a fresh temp directory and drops inherited overrides that
   could name real state, so ``config.home()``, ``Path.home()``, ``~`` and every subprocess that
   inherits the environment (gate scripts, run_supervisor workers, the watchdog) land there;
@@ -22,10 +23,12 @@ top level, not a package), which is why this is an explicit first import rather 
 from __future__ import annotations
 
 import atexit
+import functools
 import os
 import pathlib
 import shutil
 import tempfile
+import unittest
 
 GUARD_ENV = "REVIEW_LOOP_TEST_HOME_GUARD"
 # Inherited settings that could point a test at real state; the fixtures set their own.
@@ -79,8 +82,69 @@ _path = os.environ.get("PATH", "/usr/bin:/bin").split(os.pathsep)
 os.environ["PATH"] = os.pathsep.join([str(SHIM_DIR), *(p for p in _path if p != str(SHIM_DIR))])
 os.environ["REVIEW_LOOP_TEST_SHIM_DIR"] = str(SHIM_DIR)
 
-# Read-only Hermes source for the real-Hermes vertical tests, captured from the real account.
-os.environ.setdefault("HERMES_AGENT_SOURCE", str(USER_HOME / ".hermes" / "hermes-agent"))
-HERMES_AGENT_SOURCE = pathlib.Path(os.environ["HERMES_AGENT_SOURCE"])
+# The Hermes source the opt-in real-Hermes tests run (in bwrap, by its venv's own `hermes`). Only
+# ever an explicit HERMES_AGENT_SOURCE — there is no default, because the obvious default is the
+# operator's live install, whose `hermes` acts on the real ~/.hermes.
+HERMES_AGENT_SOURCE = (pathlib.Path(os.environ["HERMES_AGENT_SOURCE"])
+                       if os.environ.get("HERMES_AGENT_SOURCE") else None)
+
+
+def _protected_homes() -> list[pathlib.Path]:
+    homes = [USER_HOME]
+    try:
+        import pwd
+        homes.append(pathlib.Path(pwd.getpwuid(os.getuid()).pw_dir))
+    except (ImportError, KeyError):
+        pass
+    if os.environ.get("REVIEW_LOOP_TEST_REAL_HOME"):     # the plugin's test-only fake real home
+        homes.append(pathlib.Path(os.environ["REVIEW_LOOP_TEST_REAL_HOME"]))
+    return homes
+
+
+def source_refusal(source: pathlib.Path | None = None) -> str:
+    """Why the real-Hermes tests must not run against ``source``, or ``""``.
+
+    Refused: a source at or inside a protected home's ``.hermes`` (the live install), lexically
+    or once symlinks are resolved.
+    """
+    source = HERMES_AGENT_SOURCE if source is None else source
+    if source is None:
+        return ""
+    forms = {pathlib.Path(os.path.normpath(source.absolute())), source.resolve()}
+    for home in _protected_homes():
+        for live in {pathlib.Path(os.path.normpath(home.absolute())) / ".hermes",
+                     home.resolve() / ".hermes"}:
+            if any(form == live or live in form.parents for form in forms):
+                return (f"HERMES_AGENT_SOURCE={source} is inside the live Hermes install "
+                        f"({live}); the real-Hermes tests refuse to run it. Point "
+                        "HERMES_AGENT_SOURCE at a disposable hermes-agent checkout with its own "
+                        "venv, outside ~/.hermes.")
+    return ""
+
+
+def needs_real_hermes(*prerequisites: bool, reason: str = "real-Hermes test prerequisites absent"):
+    """Decorate an opt-in real-Hermes test (function or class).
+
+    A HERMES_AGENT_SOURCE inside the live install fails the test loudly, whatever else is
+    missing; no source or a missing prerequisite skips it, as before.
+    """
+    def decorate(target):
+        refusal = source_refusal()
+        if refusal:
+            if isinstance(target, type):
+                def set_up_class(cls):
+                    raise AssertionError(refusal)
+                target.setUpClass = classmethod(set_up_class)
+                return target
+
+            @functools.wraps(target)
+            def refuse(*args, **kwargs):
+                raise AssertionError(refusal)
+            return refuse
+        ready = (HERMES_AGENT_SOURCE is not None
+                 and (HERMES_AGENT_SOURCE / "venv/bin/hermes").exists() and all(prerequisites))
+        return unittest.skipUnless(ready, reason)(target)
+    return decorate
+
 RUST = (pathlib.Path(os.environ.get("RUSTUP_HOME") or USER_HOME / ".rustup")
         / "toolchains/stable-x86_64-unknown-linux-gnu")

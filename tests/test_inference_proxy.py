@@ -166,8 +166,8 @@ class TransportTests(unittest.TestCase):
                 upstream.server_close()
                 thread.join()
 
-    @unittest.skipUnless(shutil.which('bwrap') and (SOURCE / 'venv/bin/hermes').exists(),
-                         'bubblewrap or Hermes checkout unavailable')
+    @_home_guard.needs_real_hermes(bool(shutil.which('bwrap')),
+                                   reason='bubblewrap or Hermes checkout unavailable')
     def test_real_hermes_via_host_capability(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as d:
             root = Path(d)

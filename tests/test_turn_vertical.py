@@ -26,8 +26,8 @@ RUST = _home_guard.RUST
 HEAD = 'a' * 40
 
 
-@unittest.skipUnless(shutil.which('bwrap') and (SOURCE / 'venv/bin/hermes').exists()
-                     and (RUST / 'bin/cargo').exists(), 'offline sandbox prerequisites absent')
+@_home_guard.needs_real_hermes(bool(shutil.which('bwrap')), (RUST / 'bin/cargo').exists(),
+                               reason='offline sandbox prerequisites absent')
 class WholeTurn(unittest.TestCase):
     def test_real_agent_host_only_broker_and_model_key_with_rust(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as tmp:
