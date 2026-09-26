@@ -123,7 +123,7 @@ def main():
     print('PASS empty profile directory is not an installed profile')
 
     init = t.parser_for({'reviewer_profile': 'vex', 'fixer_profile': 'drey'}).parse_args([
-        'init', '--repo', 'acme/reconcile', '--id', 'reconcile', '--host', t.HOST,
+        'init', '--repo', 'acme/reconcile', '--id', 'reconcile', '--host', t.HOST, *t.READER_ARGS,
         '--reviewer', t.REVIEWER, '--fixer', t.FIXER,
         '--token', f'{t.REVIEWER}={t.SEAT_PATS[0]}', '--token', f'{t.FIXER}={t.SEAT_PATS[1]}'])
     count = 0
@@ -132,7 +132,7 @@ def main():
     assert_old('init retry restores preexisting config and routes', rc)
 
     new_init = t.parser_for({'reviewer_profile': 'vex', 'fixer_profile': 'drey'}).parse_args([
-        'init', '--repo', 'acme/newloop', '--id', 'newloop', '--host', t.HOST,
+        'init', '--repo', 'acme/newloop', '--id', 'newloop', '--host', t.HOST, *t.READER_ARGS,
         '--reviewer', t.REVIEWER, '--fixer', t.FIXER,
         '--token', f'{t.REVIEWER}={t.SEAT_PATS[0]}',
         '--token', f'{t.FIXER}={t.SEAT_PATS[1]}', '--hooks'])
@@ -158,7 +158,7 @@ def main():
 
     multi = t.parser_for({'reviewer_profile': 'vex', 'fixer_profile': 'drey',
                           'reviewer_login': t.REVIEWER}).parse_args([
-        'init', '--repo', 'acme/multi', '--host', t.HOST,
+        'init', '--repo', 'acme/multi', '--host', t.HOST, *t.READER_ARGS,
         '--reviewer', 'backup-reviewer', '--reviewer', t.REVIEWER, '--fixer', t.FIXER,
         '--token', f'{t.REVIEWER}={t.SEAT_PATS[0]}', '--token', f'{t.FIXER}={t.SEAT_PATS[1]}'])
     rc, out = t.run_cli(multi)
@@ -236,7 +236,7 @@ def main():
     # The configured fixer is the selected login, not merely one of the allowed fixers.
     fixer_form = {'reviewer_profile': 'vex', 'fixer_profile': 'drey',
                   'reviewer_login': t.REVIEWER, 'fixer_login': t.FIXER}
-    fixer_args = ['init', '--repo', 'acme/multifix', '--host', t.HOST,
+    fixer_args = ['init', '--repo', 'acme/multifix', '--host', t.HOST, *t.READER_ARGS,
                   '--reviewer', t.REVIEWER, '--fixer', 'backup-fixer', '--fixer', t.FIXER,
                   '--token', f'{t.REVIEWER}={t.SEAT_PATS[0]}',
                   '--token', f'{t.FIXER}={t.SEAT_PATS[1]}']

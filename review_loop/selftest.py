@@ -683,7 +683,11 @@ def check_identities(report: Report, loop: dict) -> bool:
         if not login:
             ok = False
             report.add(step, name, FAIL, f"no login configured for the {role} identity",
-                       "re-run `hermes review-loop init` with --read-token/--reviewer-login/--fixer-login")
+                       f"hermes review-loop set --loop {loop.get('id') or '<id>'} --read-token "
+                       "LOGIN --token LOGIN=/path/to/pat" if role == "read" else
+                       f"name the {role} login: reviewer_login/fixer_login in the plugin settings, "
+                       f"then `hermes review-loop apply --loop {loop.get('id') or '<id>'}` (a new "
+                       "loop takes them from `init --reviewer/--reviewer-seat/--fixer`)")
             continue
         raw = (loop.get("tokens") or {}).get(login)
         if not raw:

@@ -188,7 +188,7 @@ class ScheduleFailureTests(unittest.TestCase):
             (hermes_home / "profiles" / profile / "config.yaml").write_text("model: x\n")
         tokens = self.root / "tokens"
         tokens.mkdir()
-        for login in ("rv", "fx"):
+        for login in ("rv", "fx", "rd"):
             (tokens / login).write_text("dummy")
             (tokens / login).chmod(0o600)
 
@@ -204,6 +204,7 @@ class ScheduleFailureTests(unittest.TestCase):
             "init", "--repo", "acme/gadgets", "--fixer", "fx", "--reviewer", "rv",
             "--host", HOST, "--reviewer-profile", "rp", "--fixer-profile", "fp",
             "--token", f"rv={tokens / 'rv'}", "--token", f"fx={tokens / 'fx'}",
+            "--read-token", "rd", "--token", f"rd={tokens / 'rd'}",   # the reader is its own account
             "--schedule", "15m"])
         out = io.StringIO()
         with patch.dict(os.environ, {"REVIEW_LOOP_CONFIG_DIR": str(self.root / "configs")}), \

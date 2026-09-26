@@ -389,7 +389,7 @@ def group_observer_cli() -> None:
                               "--reviewer", REVIEWER, "--reviewer-profile", "rv",
                               "--fixer-profile", "fx", "--host", HOST,
                               "--token", f"{REVIEWER}={SEAT_PATS[0]}",
-                              "--token", f"{FIXER}={SEAT_PATS[1]}",
+                              "--token", f"{FIXER}={SEAT_PATS[1]}", *READER_ARGS,
                               "--observer-profile", "tuck"])
     init_output = io.StringIO()
     with contextlib.redirect_stdout(init_output):

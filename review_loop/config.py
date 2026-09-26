@@ -516,8 +516,7 @@ def _adjudicator_seat(raw, loop: dict, where: str) -> dict:
         *loop["reviewers"], *loop["fixers"]) if x}
     if login.casefold() in others:
         raise ConfigError(f"{where}: seats.adjudicator.login {login!r} is also the reader, a seat "
-                          "or an allowlisted reviewer/fixer — the ruling identity must be its own "
-                          "account")
+                          f"or an allowlisted reviewer/fixer — {FOUR_IDENTITY_RULE}")
     tokens = loop.get("tokens") or {}
     if not tokens.get(login):
         raise ConfigError(f"{where}: seats.adjudicator.login {login!r} has no entry in 'tokens' — "
@@ -536,7 +535,7 @@ def _adjudicator_seat(raw, loop: dict, where: str) -> dict:
                                   f"{exc}") from exc
         if same:
             raise ConfigError(f"{where}: the adjudicator and {other!r} read the same token file "
-                              "— the ruling identity needs its own credential")
+                              f"— {FOUR_IDENTITY_RULE}")
     seat["login"] = login
     return seat
 
@@ -585,6 +584,58 @@ class ConfigError(Exception):
     """A loop file that cannot be trusted to drive a run."""
 
 
+FOUR_IDENTITY_RULE = ("the four-identity rule: the reader, the reviewer, the fixer and (if set) "
+                      "the adjudicator comment login must be four different accounts with four "
+                      "different token files (docs/operations.md#token-files-one-pat-per-account)")
+
+
+def _same_token_file(first, second) -> bool:
+    """Whether two token-file references name one file. Metadata only; the PAT is never read."""
+    mine, theirs = _path(first), _path(second)
+    if os.path.realpath(mine) == os.path.realpath(theirs):
+        return True
+    try:
+        return mine.exists() and theirs.exists() and mine.samefile(theirs)
+    except OSError:
+        return True                        # cannot tell them apart: treat as shared, never as safe
+
+
+def reader_problem(loop: dict) -> str:
+    """Why the reader is not its own identity, or ``""`` when it is (or no reader is named).
+
+    The reader reads every PR state the gates act on; the broker refuses every write when it is
+    also a seat, so a loop that installs that way passes init and fails at its first review. The
+    offline part of the rule is checked here — distinct logins, distinct token files; distinct
+    ``/user`` principals need the network, and ``selftest`` and the broker check those.
+    """
+    reader = str(loop.get("read_token") or "").strip()
+    if not reader:
+        return ""
+    others = [(f"{seat} seat", seat_login(loop, seat)) for seat in SEAT_KEYS]
+    others.append(("adjudicator comment login", adjudicator_login(loop)))
+    for role, login in others:
+        if login and login.casefold() == reader.casefold():
+            return f"the reader {reader!r} is also the {role}"
+    tokens = {str(k).casefold(): str(v or "") for k, v in (loop.get("tokens") or {}).items()}
+    mine = tokens.get(reader.casefold())
+    if not mine:
+        return ""
+    for role, login in others:
+        theirs = tokens.get(login.casefold()) if login else ""
+        if theirs and _same_token_file(mine, theirs):
+            return (f"the reader {reader!r} and the {role} {login!r} read the same token file — "
+                    "one account wearing two hats")
+    return ""
+
+
+def verify_reader(loop: dict) -> None:
+    """Refuse a reader that is not its own account, naming the four-identity rule."""
+    problem = reader_problem(loop)
+    if problem:
+        where = loop.get("id") or loop.get("repo") or "<inline>"
+        raise ConfigError(f"{where}: {problem} — {FOUR_IDENTITY_RULE}")
+
+
 def verify_credentials(loop: dict, roles: set[str] | None = None) -> None:
     """Check the loop's token *references* — never their values.
 
@@ -626,7 +677,10 @@ def verify_credentials(loop: dict, roles: set[str] | None = None) -> None:
         login = seat_login(loop, seat).lower()
         if login and login not in tokens:
             raise ConfigError(f"{where}: no token mapped for the {seat} login {login!r} — add "
-                              f"--token {login}=/path/to/pat, or the {seat} acts as {read_token!r}")
+                              f"--token {login}=/path/to/pat (its own PAT file, never the "
+                              "reader's)")
+    if roles & {"read", "adjudicator", *SEAT_KEYS}:
+        verify_reader(loop)
     if roles & set(SEAT_KEYS):
         # Distinct role credentials: two seats sharing one PAT is one account wearing two hats, and
         # the loop's whole point is that a different account reviews the fixer's work.

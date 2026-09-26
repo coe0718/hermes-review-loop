@@ -221,8 +221,9 @@ def write_loop() -> dict:
         "adjudicator": {"route": "widgets-breach", "profile": "default"},
         "state_dir": str(STATE_DIR), "clone": str(CLONE),
         "roots": [str(REVIEWS), str(SCRATCH)],
-        "tokens": {REVIEWER: str(TMP / "rev.pat"), FIXER: str(TMP / "fix.pat")},
-        "read_token": REVIEWER,
+        "tokens": {REVIEWER: str(TMP / "rev.pat"), FIXER: str(TMP / "fix.pat"),
+                   READ_LOGIN: str(READ_PAT)},
+        "read_token": READ_LOGIN,
         "host": HOST,
         "grace_min": 25, "marker_grace_min": 60, "cooldown_h": 6,
         "ttl_min": 45, "inflight_ttl_min": 10,
@@ -233,6 +234,7 @@ def write_loop() -> dict:
     (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg, indent=2))
     (TMP / "rev.pat").write_text("token-reviewer\n")
     (TMP / "fix.pat").write_text("token-fixer\n")
+    READ_PAT.write_text("token-reader\n")
     return cfg
 
 
@@ -471,6 +473,10 @@ def run_cli(parsed) -> tuple[int, str]:
 
 
 SEAT_PATS = (TMP / "rev.pat", TMP / "fix.pat")     # written by ``write_loop`` for both seats
+# The reader is its own account with its own file (the four-identity rule): every `init` the
+# harness drives names it, since init no longer borrows the reviewer seat for reads.
+READ_LOGIN, READ_PAT = "read-acct", TMP / "read.pat"
+READER_ARGS = ["--read-token", READ_LOGIN, "--token", f"{READ_LOGIN}={READ_PAT}"]
 
 
 def verify_sig(request: dict, route: str) -> bool:
