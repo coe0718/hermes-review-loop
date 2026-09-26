@@ -54,6 +54,7 @@ import json
 import os
 import pathlib
 import re
+import stat
 from urllib.parse import urlsplit
 from urllib.request import Request
 
@@ -105,6 +106,32 @@ SETTINGS_SCHEMA: dict = {
                             "description": "Profile that rules when the verdict budget is spent. "
                                            "Blank = not set here: a loop with no adjudicator route "
                                            "is left exactly as it is"},
+    # Token *paths* only. A token value typed into a settings form would be stored in plain text in
+    # a config file this plugin never owns, so these keys hold where the PAT lives — never the PAT.
+    "reviewer_token_file": {"label": "Reviewer's token file (path only)", "type": "str",
+                            "default": "",
+                            "description": "Absolute path (~ allowed) to the file holding the "
+                                           "reviewer login's GitHub PAT — the path only, never the "
+                                           "token itself. Must be your own mode-600 regular file. "
+                                           "Blank = not set here"},
+    "fixer_token_file": {"label": "Fixer's token file (path only)", "type": "str", "default": "",
+                         "description": "Absolute path (~ allowed) to the file holding the fixer "
+                                        "login's GitHub PAT — the path only, never the token "
+                                        "itself. Must be your own mode-600 regular file. Blank = "
+                                        "not set here"},
+    "adjudicator_login": {"label": "Adjudicator's GitHub login (optional)", "type": "str",
+                          "default": "",
+                          "description": "Optional fourth account the ruling is also posted as, "
+                                         "as a PR comment. Must differ from the reader and both "
+                                         "seats, with its own token file. Lands only on a loop "
+                                         "with an adjudicator route. Blank = not set here"},
+    "adjudicator_token_file": {"label": "Adjudicator's token file (path only, optional)",
+                               "type": "str", "default": "",
+                               "description": "Absolute path (~ allowed) to the file holding the "
+                                              "adjudicator login's GitHub PAT — the path only, "
+                                              "never the token itself. Must be your own mode-600 "
+                                              "regular file, not shared with any other login. "
+                                              "Blank = not set here"},
 }
 
 # Seat identity: *who* a seat is. A profile decides the model, the budget and the credentials the
@@ -114,6 +141,9 @@ SETTINGS_SCHEMA: dict = {
 PROFILE_SETTINGS: dict = {"reviewer": "reviewer_profile", "fixer": "fixer_profile",
                           "adjudicator": "adjudicator_profile"}
 LOGIN_SETTINGS: dict = {"reviewer": "reviewer_login", "fixer": "fixer_login"}
+# Where each role's PAT lives. Paths, never values: see ``token_file_problem``.
+TOKEN_FILE_SETTINGS: dict = {"reviewer": "reviewer_token_file", "fixer": "fixer_token_file",
+                             "adjudicator": "adjudicator_token_file"}
 # Every role that can own a webhook route. The adjudicator is here but not in ``SEAT_KEYS``: it has
 # a route and a profile, and no login or allowlist of its own.
 ROUTE_ROLES = ("reviewer", "fixer", "adjudicator")
@@ -215,9 +245,13 @@ def seat_mapping(settings: dict | None) -> dict:
         entry: dict = {}
         if str(d.get(key) or "").strip():
             entry["profile"] = str(d[key]).strip()
-        login_key = LOGIN_SETTINGS.get(seat)
+        login_key = LOGIN_SETTINGS.get(seat) or ("adjudicator_login" if seat == "adjudicator"
+                                                 else "")
         if login_key and str(d.get(login_key) or "").strip():
             entry["login"] = str(d[login_key]).strip()
+        token_key = TOKEN_FILE_SETTINGS.get(seat)
+        if token_key and str(d.get(token_key) or "").strip():
+            entry["token_file"] = str(d[token_key]).strip()
         if entry:
             mapping[seat] = entry
     return mapping
@@ -265,12 +299,107 @@ def apply_seats(loop_raw: dict, settings: dict | None) -> dict:
     reviewer_login = str((mapping.get("reviewer") or {}).get("login") or "")
     if reviewer_login:
         raw["reviewer_seat"] = reviewer_login
-    adj_profile = str((mapping.get("adjudicator") or {}).get("profile") or "")
+    adj_entry = mapping.get("adjudicator") or {}
+    adj_profile = str(adj_entry.get("profile") or "")
     adjudicator = dict(loop_raw.get("adjudicator") or {})
     if adj_profile and adjudicator.get("route"):
         adjudicator["profile"] = adj_profile
         raw["adjudicator"] = adjudicator
+    # Token files: each seat's login → the path the form names. The value is never read here; the
+    # path is checked (``verify_token_settings``) before anything is written.
+    tokens = dict(loop_raw.get("tokens") or {})
+    for seat in SEAT_KEYS:
+        path = str((mapping.get(seat) or {}).get("token_file") or "")
+        login = str(seats.get(seat, {}).get("login") or "")
+        if path:
+            if not login:
+                raise ConfigError(f"{TOKEN_FILE_SETTINGS[seat]} is set but the {seat} seat has no "
+                                  "login to map it to — set its login first")
+            _map_token(tokens, login, path)
+    # The adjudicator's comment identity, like its profile, only lands on a loop that already has an
+    # adjudicator route: a login alone cannot rule on anything.
+    adj_login = str(adj_entry.get("login") or "")
+    adj_path = str(adj_entry.get("token_file") or "")
+    if adjudicator.get("route") and (adj_login or adj_path):
+        adj_seat = dict(seats.get("adjudicator") or {})
+        if adj_login:
+            adj_seat["login"] = adj_login
+        login = str(adj_seat.get("login") or "")
+        if adj_path:
+            if not login:
+                raise ConfigError("adjudicator_token_file is set but no adjudicator login is — set "
+                                  "adjudicator_login (a token file names nobody on its own)")
+            _map_token(tokens, login, adj_path)
+        seats["adjudicator"] = adj_seat
+    if tokens != dict(loop_raw.get("tokens") or {}):
+        raw["tokens"] = tokens
     return raw
+
+
+def _map_token(tokens: dict, login: str, path: str) -> None:
+    """Point ``login`` at ``path``, dropping any case-variant key that would shadow it."""
+    for key in [k for k in tokens if str(k).lower() == login.lower() and k != login]:
+        del tokens[key]
+    tokens[login] = str(_path(path))
+
+
+def token_file_problem(value) -> str:
+    """Why ``value`` cannot be a token file path, or ``""`` when it can.
+
+    Only metadata is inspected — ``stat``, never ``open``: the PAT itself is not read, printed,
+    hashed or copied. The rules: ``~`` expands, the result is absolute, it exists, it is a regular
+    file owned by you, and group/other cannot read it (0600-style). A symlink is followed, as every
+    other token reader in this plugin (``gh.token``, ``doctor``) follows it, and its *target* has
+    to pass the same checks.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return "no path given"
+    path = _path(raw)
+    if not path.is_absolute():
+        return f"{raw!r} is not an absolute path (use /… or ~/…)"
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        return f"{path} does not exist"
+    except OSError as exc:
+        return f"{path} cannot be inspected ({exc.strerror or exc})"
+    if not stat.S_ISREG(info.st_mode):
+        return f"{path} is not a regular file"
+    if info.st_uid != os.getuid():
+        return f"{path} is owned by uid {info.st_uid}, not you ({os.getuid()})"
+    mode = info.st_mode & 0o777
+    if mode & 0o077:
+        return f"{path} is mode {mode:03o} — group/other can read it (chmod 600 {path})"
+    return ""
+
+
+def check_token_file(value, what: str) -> None:
+    """Raise a named ``ConfigError`` when ``value`` is not a usable private token-file path."""
+    problem = token_file_problem(value)
+    if problem:
+        raise ConfigError(f"{what}: {problem}")
+
+
+def verify_adjudicator_token(loop: dict) -> None:
+    """The adjudicator comment identity's token file must be a private absolute path.
+
+    Checked when a CLI or settings push *writes* the identity; ``normalize`` already refused a
+    missing mapping, a shared file and a login that is also the reader, a seat or an allowlisted
+    account. The live ``/user`` principal check stays in the broker, before each comment.
+    """
+    login = adjudicator_login(loop)
+    if login:
+        check_token_file((loop.get("tokens") or {}).get(login),
+                         f"token file for the adjudicator login {login!r}")
+
+
+def verify_token_settings(settings: dict | None) -> None:
+    """Every token-file path the settings form holds, checked before any write. Blank is skipped."""
+    d = settings_defaults(settings)
+    for key in TOKEN_FILE_SETTINGS.values():
+        if str(d.get(key) or "").strip():
+            check_token_file(d[key], key)
 
 
 DEFAULTS: dict = {

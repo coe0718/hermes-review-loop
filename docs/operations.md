@@ -77,8 +77,42 @@ change takes effect on the next event with nothing to re-install. The observer f
 same way: `--observer-profile`, `--observer-route`, `--observer-deliver`, `--observer-events`,
 `--observer-digest-min`, and `--observer-mute` / `--observer-unmute` / `--observer-disable`.
 
+`set --adjudicator-login LOGIN --token LOGIN=/abs/path` names (or `--adjudicator-login ""`
+clears) the optional account a ruling is also posted as; `set --token` maps only that login.
+
 Who serves each seat, and how the plugin-level defaults reach a loop, is covered in
 [Settings, in the desktop](settings.md).
+
+## Token files: one PAT per account
+
+Each GitHub account the loop uses gets its **own fine-grained PAT in its own file**, and the loop
+config (or the settings form) holds only the path:
+
+```bash
+(umask 077; mkdir -p ~/.hermes/keys)   # paste each account's PAT into its own <login>-pat file
+chmod 600 ~/.hermes/keys/*-pat
+
+hermes review-loop init --repo owner/name \
+  --fixer dev-account --reviewer rev-bot \
+  --fixer-profile drey --reviewer-profile vex \
+  --read-token reader-bot \
+  --token reader-bot=~/.hermes/keys/reader-bot-pat \
+  --token rev-bot=~/.hermes/keys/rev-bot-pat \
+  --token dev-account=~/.hermes/keys/dev-account-pat \
+  --adjudicator-route name-breach --adjudicator-profile tuck \
+  --adjudicator-login rule-bot --token rule-bot=~/.hermes/keys/rule-bot-pat \
+  --host https://your-gateway.example
+```
+
+* **Mode 600, owned by you, absolute path.** The settings form's `*_token_file` fields and the
+  adjudicator's `--token` are refused unless the path is absolute after `~` expansion, exists, is a
+  regular file you own, and is not group/world readable. The check reads metadata only.
+* **The four-identity rule.** The reader, the reviewer, the fixer and (if set) the adjudicator
+  comment login must be four different accounts with four different token files — the broker
+  re-checks distinct `/user` principals before each write. A shared file is one account wearing
+  two hats, and the review loop exists so a different account reviews the fixer's work.
+* **Never a token value.** `status`, `settings`, `doctor` and every refusal print paths; `doctor`
+  reports each seat's file as `path (exists: yes, private: yes)`.
 
 ## Preflight: `doctor`
 

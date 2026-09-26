@@ -91,3 +91,23 @@ config_schema:
     type: str
     default: ""
     description: "Profile that rules when the verdict budget is spent. Blank = not set here: a loop with no adjudicator route is left exactly as it is"
+  reviewer_token_file:
+    label: "Reviewer's token file (path only)"
+    type: str
+    default: ""
+    description: "Absolute path (~ allowed) to the file holding the reviewer login's GitHub PAT — the path only, never the token itself. Must be your own mode-600 regular file. Blank = not set here"
+  fixer_token_file:
+    label: "Fixer's token file (path only)"
+    type: str
+    default: ""
+    description: "Absolute path (~ allowed) to the file holding the fixer login's GitHub PAT — the path only, never the token itself. Must be your own mode-600 regular file. Blank = not set here"
+  adjudicator_login:
+    label: "Adjudicator's GitHub login (optional)"
+    type: str
+    default: ""
+    description: "Optional fourth account the ruling is also posted as, as a PR comment. Must differ from the reader and both seats, with its own token file. Lands only on a loop with an adjudicator route. Blank = not set here"
+  adjudicator_token_file:
+    label: "Adjudicator's token file (path only, optional)"
+    type: str
+    default: ""
+    description: "Absolute path (~ allowed) to the file holding the adjudicator login's GitHub PAT — the path only, never the token itself. Must be your own mode-600 regular file, not shared with any other login. Blank = not set here"
