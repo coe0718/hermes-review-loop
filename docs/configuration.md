@@ -270,6 +270,15 @@ It names **host paths** — the model is not a runtime setting any more (issue #
  "runtime": "/path/to/python-runtime", "rust": "~/.rustup/toolchains/stable-x86_64-unknown-linux-gnu"}
 ```
 
+**The interpreter this names must be able to read YAML.** A seat's model is resolved by a child
+process running the `venv` above, and Hermes reads its configs with `ruamel.yaml`. A packaged
+install runs Hermes itself on a bundled python that ships **neither** `ruamel.yaml` nor PyYAML, so
+on such a host — with no runtime file naming a venv that has them — every seat reports
+`this interpreter (…) has no YAML library (looked for yaml and ruamel.yaml)` and is held before its
+turn starts. The reader tries `yaml`, then `ruamel.yaml`, then JSON (a JSON config is valid YAML),
+and names the interpreter it was when it has neither: a profile's `config.yaml` written as real
+YAML needs one of the first two.
+
 **Each seat runs its own Hermes profile's model.** Before a turn, the host resolves the seat's
 profile (`seats.reviewer.profile`, `seats.fixer.profile`, `adjudicator.profile`) with Hermes's own
 resolution — the profile's `config.yaml` `model` block, its `.env`/secret sources and `auth.json`
