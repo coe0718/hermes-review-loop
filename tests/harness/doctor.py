@@ -165,11 +165,19 @@ def resolver_venv(dest: pathlib.Path) -> str:
                                      f"version = {sys.version.split()[0]}\n")
     packages = dest / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
     packages.mkdir(parents=True, exist_ok=True)
-    for entry in pathlib.Path(sysconfig.get_paths()["purelib"]).iterdir():
-        if entry.name.split(".")[0] in ("yaml", "ruamel") or entry.name.startswith("_yaml"):
-            link = packages / entry.name
-            if not link.exists():
-                link.symlink_to(entry)
+    # Every site directory this interpreter imports from, not just ``purelib``: distributions put
+    # PyYAML in platlib (Fedora: /usr/lib64/…) and may not create purelib at all.
+    import site
+    sources = [sysconfig.get_paths()["purelib"], sysconfig.get_paths()["platlib"],
+               *site.getsitepackages()]
+    for source in dict.fromkeys(pathlib.Path(path) for path in sources):
+        if not source.is_dir():
+            continue
+        for entry in source.iterdir():
+            if entry.name.split(".")[0] in ("yaml", "ruamel") or entry.name.startswith("_yaml"):
+                link = packages / entry.name
+                if not link.exists():
+                    link.symlink_to(entry)
     return str(dest)
 
 
@@ -651,9 +659,13 @@ def group_doctor() -> None:
     DATA["world"]["hooks"][1]["active"] = False
     save_world()
     rc, out = run_doctor("--loop", "widgets")
-    check("a paused hook fails", rc, 1)
-    check("  and says how to arm it", "❌ hook:widgets-fix" in out
-          and "arm --loop widgets" in out, True)
+    # init creates hooks paused and the documented order is doctor → selftest → arm, so a paused
+    # hook is the expected pre-arm state: reported plainly, never a failure.
+    check("a paused hook is not a failure", rc, 0)
+    check("  it is marked paused, with how to arm", "✅ hook:widgets-fix" in out
+          and "PAUSED" in out and "arm --loop widgets" in out, True)
+    check("  and the summary does not claim the loop can wake a seat",
+          "can wake a seat" not in out and "nothing fires yet" in out, True)
 
     install_doctor_fixture()
     DATA["world"]["hooks"][0]["config"]["url"] = (

@@ -67,11 +67,15 @@ GATE_EVENT = {"reviewer": "pull_request", "fixer": "pull_request_review"}
 class Check:
     """One line of the preflight: what was asked, what was found, and how to fix it."""
 
-    def __init__(self, name: str, status: str, detail: str, fix: str = "") -> None:
+    def __init__(self, name: str, status: str, detail: str, fix: str = "",
+                 paused: bool = False) -> None:
         self.name = name
         self.status = status
         self.detail = detail
         self.fix = fix
+        # A correct hook that is not armed yet. Not a failure: init creates hooks paused and the
+        # documented order is doctor → selftest → arm, so a fresh install must be able to pass.
+        self.paused = paused
 
     @property
     def failed(self) -> bool:
@@ -868,16 +872,16 @@ def check_hook(loop: dict, hooks: list, seat: str, name: str, url: str) -> Check
         return Check(f"hook:{name}", MISMATCH,
                      f"hook {hook_id} subscribes to {events or '(no events)'}, not {event!r}",
                      f"re-run init --hooks, or add {event!r} to hook {hook_id} on {loop['repo']}")
-    if not match.get("active"):
-        return Check(f"hook:{name}", MISMATCH, f"hook {hook_id} is paused",
-                     f"`hermes review-loop arm --loop {loop['id']}` (or activate hook {hook_id} "
-                     f"in the repo's settings)")
     content_type = match["config"].get("content_type")
     if content_type != "json":
         return Check(f"hook:{name}", MISMATCH,
                      f"hook {hook_id} has content_type {content_type!r}, expected 'json'",
                      f"re-run init --hooks, or set hook {hook_id}'s content_type to json: "
                      "the gate reads a JSON payload, not form-encoded data")
+    if not match.get("active"):
+        return Check(f"hook:{name}", VERIFIED,
+                     f"hook {hook_id} → [webhook URL redacted] ({event}, PAUSED — nothing fires "
+                     f"until `hermes review-loop arm --loop {loop['id']}`)", paused=True)
     return Check(f"hook:{name}", VERIFIED,
                  f"hook {hook_id} → [webhook URL redacted] ({event}, active)")
 
@@ -941,8 +945,13 @@ def report(loop: dict, checks: list[Check], strict: bool = False) -> int:
     elif unknown:
         print(f"  no failures — but {len(unknown)} check(s) could not be decided from here; "
               f"verify the ⚠️ lines by hand.")
-    else:
+    elif not any(check.paused for check in checks):
         print("  every check passed — this loop can wake a seat and post a verdict.")
+    else:
+        print("  every check passed.")
+    if not failed and any(check.paused for check in checks):
+        print("  the repo hooks are paused, so nothing fires yet: run selftest, then "
+              f"`hermes review-loop arm --loop {loop['id']}`.")
     if strict and unknown and not failed:
         print(f"  --strict: {len(unknown)} undecided check(s) count as a failure.")
     return 1 if failed or (strict and unknown) else 0
