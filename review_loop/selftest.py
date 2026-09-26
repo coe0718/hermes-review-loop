@@ -12,7 +12,8 @@ exits 1 if anything failed:
 2. bubblewrap with unprivileged user namespaces, and a probe *inside* the real sandbox layout
    (configured venv, runtime and Rust, a staged source snapshot) that must not be able to read a
    dummy host secret, any model key file, the seat profiles' ``.env``/``auth.json``/``config.yaml``,
-   the PATs, the runtime file or ``$HERMES_HOME/.env``;
+   the PATs, the runtime file or ``$HERMES_HOME/.env``; the staged snapshot is scanned too, so a
+   secret that reached the sandbox (a filter regression) is noticed rather than trusted;
 3. one tiny real request in the seat's wire format (chat completion, Responses or Messages)
    through the host inference capability, once per distinct seat resolution (``--no-model``
    skips it);
@@ -447,6 +448,27 @@ def check_bwrap(report: Report, loop: dict, settings: dict | None, runtime_file:
                        "the worktree) and make sure run_agent.py is committed")
             return
         report.add(step, "sandbox:snapshot", PASS, "committed source snapshot staged")
+        violations, advisories = trusted_turn.exported_secrets(code)
+        if violations:
+            report.add(step, "sandbox:secret-files", FAIL,
+                       f"{len(violations)} secret-shaped file(s) in the exported snapshot: "
+                       + "; ".join(violations[:3])
+                       + (f" (+{len(violations) - 3} more)" if len(violations) > 3 else ""),
+                       f"remove the secret from {settings['source']}: /opt/code is readable by a "
+                       "seat that can publish what it reads; the snapshot filter is a shape rule, "
+                       "not a scanner")
+        else:
+            report.add(step, "sandbox:secret-files", PASS,
+                       "no secret-shaped name or value in the exported snapshot")
+        if advisories:
+            report.add(step, "sandbox:secret-text", WARN,
+                       f"credential-shaped text in exported code: " + "; ".join(advisories[:3])
+                       + (f" (+{len(advisories) - 3} more)" if len(advisories) > 3 else ""),
+                       "confirm these are fixtures: the sandbox imports this code, so the snapshot "
+                       "filter cannot drop it (unset the variables/values in the committed tree)")
+        else:
+            report.add(step, "sandbox:secret-text", PASS,
+                       "no credential-shaped text in the code the sandbox imports")
         home.mkdir(mode=0o700)
         work.mkdir(mode=0o700)
         query = root / "query.txt"
