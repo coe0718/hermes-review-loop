@@ -208,6 +208,46 @@ def _fenced(text: str, lang: str = '') -> str:
     return f"{fence}{lang}\n{text.rstrip(chr(10))}\n{fence}"
 
 
+def _tree_blobs(loop: dict, repo: str, commit: str) -> dict[str, tuple]:
+    """``{path: (type, mode, sha)}`` for every non-tree entry of ``commit``, read whole or raised."""
+    from . import gh
+    data, error = gh.fetch(loop, f"/repos/{repo}/git/commits/{commit}", login=loop['read_token'])
+    tree = (data or {}).get('tree') if isinstance(data, dict) else None
+    sha = tree.get('sha') if isinstance(tree, dict) else None
+    if error or not isinstance(sha, str):
+        raise ValueError(f"commit {commit[:12]} unreadable: {error or 'no tree'}")
+    data, error = gh.fetch(loop, f"/repos/{repo}/git/trees/{sha}?recursive=1",
+                           login=loop['read_token'])
+    if error or not isinstance(data, dict) or not isinstance(data.get('tree'), list):
+        raise ValueError(f"tree of {commit[:12]} unreadable: {error or 'invalid tree'}")
+    if data.get('truncated') is not False:
+        raise ValueError(f"GitHub truncated the tree of {commit[:12]}")
+    return {item['path']: (item.get('type'), item.get('mode'), item.get('sha'))
+            for item in data['tree'] if isinstance(item, dict)
+            and isinstance(item.get('path'), str) and item.get('type') != 'tree'}
+
+
+def unlisted_changes(loop: dict, repo: str, base: str, head: str,
+                     listed: set[str]) -> list[tuple[str, str]]:
+    """The changed files GitHub's pulls/N/files did not list, as ``[(status, path)]``.
+
+    GitHub stops listing at 3,000 files. The PR's diff is against the merge base (not the base
+    branch's tip, which may have moved on), so this compares the merge-base tree with the head
+    tree and drops every path the listing already named. Raises when any of it is unreadable.
+    """
+    from . import gh
+    data, error = gh.fetch(loop, f"/repos/{repo}/compare/{base}...{head}?per_page=1",
+                           login=loop['read_token'])
+    merge_base = (data.get('merge_base_commit') or {}).get('sha') if isinstance(data, dict) else None
+    if error or not isinstance(merge_base, str):
+        raise ValueError(f"merge base unreadable: {error or 'no merge base'}")
+    old, new = _tree_blobs(loop, repo, merge_base), _tree_blobs(loop, repo, head)
+    changes = [('added' if path not in old else 'removed' if path not in new else 'modified', path)
+               for path in sorted(old.keys() | new.keys())
+               if old.get(path) != new.get(path) and path not in listed]
+    return changes
+
+
 def pr_change(loop: dict, row) -> PRChange:
     """The PR's title, description, base and changed files as the host read them, fail-closed.
 
@@ -235,6 +275,15 @@ def pr_change(loop: dict, row) -> PRChange:
         count += (f"; GitHub reports {declared} changed files but lists "
                   f"{len(files)}" + (f" (it lists at most {GITHUB_FILES_CAP})"
                                      if len(files) >= GITHUB_FILES_CAP else ''))
+    # Past GitHub's listing cap, name the rest from the trees; /work has no history to diff.
+    unlisted, unlisted_error = [], ''
+    if type(declared) is int and declared > len(files):
+        named = {n for f in files for n in (f.get('filename'), f.get('previous_filename'))
+                 if isinstance(n, str)}
+        try:
+            unlisted = unlisted_changes(loop, row['repo'], base.get('sha') or '', row['head'], named)
+        except ValueError as exc:
+            unlisted_error = _line(str(exc), 200)
 
     listed, patches, patch_total, omitted = [], [], 0, 0
     diff_parts, diff_total, diff_cut = [], 0, 0
@@ -269,6 +318,27 @@ def pr_change(loop: dict, row) -> PRChange:
         diff_total += len(part.encode())
     if len(files) > len(listed):
         listed.append(f"- … and {len(files) - len(listed)} more (see {REVIEW_DIFF})")
+    unnamed = []
+    for status, path in unlisted:
+        name = _line(path, 512)
+        if len(unnamed) < CHANGE_FILES_LISTED:
+            unnamed.append(f"- {status}: {name}")
+        part = (f"diff --git a/{name} b/{name}\n# status: {status} (GitHub does not list this "
+                f"file, so it has no patch here: read /work/{name})\n")
+        if diff_total + len(part.encode()) > DIFF_BYTES:
+            diff_cut += 1
+            continue
+        diff_parts.append(part)
+        diff_total += len(part.encode())
+    if len(unlisted) > len(unnamed):
+        unnamed.append(f"- … and {len(unlisted) - len(unnamed)} more (see {REVIEW_DIFF})")
+    if unlisted_error:
+        unnamed = [f"GitHub did not list every changed file, and the host could not name the "
+                   f"rest ({unlisted_error}). You cannot see the whole change: do not approve "
+                   f"it; say that the PR is too large to review whole."]
+    elif unnamed:
+        unnamed.insert(0, "Named by the host from the merge-base and head trees; they have no "
+                          "patches here, so read them in `/work`.")
     if omitted:
         patches.append(f"({omitted} more patch(es) not shown here for size; see {REVIEW_DIFF})")
 
@@ -290,6 +360,7 @@ def pr_change(loop: dict, row) -> PRChange:
         '',
         '### Changed files',
         '\n'.join(listed) or '(GitHub lists no changed files)',
+        *(['', '### Changed files GitHub does not list', '\n'.join(unnamed)] if unnamed else []),
         '',
         '### Patches (each clipped)',
         '\n\n'.join(patches) or '(no inline patches)',

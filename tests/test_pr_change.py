@@ -21,6 +21,7 @@ from review_loop.run_supervisor import Supervisor  # noqa: E402
 REPO = "acme/widgets"
 HEAD = "a" * 40
 BASE = "b" * 40
+MERGE_BASE = "d" * 40
 FILES = f"/repos/{REPO}/pulls/7/files?per_page=100"
 
 
@@ -37,6 +38,8 @@ class World:
         self.files = files
         self.fail = set()
         self.calls = []
+        self.trees = {}
+        self.truncated = False
 
     def fetch(self, loop, path, method="GET", body=None, login=None):
         self.calls.append((method, path, login))
@@ -49,6 +52,15 @@ class World:
         if path.startswith(FILES):
             page = int(path.rsplit("&page=", 1)[1]) if "&page=" in path else 1
             return self.files[(page - 1) * 100:page * 100], ""
+        if path == f"/repos/{REPO}/compare/{BASE}...{HEAD}?per_page=1" and self.trees:
+            return {"merge_base_commit": {"sha": MERGE_BASE}}, ""
+        for commit, entries in self.trees.items():
+            if path == f"/repos/{REPO}/git/commits/{commit}":
+                return {"sha": commit, "tree": {"sha": "t" + commit[1:]}}, ""
+            if path == f"/repos/{REPO}/git/trees/t{commit[1:]}?recursive=1":
+                return {"sha": "t" + commit[1:], "truncated": self.truncated,
+                        "tree": [{"path": p, "type": "blob", "mode": "100644", "sha": s}
+                                 for p, s in entries.items()]}, ""
         return None, "HTTP 404"
 
 
@@ -116,6 +128,50 @@ class Record(Base):
         self.assertIn("GitHub reports 3200 changed files but lists 3000 (it lists at most 3000)",
                       change.record)
         self.assertIn("# (no patch: binary, or too large", change.diff)
+
+    def over_cap(self):
+        world = World([changed(i, patch="") for i in range(3000)])
+        world.pr["changed_files"] = 3004
+        listed = {f"src/f{i}.rs": "1" * 40 for i in range(3000)}
+        old = {**listed, "src/gone.rs": "2" * 40, "src/edit.rs": "3" * 40, "keep.rs": "4" * 40}
+        new = {**{p: "5" * 40 for p in listed}, "src/edit.rs": "6" * 40, "src/new.rs": "7" * 40,
+               "keep.rs": "4" * 40, "src/moved.rs": "8" * 40}
+        # The base branch moved on after the PR branched: its tip is not what the PR diffs against.
+        world.trees = {MERGE_BASE: old, HEAD: new, BASE: {**old, "base-only.rs": "9" * 40}}
+        return world
+
+    def test_files_past_the_github_cap_are_named_from_the_trees(self):
+        change = self.change(self.over_cap())
+        section = change.record.split("### Changed files GitHub does not list", 1)[1]
+        section = section.split("###", 1)[0]
+        for line in ("- added: src/moved.rs", "- added: src/new.rs", "- modified: src/edit.rs",
+                     "- removed: src/gone.rs"):
+            self.assertIn(line, section)
+        self.assertIn("read them in `/work`", section)
+        self.assertEqual(section.count("\n- "), 4, section)  # listed, unchanged and base-only left out
+        self.assertNotIn("base-only.rs", change.record + change.diff)
+        self.assertIn("diff --git a/src/new.rs b/src/new.rs\n# status: added (GitHub does not "
+                      "list this file, so it has no patch here: read /work/src/new.rs)", change.diff)
+        self.assertNotIn("do not approve", change.record)
+
+    def test_unnamed_files_past_the_cap_forbid_an_approval(self):
+        for breakage in ("truncated", "compare", "tree"):
+            world = self.over_cap()
+            if breakage == "truncated":
+                world.truncated = True
+            elif breakage == "compare":
+                world.fail.add(f"/repos/{REPO}/compare/{BASE}...{HEAD}?per_page=1")
+            else:
+                world.fail.add(f"/repos/{REPO}/git/trees/t{HEAD[1:]}?recursive=1")
+            with self.subTest(breakage):
+                record = self.change(world).record
+                self.assertIn("could not name the rest", record)
+                self.assertIn("You cannot see the whole change: do not approve it", record)
+
+    def test_a_pr_github_lists_whole_reads_no_trees(self):
+        world = World([changed(i) for i in range(3)])
+        self.change(world)
+        self.assertFalse([c for c in world.calls if "/compare/" in c[1] or "/git/" in c[1]])
 
     def test_unreadable_listing_or_moved_head_fails_closed(self):
         world = World([changed(i) for i in range(150)])
