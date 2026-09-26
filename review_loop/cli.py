@@ -19,7 +19,8 @@ import time
 import tempfile
 from urllib.parse import urlsplit
 
-from . import config, doctor, gate, gh, observer, prompts, route_intent, routes, state as state_mod
+from . import (config, doctor, gate, gate_shims, gh, observer, prompts, route_intent, routes,
+               state as state_mod)
 
 SHIM_NAME = "review-loop-watchdog.py"
 
@@ -590,6 +591,19 @@ def _install_schedule(loop: dict, schedule: str, deliver: str) -> list[str]:
     return [f"scheduled the watchdog ({schedule}, deliver={deliver})", f"shim: {shim}"]
 
 
+def _install_shims(loop: dict) -> bool:
+    """Write the loop's gate shims where the gateway resolves route scripts (issue #105)."""
+    try:
+        for line in gate_shims.install(loop):
+            print(f"  {line}")
+        return True
+    except (OSError, config.ConfigError) as exc:
+        print(f"gate shim install FAILED — the gateway drops this loop's events until it lands: "
+              f"{exc}")
+        print(f"  fix it, then: hermes review-loop apply --loop {loop['id']}")
+        return False
+
+
 # -- verbs ----------------------------------------------------------------------
 
 
@@ -776,6 +790,7 @@ def cmd_init(args) -> int:
         config.verify_seats(loop, roles)
         _verify_routes(loop, roles)
         _observer_check(loop)
+        shim_lines = gate_shims.install(loop, dry_run=True)   # refuses a foreign file (#105)
     except config.ConfigError as exc:
         print(f"config refused: {exc}")
         return 2
@@ -795,6 +810,8 @@ def cmd_init(args) -> int:
             print(f"  would install the watchdog cron job ({args.schedule})")
         if loop.get("observer", {}).get("route"):
             print(f"  would write route: {loop['observer']['route']}")
+        for line in shim_lines:
+            print(f"  {line}")
         return 0
 
     path = config.config_dir() / f"{loop['id']}.json"
@@ -840,6 +857,7 @@ def cmd_init(args) -> int:
         return 2
     for name in written_routes:
         print(f"route written: {name}")
+    shims_ok = _install_shims(loop)
     try:
         hook_lines = (_install_hooks(loop, args.admin_token, active=bool(getattr(args, "arm", False)))
                       if args.hooks else [])
@@ -893,7 +911,7 @@ def cmd_init(args) -> int:
         print(f"  {n}. {step}")
     print("  Seat tokens live only in the token files mapped above; a seat profile needs no "
           "GH_TOKEN.")
-    return 0
+    return 0 if shims_ok else 1
 
 
 def cmd_set(args) -> int:
@@ -1070,6 +1088,7 @@ def cmd_set(args) -> int:
                 print(f"ROLLBACK FAILED: {rollback_exc} — inspect route {name!r} manually")
             print(f"observer route intent could not be recorded; loop config unchanged: {exc}")
             return 2
+        _install_shims(updated)
     path = _write_config(updated)
     if destination_changed and before.get("route") and before["route"] != after.get("route"):
         try:
@@ -1151,8 +1170,16 @@ def cmd_apply(args) -> int:
             config.verify_credentials(updated)
         if rebinding:
             _verify_routes(updated, rebinding)
+        shim_lines = gate_shims.install(updated, dry_run=True)   # refuses a foreign file (#105)
     except config.ConfigError as exc:
         print(f"settings refused: {exc}")
+        return 2
+    # The gate shims are not a setting and move nothing, so apply writes them up front, even when
+    # everything else already matches: a loop whose gates the gateway cannot find drops every event.
+    if shim_lines and args.dry_run:
+        for line in shim_lines:
+            print(f"  {line}")
+    elif shim_lines and not _install_shims(updated):
         return 2
 
     changes = []
@@ -1492,7 +1519,7 @@ def cmd_doctor(args) -> int:
         if getattr(args, "repair", False):
             # The one write doctor can make, and only when asked: put this loop's own routes back
             # from the plugin's intent record (same secret). Everything after it stays read-only.
-            lines = route_intent.heal(loop)
+            lines = route_intent.heal(loop) + gate_shims.heal(loop)
             print("\n".join(lines) if lines else
                   f"[{loop['id']}] repair: routes match the plugin's intent record — nothing restored")
         failed += doctor.report(loop, doctor.check_loop(loop, offline=args.offline),
@@ -1696,6 +1723,13 @@ def cmd_uninstall(args) -> int:
     for name in _routes_of(loop).values():
         if name and routes.remove_route(name):
             print(f"route removed: {name}")
+    try:
+        others = [other for other in config.all_loops()
+                  if not (other["id"] == loop["id"] and other.get("repo") == loop.get("repo"))]
+        for line in gate_shims.remove(loop, others):
+            print(line)
+    except (OSError, config.ConfigError) as exc:
+        print(f"gate shims left in place (another loop may still need them): {exc}")
     if not args.keep_config:
         path = config.config_dir() / f"{loop['id']}.json"
         if path.exists():
