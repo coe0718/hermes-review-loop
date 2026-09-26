@@ -1,4 +1,5 @@
 """Ambiguous fixer pushes must hold the PR and alert the operator."""
+import _home_guard  # noqa: F401  first import: temp HOME/HERMES_HOME (tests/_home_guard.py)
 import json
 import contextlib
 import io

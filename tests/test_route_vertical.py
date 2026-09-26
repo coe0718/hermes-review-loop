@@ -3,6 +3,7 @@
 The fixture creates both HOME and HERMES_HOME before starting *any* child.
 Only the stub executable is permitted to answer the gate's GitHub reads.
 """
+import _home_guard  # noqa: F401  first import: temp HOME/HERMES_HOME (tests/_home_guard.py)
 import json
 import os
 from pathlib import Path

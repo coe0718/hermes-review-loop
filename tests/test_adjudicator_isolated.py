@@ -3,6 +3,7 @@
 No real GitHub, model, Hermes or ~/.hermes: GitHub is mocked, the ledger and state live in a
 private temporary directory, and the sandbox launcher is replaced where a turn is exercised.
 """
+import _home_guard  # noqa: F401  first import: temp HOME/HERMES_HOME (tests/_home_guard.py)
 import json
 import os
 from pathlib import Path

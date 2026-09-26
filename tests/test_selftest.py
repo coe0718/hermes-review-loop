@@ -2,6 +2,7 @@
 
 GitHub, the model provider and bubblewrap are all mocked; nothing here needs a network.
 """
+import _home_guard  # noqa: F401  first import: temp HOME/HERMES_HOME (tests/_home_guard.py)
 import argparse
 import io
 import json

@@ -1,4 +1,5 @@
 """Safe push security tests: synthetic API plus real local bare Git receive-pack."""
+import _home_guard  # noqa: F401  first import: temp HOME/HERMES_HOME (tests/_home_guard.py)
 import base64
 import hashlib
 import json

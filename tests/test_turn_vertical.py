@@ -3,6 +3,7 @@
 The route subprocess is tested separately; this is not proof of a route-to-worker
 link. No real token, GitHub endpoint, model endpoint, or credential HOME is used.
 """
+import _home_guard  # noqa: F401  first import: temp HOME/HERMES_HOME (tests/_home_guard.py)
 import http.server
 import json
 import os
@@ -20,13 +21,13 @@ from review_loop.broker_ipc import RunScope
 from review_loop.run_supervisor import Supervisor
 from review_loop.inference_proxy import PATH
 
-SOURCE = Path(os.environ.get('HERMES_AGENT_SOURCE') or Path.home() / '.hermes/hermes-agent')
-RUST = Path.home() / '.rustup/toolchains/stable-x86_64-unknown-linux-gnu'
+SOURCE = _home_guard.HERMES_AGENT_SOURCE
+RUST = _home_guard.RUST
 HEAD = 'a' * 40
 
 
-@unittest.skipUnless(shutil.which('bwrap') and (SOURCE / 'venv/bin/hermes').exists()
-                     and (RUST / 'bin/cargo').exists(), 'offline sandbox prerequisites absent')
+@_home_guard.needs_real_hermes(bool(shutil.which('bwrap')), (RUST / 'bin/cargo').exists(),
+                               reason='offline sandbox prerequisites absent')
 class WholeTurn(unittest.TestCase):
     def test_real_agent_host_only_broker_and_model_key_with_rust(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as tmp:
@@ -81,7 +82,7 @@ class WholeTurn(unittest.TestCase):
                         finish = 'stop'
                     else:
                         command = ('cat ' + str(host_pat) + ' ' + str(key_path) +
-                                   ' ' + str(Path.home() / '.hermes/.env') + '; '
+                                   ' ' + str(_home_guard.USER_HOME / '.hermes/.env') + '; '
                                    'git credential fill </dev/null; cargo test --offline; '
                                    'python -m review_loop.broker_client review --verdict APPROVE '
                                    '--body-file /work/review.txt')

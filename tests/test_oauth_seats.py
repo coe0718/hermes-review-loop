@@ -5,6 +5,7 @@ throwaway HERMES_HOME, a fake ``hermes_cli``/``agent`` tree (the entry points th
 from the real Hermes source) resolves them — including a fake Codex-style ``auth.json`` with a
 refresh token that rotates under a fake ``auth.lock`` — and every upstream is a local HTTP fake.
 """
+import _home_guard  # noqa: F401  first import: temp HOME/HERMES_HOME (tests/_home_guard.py)
 import base64
 import http.client
 import http.server
@@ -726,7 +727,7 @@ class OAuthSandboxProbe(OAuthBase):
 
 # -- 5. the real sandboxed Hermes speaking each wire format through the real proxy ----------------
 
-SOURCE = pathlib.Path(os.environ.get("HERMES_AGENT_SOURCE") or pathlib.Path.home() / ".hermes/hermes-agent")
+SOURCE = _home_guard.HERMES_AGENT_SOURCE
 
 
 def _sse(events):
@@ -777,8 +778,7 @@ def messages_reply(request):
                  ("message_stop", {"type": "message_stop"})])
 
 
-@unittest.skipUnless(_bwrap_works() and (SOURCE / "venv/bin/hermes").exists(),
-                     "bubblewrap or Hermes checkout unavailable")
+@_home_guard.needs_real_hermes(_bwrap_works(), reason="bubblewrap or Hermes checkout unavailable")
 class RealHermesWireFormats(unittest.TestCase):
     """The sandboxed Hermes, configured by ``sandbox_config``, completes a tool turn in each mode."""
 

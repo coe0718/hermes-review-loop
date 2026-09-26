@@ -788,8 +788,105 @@ def webhook_host(value: str | None, *, required: bool = False) -> str:
     return host.removesuffix("/")
 
 
+# Set by the test suites' home guard (tests/_home_guard.py). While it is set, every path the loop
+# would write state under is checked against the operator's real Hermes home, so a test that
+# escapes the guard fails loudly instead of writing to a real ledger or runtime file.
+TEST_HOME_GUARD_ENV = "REVIEW_LOOP_TEST_HOME_GUARD"
+# Test-only: one more directory to treat as "the real home" while the guard is on, so the
+# tripwire itself can be proven against a fake home. It adds protection, never removes it.
+TEST_REAL_HOME_ENV = "REVIEW_LOOP_TEST_REAL_HOME"
+
+
+class RealHomeError(BaseException):
+    """A guarded test resolved a path inside the operator's real Hermes home.
+
+    A ``BaseException``, like ``KeyboardInterrupt``: the loop fails closed with broad ``except
+    Exception`` handlers, and a tripwire those handlers swallowed would let the test pass.
+    """
+
+
+def _real_homes() -> list[pathlib.Path]:
+    homes = []
+    try:
+        import pwd
+        homes.append(pathlib.Path(pwd.getpwuid(os.getuid()).pw_dir))
+    except (ImportError, KeyError):
+        pass
+    if os.environ.get(TEST_REAL_HOME_ENV):
+        homes.append(pathlib.Path(os.environ[TEST_REAL_HOME_ENV]))
+    return [pathlib.Path(os.path.normpath(h.absolute())) for h in homes] + [h.resolve() for h in homes]
+
+
+def guard_real_home(path: pathlib.Path | str) -> pathlib.Path:
+    """Return ``path``; under the test guard, raise if it is the real home or inside its .hermes."""
+    path = pathlib.Path(path)
+    if not os.environ.get(TEST_HOME_GUARD_ENV):
+        return path
+    homes = _real_homes()
+    # The lexical form first, so the obvious escape is refused without touching the real home;
+    # then the resolved form, so a symlink into it is refused too.
+    lexical = pathlib.Path(os.path.normpath(path.expanduser().absolute()))
+    for candidate in (lexical, None):
+        candidate = candidate or path.expanduser().resolve()
+        for real in homes:
+            hermes = real / ".hermes"
+            if candidate in (real, hermes) or hermes in candidate.parents:
+                raise RealHomeError(f"test home guard: {path} resolves into the real home "
+                                    f"{real}; a test escaped tests/_home_guard.py")
+    return path
+
+
+class RealNetworkError(BaseException):
+    """A guarded test tried to reach a real host (GitHub, Discord, a model upstream).
+
+    A ``BaseException`` for the same reason as ``RealHomeError``: the loop's broad ``except
+    Exception`` would otherwise turn the escape into an ordinary "network failed" and a pass.
+    """
+
+
+def guard_network(url: str) -> str:
+    """Return ``url``; under the test guard, raise unless it stays on this machine.
+
+    Loopback hosts (127.0.0.0/8, ::1, localhost) and local paths/``file:`` URLs are the tests'
+    own fakes and pass. Everything else — above all api.github.com and github.com — means a test
+    mocked one seam (say ``gh.api``) and not the one underneath (``gh.fetch``).
+    """
+    if not os.environ.get(TEST_HOME_GUARD_ENV):
+        return url
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    if not host and parts.scheme in ("", "file"):
+        return url
+    if host == "localhost":
+        return url
+    try:
+        if ipaddress.ip_address(host).is_loopback:
+            return url
+    except ValueError:
+        pass
+    raise RealNetworkError(f"test guard: real network call to {url} refused; mock the request "
+                           "underneath (gh.fetch, not only gh.api), set REVIEW_LOOP_GH_STUB, or "
+                           "point it at a 127.0.0.1 fake")
+
+
+def guard_real_hermes(executable: str) -> str:
+    """Return ``executable``; under the test guard, raise if it is a ``hermes`` in the real home.
+
+    The guard also shadows ``hermes`` on PATH with a shim that refuses to run; this is the second
+    layer, for a PATH the shim is missing from.
+    """
+    if not os.environ.get(TEST_HOME_GUARD_ENV) or not os.path.isabs(executable):
+        return executable
+    found = pathlib.Path(executable)
+    resolved = [pathlib.Path(os.path.normpath(found.absolute())), found.resolve()]
+    for real in _real_homes():
+        if any(real in path.parents for path in resolved):
+            raise RealHomeError(f"test home guard: refusing to run the real {executable}")
+    return executable
+
+
 def home() -> pathlib.Path:
-    return pathlib.Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser()
+    return guard_real_home(pathlib.Path(os.environ.get("HERMES_HOME", "~/.hermes")).expanduser())
 
 
 def config_dir() -> pathlib.Path:

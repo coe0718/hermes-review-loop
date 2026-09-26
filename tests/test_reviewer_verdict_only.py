@@ -5,6 +5,7 @@ one-shot capability (including the single fresh review after a stacked retarget)
 PR. The broker refuses it before consuming the capability, so a retry in the same turn works.
 Offline: GitHub REST is mocked; the socket is a real Unix domain socket.
 """
+import _home_guard  # noqa: F401  first import: temp HOME/HERMES_HOME (tests/_home_guard.py)
 import contextlib
 import io
 import json

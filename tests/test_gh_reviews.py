@@ -1,6 +1,7 @@
 """Review enumeration cannot silently turn a partial history into a verdict."""
 from __future__ import annotations
 
+import _home_guard  # noqa: F401  first import: temp HOME/HERMES_HOME (tests/_home_guard.py)
 import pathlib
 import sys
 import unittest

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Failure injection across profile-bound routes, GitHub hooks, and loop config."""
+import _home_guard  # noqa: F401  first import: temp HOME/HERMES_HOME (tests/_home_guard.py)
 import json
 import pathlib
 import sys

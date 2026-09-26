@@ -1,6 +1,7 @@
 """Cross-process and failure-path regression tests for the shared webhook registry."""
 from __future__ import annotations
 
+import _home_guard  # noqa: F401  first import: temp HOME/HERMES_HOME (tests/_home_guard.py)
 import json
 import multiprocessing
 import os

@@ -8,6 +8,7 @@ review stays diagnostic; a missing baseline holds forever.
 No GitHub, model, Hermes or ~/.hermes: GitHub is mocked, and HERMES_HOME (the run ledger) and
 the loop state live in a private temporary directory.
 """
+import _home_guard  # noqa: F401  first import: temp HOME/HERMES_HOME (tests/_home_guard.py)
 import contextlib
 import io
 import json

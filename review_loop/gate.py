@@ -988,6 +988,7 @@ def ping_start(loop: dict, seat: str, text: str) -> None:
             f"https://discord.com/api/v10/channels/{channel}/messages", data=body,
             headers={"Authorization": f"Bot {token}", "Content-Type": "application/json",
                      "User-Agent": "hermes-review-loop"})
+        config.guard_network(req.full_url)
         with urllib.request.urlopen(req, timeout=10) as resp:
             if resp.status not in (200, 201):
                 raise RuntimeError(f"Discord HTTP {resp.status}")

@@ -1,4 +1,5 @@
 """Stacked visibility is not a reviewer-seat authorization."""
+import _home_guard  # noqa: F401  first import: temp HOME/HERMES_HOME (tests/_home_guard.py)
 import importlib.util
 import contextlib
 import io

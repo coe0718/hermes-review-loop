@@ -5,6 +5,7 @@ tests play that native writer: plain ``write_text`` calls that ignore the lock e
 """
 from __future__ import annotations
 
+import _home_guard  # noqa: F401  first import: temp HOME/HERMES_HOME (tests/_home_guard.py)
 import contextlib
 import io
 import json

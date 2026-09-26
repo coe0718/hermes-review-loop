@@ -1,4 +1,5 @@
 """Fail-closed identity and chain resolution for stacked PRs."""
+import _home_guard  # noqa: F401  first import: temp HOME/HERMES_HOME (tests/_home_guard.py)
 import pathlib
 import sys
 import unittest

@@ -1,4 +1,5 @@
 """Offline GitHub transport fixtures for the trusted fetch boundary."""
+import _home_guard  # noqa: F401  first import: temp HOME/HERMES_HOME (tests/_home_guard.py)
 import hashlib
 import io
 import json
@@ -13,6 +14,8 @@ from unittest import mock
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from review_loop import trusted_fetch, trusted_turn
 
+
+LOOPBACK_API = "http://127.0.0.1:9"   # never contacted: urlopen is mocked where it is used
 
 class CommittedSourceSnapshotTests(unittest.TestCase):
     def setUp(self):
@@ -170,8 +173,10 @@ class TrustedFetchTests(unittest.TestCase):
         self.assertFalse(any(self.root.glob(".review-trusted-*")))
 
     def test_oversized_response_stopped_before_download(self):
+        # urlopen is mocked; the loopback API keeps the test guard's no-real-GitHub check quiet.
         response = Response(b"x" * 100, length=0)
         with mock.patch.object(trusted_fetch.gh, "token", return_value="dummy"), \
+                mock.patch.object(trusted_fetch.gh, "API", LOOPBACK_API), \
                 mock.patch.object(trusted_fetch.urllib.request, "urlopen", return_value=response):
             with self.assertRaisesRegex(trusted_fetch.FetchDenied, "bounds"):
                 trusted_fetch._request(self.loop, "/repos/acme/widgets/git/trees/x", "reader", 8,
@@ -180,6 +185,7 @@ class TrustedFetchTests(unittest.TestCase):
         self.assertEqual(response.read_sizes, [9])
         response = Response(b"x" * 100, length=100)
         with mock.patch.object(trusted_fetch.gh, "token", return_value="dummy"), \
+                mock.patch.object(trusted_fetch.gh, "API", LOOPBACK_API), \
                 mock.patch.object(trusted_fetch.urllib.request, "urlopen", return_value=response):
             with self.assertRaisesRegex(trusted_fetch.FetchDenied, "bounds"):
                 trusted_fetch._request(self.loop, "/user", "reader", 8, "application/vnd.github+json")

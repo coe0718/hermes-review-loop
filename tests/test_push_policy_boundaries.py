@@ -1,4 +1,5 @@
 """Offline authorization regressions: never touch a live Hermes home or GitHub."""
+import _home_guard  # noqa: F401  first import: temp HOME/HERMES_HOME (tests/_home_guard.py)
 import json
 import os
 from pathlib import Path
