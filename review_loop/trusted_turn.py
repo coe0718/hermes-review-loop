@@ -169,9 +169,13 @@ def tool_instructions(role: str) -> str:
 
 
 SANDBOX_KEY = 'sandbox-dummy-not-a-credential'
-# Shaped like a Claude subscription token so the sandboxed Hermes applies the Claude Code
-# request identity it applies for the real one; it authenticates nothing (the proxy drops it).
-SANDBOX_OAUTH_TOKEN = 'sk-ant-oat01-sandbox-dummy-not-a-credential'
+# Hermes applies the Claude Code request identity to any token it classifies as a Claude
+# subscription login (``agent/anthropic_credentials._is_oauth_token``: ``sk-ant-`` but not
+# ``sk-ant-api``, a JWT, or ``cc-``). The ``cc-`` form is used on purpose: it satisfies that test
+# without imitating a real ``sk-ant-oat01`` secret, which secret scanners (GitHub's, Hermes's
+# plugin guard) rightly flag, and short enough not to resemble any secret. It authenticates
+# nothing; the proxy drops it.
+SANDBOX_OAUTH_TOKEN = 'cc-dummy'  # deliberately short: a placeholder, not secret-shaped
 SEAT_PROVIDER = 'review-loop-seat'
 
 

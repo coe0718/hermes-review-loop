@@ -609,7 +609,7 @@ class SandboxConfig(unittest.TestCase):
         self.assertIn("base_url: http://127.0.0.1:18761/anthropic", anth[0])
         sub = trusted_turn.sandbox_config("claude-x", "anthropic_messages", "claude_code")
         self.assertEqual(sub[2], "anthropic")
-        self.assertEqual(sub[1], "ANTHROPIC_TOKEN=sk-ant-oat01-sandbox-dummy-not-a-credential\n")
+        self.assertEqual(sub[1], "ANTHROPIC_TOKEN=cc-dummy\n")
         for text in (chat[0], codex[0], anth[0], sub[0]):
             self.assertIn("sandbox-dummy-not-a-credential", text) if "api_key" in text else None
         with self.assertRaises(ValueError):
