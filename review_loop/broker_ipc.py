@@ -3,10 +3,24 @@
 The trusted launcher constructs RunScope from gate-verified data, starts this server
 outside the agent's mount namespace, then bind-mounts ONLY its socket (or its private
 socket directory) at /run/review-loop/broker.sock inside that namespace. Do not mount
-this module's host config, state, token files or socket parent into the agent. The
-socket is a bearer capability: namespace isolation and a per-run, unguessable path,
-not SO_PEERCRED (the agent may share the host UID), provide authentication. Never
-share this socket between runs; close it when the run ends.
+this module's host config, state, token files or socket parent into the agent.
+
+The socket is a bearer capability, and that is all it is: reaching the path is the credential, and
+it buys exactly the one verified write its RunScope names. The protection is exactly this, and no
+more (issue #89):
+
+* another UID cannot reach it — the run directory is 0700 and the socket 0600, inside a private
+  scratch directory;
+* the same UID can. There is no accept-time credential check and no SO_PEERCRED check: the seat
+  runs under the same host UID as this broker, so a peer check could not tell the seat from any
+  other same-UID process. The per-run path is enumerable (a scratch parent such as /var/tmp is
+  world-traversable, and the run directory name is discoverable), and the socket is then
+  connectable and usable. Treat every same-UID process on the host as able to spend this run's
+  write, and put nothing in a RunScope that one such process may not use.
+
+That is not an extra privilege: the same UID already holds the host PATs this broker writes with,
+so the socket hands out nothing the caller could not do directly. Never share this socket between
+runs; close it when the run ends.
 """
 from __future__ import annotations
 
