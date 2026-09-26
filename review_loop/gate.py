@@ -46,6 +46,8 @@ def payload_loop(payload: dict) -> dict:
 
 def context(payload: dict):
     loop = payload_loop(payload)
+    # A gate's failed GitHub read ends in [SILENT]; keep it on disk for the watchdog and explain.
+    gh.record_failures()
     return loop, state_mod.state_for(loop)
 
 
@@ -293,11 +295,14 @@ def hooks_read(loop: dict) -> tuple[bool | None, str]:
     return not missing, ", ".join(missing)
 
 
-def hooks_armed(loop: dict) -> bool:
-    """Both seat routes present and active. A failed read answers False on purpose: the watchdog
-    must stay quiet rather than alert on a loop it cannot confirm is armed."""
+def hooks_armed(loop: dict) -> bool | None:
+    """Both seat routes present and active: True armed, False paused, None unknown (unreadable).
+
+    None is falsy, so "start nothing unless armed" callers stay fail-closed; the ones that talk to
+    an operator must tell the two apart — a paused loop is silent on purpose, a blind one is not.
+    """
     armed, _ = hooks_read(loop)
-    return bool(armed)
+    return armed
 
 
 # -- explain --------------------------------------------------------------------
@@ -430,8 +435,25 @@ def _explain_state(loop: dict, st: state_mod.LoopState, key: str, number: int, h
     else:
         sweep = "no watchdog sweep recorded — nothing has read this loop's PRs yet"
 
+    github_bits = []
+    blind = watch.get("github_read")
+    if isinstance(blind, dict) and blind.get("error"):
+        github_bits.append(f"watchdog could not read GitHub as {blind.get('login') or '?'} for "
+                           f"{blind.get('sweeps', '?')} sweep(s): {blind.get('error')}")
+    failure = st.github_failure()
+    if failure.get("error"):
+        at = failure.get("at")
+        when = iso_at(float(at)) if isinstance(at, (int, float)) and not isinstance(at, bool) else "?"
+        github_bits.append(f"last failed call: {failure.get('where') or '?'} "
+                           f"{failure.get('method') or 'GET'} {failure.get('path') or '?'} at {when}: "
+                           f"{failure.get('error')} — "
+                           + ("a gate that hit it treated the PR as unavailable and started nothing"
+                              if (failure.get("method") or "GET") == "GET"
+                              else "that call did not take effect"))
+    github_line = " · ".join(github_bits) or "no failed GitHub call recorded"
+
     return {"seat": seat_line, "queue": queue_line, "inflight": inflight_line,
-            "escalation": escalation_line, "held": held, "queued_seat": queued_seat,
+            "escalation": escalation_line, "github": github_line, "held": held, "queued_seat": queued_seat,
             "queued_reason": queued_reason, "stale_queues": stale_queues,
             "inflight_review": inflight_review,
             "inflight_fix": inflight_fix, "parked": parked, "delivery_status": delivery_status,
@@ -868,7 +890,9 @@ def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> di
         "read_at": iso_at(now),
         "state_line": state_line, "budget": budget, "seat": local["seat"], "queue": local["queue"],
         "inflight": local["inflight"], "escalation": local["escalation"], "hooks": hooks_line,
-        "sweep": local["sweep"], "blockers": blockers, "next": {"kind": kind, "action": action},
+        "sweep": local["sweep"],
+        "github": local.get("github", "no failed GitHub call recorded"),
+        "blockers": blockers, "next": {"kind": kind, "action": action},
     }
 
 

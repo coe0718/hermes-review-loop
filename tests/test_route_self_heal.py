@@ -193,7 +193,9 @@ class WatchdogAndDoctorTest(Fixture):
         self.native(lambda d: d.pop("widgets-review"))
         st = mock.Mock()
         st.watch.return_value = {}
-        with mock.patch.object(watchdog.gate, "hooks_armed", return_value=True), \
+        with mock.patch.object(watchdog.gate, "hooks_read", return_value=(True, "")), \
+                mock.patch.object(watchdog.gh, "auth_probe",
+                                  return_value=watchdog.gh.Response({"login": "rev"}, "", 200, {})), \
                 mock.patch.object(watchdog, "TEST", False), \
                 mock.patch.object(watchdog.gh, "open_prs", return_value=None):
             lines = watchdog.sweep_loop(self.loop, st)
@@ -205,9 +207,11 @@ class WatchdogAndDoctorTest(Fixture):
     def test_paused_sweep_does_not_heal(self):
         self.install()
         self.native(lambda d: d.pop("widgets-review"))
-        with mock.patch.object(watchdog.gate, "hooks_armed", return_value=False), \
+        with mock.patch.object(watchdog.gate, "hooks_read", return_value=(False, "reviewer, fixer")), \
+                mock.patch.object(watchdog.gh, "auth_probe") as probe, \
                 mock.patch.object(watchdog, "TEST", False):
             self.assertEqual(watchdog.sweep_loop(self.loop, mock.Mock()), [])
+        probe.assert_not_called()               # a confirmed pause reads nothing more
         self.assertNotIn("widgets-review", self.live())
 
     def test_doctor_reports_drift_without_writing(self):

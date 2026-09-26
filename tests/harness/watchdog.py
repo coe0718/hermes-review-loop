@@ -423,6 +423,20 @@ def group_watchdog() -> None:
                     extra_env={"REVIEW_LOOP_TEST": ""})
     check("paused loop drains nothing", "hooks are paused" in out, True)
 
+    # Unknown is not paused (#54/#78): a dead read token is said out loud, never slept through.
+    dead = TMP / "gh_dead.py"
+    dead.write_text("#!/usr/bin/env python3\nprint('{\"__gh_stub_response__\": {\"status\": 401, "
+                    "\"body\": {\"message\": \"Bad credentials\"}}}')\n")
+    os.chmod(dead, 0o755)
+    blind = {"REVIEW_LOOP_TEST": "", "REVIEW_LOOP_GH_STUB": str(dead)}
+    reset(prs={"7": pr(7)})
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets", extra_env=blind)
+    check("unreadable hooks alert with login and status",
+          "cannot read GitHub as rev-coach: HTTP 401" in out, True)
+    out, _, _ = run("watchdog.py", None, "--loop", "widgets", "--drain", "--seat", "reviewer",
+                    extra_env=blind)
+    check("  drain says unreadable, not paused", "hook list unreadable" in out, True)
+
 
 def group_explain() -> None:
     """``explain`` — the answer to "why is this PR not moving?".
