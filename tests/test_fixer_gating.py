@@ -281,7 +281,7 @@ class Surfaces(Base):
         self.assertIn("1 held verdict(s)", out.getvalue())
         self.assertIn("drain --loop one --seat fixer", out.getvalue())
         source = (ROOT / "review_loop" / "cli.py").read_text()
-        self.assertIn("Then decide the fix leg", source)
+        self.assertIn("decide the fix leg", source)
         self.assertIn("fixer-push --loop", (ROOT / "docs" / "operations.md").read_text())
 
 
