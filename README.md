@@ -283,6 +283,8 @@ scripts/gate_fixer.py      between a pull_request_review event and a fix run
 scripts/watchdog.py        cron: route self-heal, stall detection, stuck state, queue draining
 scripts/cleanup.py         merge/close: reclaim the PR's local disk
 scripts/observe.py         the observer route's adapter: republish the loop's notice, wake nobody
+                           (the gateway runs a route's script only from the serving profile's
+                           ~/.hermes[/profiles/<name>]/scripts, so init/apply put a shim there)
 skill/SKILL.md             the protocol the seats load
 tests/run_tests.py         the proof (stubbed GitHub, real HTTP sink, real git)
 docs/                      operations, settings, observer, architecture and configuration (see docs/README.md)

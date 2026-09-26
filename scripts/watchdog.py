@@ -38,7 +38,7 @@ import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from review_loop import config, gate, gh, observer, route_intent, routes, situation, transition, state as state_mod  # noqa: E402
+from review_loop import config, gate, gate_shims, gh, observer, route_intent, routes, situation, transition, state as state_mod  # noqa: E402
 from review_loop.util import age_min, epoch, log, now_iso  # noqa: E402
 
 TEST = bool(os.environ.get("REVIEW_LOOP_TEST"))
@@ -393,7 +393,7 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
     # Self-heal first, and independent of GitHub listing: a route another registry writer erased
     # or rewrote (issue #1) is a loop that cannot wake a seat, whatever the PRs look like.
     try:
-        healed = route_intent.heal(loop)
+        healed = route_intent.heal(loop) + gate_shims.heal(loop)
     except Exception as exc:                      # never let the heal hide the stall scan
         healed = [f"⚠️ Review loop [{loop['id']}] route self-heal failed: "
                   f"{type(exc).__name__}: {exc}"]

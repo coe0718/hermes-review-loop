@@ -910,6 +910,15 @@ def _safe_report_text(text: str) -> str:
     return _URL_IN_REPORT.sub("[webhook URL redacted]", text)
 
 
+def check_gateway_scripts(loop: dict) -> list[Check]:
+    """Each installed route's script, resolved exactly as the gateway resolves it (issue #105):
+    under the serving profile's ``scripts/``, a real file inside it, and this plugin's shim."""
+    from . import gate_shims
+    status_of = {"ok": VERIFIED, "absent": ABSENT, "mismatch": MISMATCH}
+    return [Check(name, status_of[status], detail, fix)
+            for name, status, detail, fix in gate_shims.live_checks(loop)]
+
+
 def check_loop(loop: dict, offline: bool = False) -> list[Check]:
     """Every check, in the order an operator reads an install: what it is, who runs it, what
     wakes it, what schedules it, and where it works."""
@@ -927,6 +936,7 @@ def check_loop(loop: dict, offline: bool = False) -> list[Check]:
     checks.extend(check_tokens(loop))
     checks.append(check_read_token(loop))
     checks.extend(check_routes(loop))
+    checks.extend(check_gateway_scripts(loop))
     checks.append(check_scripts())
     checks.append(check_shim(loop))
     checks.append(check_cron_job(loop))
