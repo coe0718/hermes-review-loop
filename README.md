@@ -121,9 +121,13 @@ hermes review-loop init \
 The reader (`--read-token`), the reviewer seat and the fixer seat are three different accounts, each
 with its own token file (a fourth, `--adjudicator-login`, is optional) — `init` and `set` refuse a
 reader that is a seat or shares a seat's file, because the broker would refuse every write. Each
-seat login must be in its `--reviewer`/`--fixer` allowlist. `--hooks` creates the repo hooks as
-`--admin-token`'s login, so that login's file needs hook write access; leave `--hooks` off to keep
-the reader's token read-only and add the hooks by hand. A reader can be changed later with
+seat login must be in its `--reviewer`/`--fixer` allowlist. `--hooks` and `arm` edit the repo
+hooks as `--admin-token`'s login (default: the reader). On a user-owned repo only the owner can
+manage hooks, and here the owner is also the reader, so its file needs hook write — fine-grained
+`repository_hooks: write`, or classic `repo`; `init` prints this, and `arm` exits 1 naming it if
+GitHub refuses. To keep the reader read-only, leave `--hooks` off and add and toggle the hooks by
+hand (or, on an org repo, name a separate admin login with its own file and pass the same
+`--admin-token` to `arm`). A reader can be changed later with
 `hermes review-loop set --loop ID --read-token LOGIN --token LOGIN=/path/to/pat`.
 
 Each `--token` is a *path* to one account's **classic** PAT (mode 600) — never the token itself, and

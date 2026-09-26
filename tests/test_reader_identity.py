@@ -87,6 +87,28 @@ class _Home(unittest.TestCase):
         return rc, text
 
 
+class _Loop(_Home):
+    def init_argv(self, *extra, reader=READER, reader_file="read"):
+        argv = ["init", "--repo", "acme/widgets", "--fixer", FIX, "--reviewer", REV,
+                "--reviewer-profile", "vex", "--fixer-profile", "drey",
+                "--host", "https://gateway.example",
+                "--token", f"{REV}={self.pat('rev')}", "--token", f"{FIX}={self.pat('fix')}"]
+        if reader:
+            argv += ["--read-token", reader]
+        if reader and reader_file:
+            argv += ["--token", f"{reader}={self.pat(reader_file)}"]
+        return argv + list(extra)
+
+    def loop_file(self):
+        return config.config_dir() / "widgets.json"
+
+    def refused(self, argv, reason):
+        rc, out = self.run_cli(argv)
+        self.assertEqual(rc, 2, out)
+        self.assertRegex(out, reason)
+        return out
+
+
 class ReadmeInstallTests(_Home):
     def test_readme_install_command_passes_init_dry_run(self):
         argv = readme_install_argv()
@@ -118,27 +140,7 @@ class ReadmeInstallTests(_Home):
         self.assertIn("four-identity rule", out)
 
 
-class ReaderIdentityTests(_Home):
-    def init_argv(self, *extra, reader=READER, reader_file="read"):
-        argv = ["init", "--repo", "acme/widgets", "--fixer", FIX, "--reviewer", REV,
-                "--reviewer-profile", "vex", "--fixer-profile", "drey",
-                "--host", "https://gateway.example",
-                "--token", f"{REV}={self.pat('rev')}", "--token", f"{FIX}={self.pat('fix')}"]
-        if reader:
-            argv += ["--read-token", reader]
-        if reader and reader_file:
-            argv += ["--token", f"{reader}={self.pat(reader_file)}"]
-        return argv + list(extra)
-
-    def loop_file(self):
-        return config.config_dir() / "widgets.json"
-
-    def refused(self, argv, reason):
-        rc, out = self.run_cli(argv)
-        self.assertEqual(rc, 2, out)
-        self.assertRegex(out, reason)
-        return out
-
+class ReaderIdentityTests(_Loop):
     def test_init_refuses_a_reader_that_is_a_seat(self):
         for seat, login in (("reviewer", REV), ("fixer", FIX)):
             out = self.refused(self.init_argv(reader=login, reader_file=""),
@@ -220,6 +222,73 @@ class ReaderIdentityTests(_Home):
         self.refused(["set", "--loop", "widgets", "--token", f"{REV}={self.keys / 'rev-pat'}"],
                      r"only maps the token file of the login named by --read-token")
         self.assertEqual(self.loop_file().read_bytes(), before)
+
+
+class HookWriteTests(_Loop):
+    """Who edits the hooks, and what that login's file must carry. `arm`'s read-back and exit
+    codes are tests/test_arm_verify.py's; these pin what init states and what the fix names."""
+
+    def hook_fetch(self, patch_error):
+        calls = []
+        state = {1: False, 2: False}
+
+        def fetch(loop, path, method="GET", body=None, login=None):
+            calls.append((method, path, login))
+            if path.endswith("/hooks?per_page=100"):
+                return [{"id": n, "active": state[n], "config": {
+                    "url": f"https://gateway.example/p/x/webhooks/widgets-{r}"}}
+                    for n, r in ((1, "review"), (2, "fix"))], ""
+            hook_id = int(path.rsplit("/", 1)[-1])
+            if method == "PATCH":
+                if patch_error:
+                    return None, patch_error
+                state[hook_id] = body["active"]
+            return {"id": hook_id, "active": state[hook_id]}, ""
+        return fetch, calls
+
+    def test_dry_run_states_who_edits_the_hooks_and_what_it_needs(self):
+        rc, out = self.run_cli(self.init_argv("--hooks", "--dry-run"))
+        self.assertEqual(rc, 0, out)
+        self.assertIn(f"hooks are created and armed as {READER}", out)
+        self.assertIn("repository_hooks: write", out)
+        self.assertIn("that is the reader's file", out)
+        self.pat("owner")
+        rc, out = self.run_cli(self.init_argv("--hooks", "--admin-token", "owner",
+                                              "--token", f"owner={self.keys / 'owner-pat'}",
+                                              "--dry-run"))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("hooks are created and armed as owner", out)
+        self.assertNotIn("that is the reader's file", out)
+
+    def test_next_step_arms_as_the_admin_login(self):
+        self.pat("owner")
+        created = []
+
+        def api(loop, path, method="GET", body=None, login=None):
+            if path.endswith("/hooks?per_page=100"):
+                return []
+            if method == "POST":
+                created.append(login)
+                return {"id": len(created)}
+            return None
+        with patch("review_loop.gh.api", side_effect=api):
+            rc, out = self.run_cli(self.init_argv("--hooks", "--admin-token", "owner",
+                                                  "--token", f"owner={self.keys / 'owner-pat'}"))
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(created, ["owner", "owner"])
+        self.assertIn("hermes review-loop arm --loop widgets --admin-token owner", out)
+
+    def test_a_refused_arm_as_the_reader_names_the_scope_and_the_owner_case(self):
+        rc, out = self.run_cli(self.init_argv())
+        self.assertEqual(rc, 0, out)
+        fetch, calls = self.hook_fetch("HTTP 403 Resource not accessible")
+        with patch("review_loop.gh.fetch", side_effect=fetch):
+            rc, out = self.run_cli(["arm", "--loop", "widgets"])
+        self.assertEqual(rc, 1, out)
+        self.assertIn("repository_hooks: write", out)
+        self.assertIn("that is the reader's file", out)
+        self.assertIn("only the owner can manage hooks", out)
+        self.assertEqual({login for method, _, login in calls if method == "PATCH"}, {READER})
 
 
 if __name__ == "__main__":

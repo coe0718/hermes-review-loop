@@ -446,7 +446,8 @@ def _install_hooks(loop: dict, token_login: str | None, active: bool = False) ->
             result = gh.api(loop, f"/repos/{loop['repo']}/hooks", method="POST", body=body,
                             login=token_login or loop.get("read_token"))
             if not isinstance(result, dict) or not isinstance(result.get("id"), int):
-                raise config.ConfigError(f"hook creation not confirmed for {url}")
+                raise config.ConfigError(f"hook creation not confirmed for {url}: "
+                                         f"{hook_write_need(loop, token_login)}")
             created.append(result["id"])
         state = "armed" if active else "paused"
         return [f"hook {id} → {url} ({state})" for id, (_, url, _) in zip(created, hooks)]
@@ -880,6 +881,8 @@ def cmd_init(args) -> int:
         if args.hooks:
             print("  would create the two repo hooks (pull_request, pull_request_review), "
                   + ("armed (--arm)" if getattr(args, "arm", False) else "paused until `arm`"))
+            print(f"  hooks are created and armed as {args.admin_token or loop['read_token']}: "
+                  f"{hook_write_need(loop, args.admin_token)}")
         if args.schedule:
             print(f"  would install the watchdog cron job ({args.schedule})")
         if loop.get("observer", {}).get("route"):
@@ -982,7 +985,9 @@ def cmd_init(args) -> int:
                      f"verdicts: {config.fixer_push_enable_command(loop)} "
                      "(read docs/operations.md on the PR-metadata race first)")
     if args.hooks and not getattr(args, "arm", False):
-        steps.append(f"hermes review-loop arm --loop {lid}   (the hooks were created paused)")
+        admin = f" --admin-token {args.admin_token}" if args.admin_token else ""
+        steps.append(f"hermes review-loop arm --loop {lid}{admin}   (the hooks were created "
+                     "paused)")
     elif args.hooks:
         steps.append("the hooks are ARMED: until the runtime file exists every turn is held")
     print("\nNext:")
