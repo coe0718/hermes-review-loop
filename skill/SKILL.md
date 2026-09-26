@@ -19,8 +19,13 @@ Your turn runs in a sandbox, not on the operator's machine:
   The reviewer and the fixer may build, test and edit there freely; the adjudicator's `/work` is
   read-only (write under `/tmp`). Nothing in it survives the turn — anything that matters belongs
   in your one write.
+* **`/opt/review/pr.diff`** is the PR's whole diff against its base, written by the host and
+  read-only — outside `/work`, so it is never part of a push.
 * **No network and no GitHub credentials.** There is no `gh`, no `git push`, no token anywhere in
   the sandbox, by design. A command that needs GitHub will fail; that is not a bug to work around.
+  Dependencies a committed lockfile pins (Rust's `Cargo.lock`) are fetched by the host before
+  the turn and mounted read-only, offline; the "Build environment" note at the top of your
+  prompt says whether that worked.
 * **One scoped write, through the broker.** `python -m review_loop.broker_client` is the only way
   anything leaves the sandbox. The host re-checks the live PR before it acts on it, so a write
   against a head that moved is refused rather than applied to the wrong code.
@@ -42,7 +47,10 @@ Your turn runs in a sandbox, not on the operator's machine:
 
    A `COMMENT` is refused (without spending your write): it would neither wake the fixer nor cue a
    merge, and the loop would stall. If you could not verify something, that is `REQUEST_CHANGES`
-   naming what you could not verify — never an approval.
+   naming what you could not verify — never an approval. The one exception is the sandbox
+   itself: when the "Build environment" note at the top of your prompt says dependencies are
+   unavailable, the failed build is not a finding. Judge by reading, say what you could not run,
+   and give the verdict the code earns.
 4. Finish with a 3-5 line summary: verdict, what you verified, what you did not.
 
 **Never approve what you did not verify.** Stacked PRs (based on another open PR's branch) are not

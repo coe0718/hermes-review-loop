@@ -91,6 +91,8 @@ class Fixture:
         return None, "HTTP 404"
 
     def contained_run(self, **kwargs):
+        if "cargo metadata" in kwargs["entry"][-1]:     # step 5's build check: resolves
+            return subprocess.CompletedProcess([], 0, "", "")
         self.sandbox_paths = json.loads(kwargs["entry"][-1])
         return subprocess.CompletedProcess([], 0, json.dumps(self.probe) + "\n", "")
 
@@ -115,6 +117,7 @@ class SelftestBase(unittest.TestCase):
             mock.patch.object(trusted_turn, "_safe_code_snapshot",
                               side_effect=lambda source, dest: dest.mkdir()),
             mock.patch.object(contained, "run", side_effect=self.fx.contained_run),
+            mock.patch.object(trusted_fetch, "stage", side_effect=self.stage),
             mock.patch.object(inference_proxy._NoRedirectConnection, "post", autospec=True,
                               side_effect=self.model_post),
             mock.patch.object(doctor, "check_shim", return_value=_ok("cron:shim")),
@@ -126,6 +129,15 @@ class SelftestBase(unittest.TestCase):
             self.addCleanup(patch.stop)
         self.model_status = 200
         self.model_keys = []
+        self.head_files = {}
+
+    def stage(self, loop, **kw):
+        """The exact-head export, faked: ``head_files`` is the PR head's tree."""
+        repo = kw["sandbox_root"] / "repo"
+        repo.mkdir(parents=True)
+        for name, text in self.head_files.items():
+            (repo / name).write_text(text)
+        return repo
 
     def model_post(self, endpoint, body, headers):
         key = headers.get("Authorization", "").removeprefix("Bearer ")
@@ -276,6 +288,61 @@ class ChecklistTests(SelftestBase):
         self.assertIn("❌ github:stub", text)
 
 
+GIT_LOCK = ('[[package]]\nname = "x"\nversion = "1.0.0"\n'
+            'source = "git+https://evil.example/x#abc"\n')
+PATH_ONLY_LOCK = '[[package]]\nname = "tiny"\nversion = "0.1.0"\n'
+
+
+class BuildCheckTests(SelftestBase):
+    """Step 5 (cont.): whether the seat can build the PR head (issue #51)."""
+
+    def sandbox(self, rc):
+        self.sandbox_calls = []
+
+        def run(**kwargs):
+            if "cargo metadata" not in " ".join(kwargs["entry"]):
+                return self.fx.contained_run(**kwargs)
+            self.sandbox_calls.append(kwargs)
+            return subprocess.CompletedProcess([], rc, "", "" if rc == 0 else
+                                               "error: no matching package named `x` found")
+        return mock.patch.object(contained, "run", side_effect=run)
+
+    def test_not_a_rust_head_skips(self):
+        rc, text = self.run_selftest(pr=7)
+        self.assertEqual(rc, 0, text)
+        self.assertIn("build:deps", text)
+        self.assertIn("nothing to prefetch", text)
+
+    def test_prefetched_head_that_resolves_offline_passes(self):
+        self.head_files = {"Cargo.toml": "[package]\n", "Cargo.lock": PATH_ONLY_LOCK}
+        with self.sandbox(0):
+            rc, text = self.run_selftest(pr=7)
+        self.assertEqual(rc, 0, text)
+        self.assertRegex(text, r"✅ build:rust:fetch\b")
+        self.assertRegex(text, r"✅ build:rust\b.*the seat can build")
+        [call] = self.sandbox_calls
+        self.assertEqual(list(call["dependency_caches"]), ["rust"])
+        self.assertIn("--offline", call["entry"][-1])
+        self.assert_reads_only()
+
+    def test_prefetched_but_unresolvable_offline_fails(self):
+        self.head_files = {"Cargo.toml": "[package]\n", "Cargo.lock": PATH_ONLY_LOCK}
+        with self.sandbox(101):
+            rc, text = self.run_selftest(pr=7)
+        self.assertEqual(rc, 1)
+        self.assertRegex(text, r"❌ build:rust\b")
+
+    def test_refused_prefetch_warns_and_the_seat_cannot_build(self):
+        self.head_files = {"Cargo.toml": "[package]\n", "Cargo.lock": GIT_LOCK}
+        with self.sandbox(101):
+            rc, text = self.run_selftest(pr=7)
+        self.assertEqual(rc, 0, text)                 # turns still run; the seat is told
+        self.assertIn("build:rust:fetch", text)
+        self.assertIn("non-crates.io", text)
+        self.assertRegex(text, r"⚠️ +build:rust\b.*cannot build")
+        self.assertEqual(self.sandbox_calls[0]["dependency_caches"], {})
+
+
 class LiveTurnTests(SelftestBase):
     def agent(self, verdict="REQUEST_CHANGES", body=None, extra=None):
         body = body if body is not None else f"Needs a test.\nleaked? {SECRETS['fixer']}"
@@ -284,6 +351,8 @@ class LiveTurnTests(SelftestBase):
             if "broker_socket_dir" not in kwargs:        # step 2's probe
                 return self.fx.contained_run(**kwargs)
             sock = str(pathlib.Path(kwargs["broker_socket_dir"]) / "broker.sock")
+            self.query_text = pathlib.Path(kwargs["query"]).read_text()
+            self.caches = kwargs.get("dependency_caches")
             self.staged_diff = (pathlib.Path(kwargs["review_dir"]) / "pr.diff").read_text()
             if extra:
                 self.extra_answer = self.raw_request(sock, extra)
@@ -300,9 +369,7 @@ class LiveTurnTests(SelftestBase):
             return json.loads(broker_ipc._read_line(conn, broker_ipc.MAX_REQUEST))
 
     def live(self, agent):
-        stage = lambda loop, **kw: (kw["sandbox_root"].mkdir() or kw["sandbox_root"])  # noqa: E731
-        with mock.patch.object(trusted_fetch, "stage", side_effect=stage), \
-             mock.patch.object(contained, "run", side_effect=agent), \
+        with mock.patch.object(contained, "run", side_effect=agent), \
              mock.patch.object(broker, "perform", side_effect=AssertionError("perform called")), \
              mock.patch.object(review_receipt, "submit", side_effect=AssertionError("submit called")):
             return self.run_selftest(pr=7, live_turn=True, timeout=30)
@@ -333,6 +400,23 @@ class LiveTurnTests(SelftestBase):
         self.assertEqual(self.extra_answer, {"ok": False, "error": "unsupported request fields"})
         self.assertEqual(rc, 0, text)
         self.assert_reads_only()
+
+    def test_unbuildable_head_tells_the_reviewer_to_judge_by_reading(self):
+        self.head_files = {"Cargo.toml": "[package]\n", "Cargo.lock": GIT_LOCK}
+        rc, text = self.live(self.agent())
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(self.caches, {})
+        self.assertIn("Rust: dependencies are NOT available in this sandbox", self.query_text)
+        self.assertIn("not by itself a reason to request changes", self.query_text)
+        # The host note leads the message, ahead of the PR records a PR author can shape.
+        self.assertTrue(self.query_text.startswith("Build environment (host-checked"))
+
+    def test_buildable_head_mounts_the_cache(self):
+        self.head_files = {"Cargo.toml": "[package]\n", "Cargo.lock": PATH_ONLY_LOCK}
+        rc, text = self.live(self.agent())
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(list(self.caches), ["rust"])
+        self.assertIn("dependencies are available offline", self.query_text)
 
     def test_cli_requires_pr_for_live_turn(self):
         args = argparse.Namespace(loop="demo", pr=None, no_model=False, live_turn=True, timeout=120)

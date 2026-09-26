@@ -15,7 +15,8 @@ import shutil
 import subprocess
 import tempfile
 
-from . import broker_client, broker_ipc, contained, gh, inference_proxy, safe_push, trusted_fetch
+from . import (broker_client, broker_ipc, contained, deps, gh, inference_proxy, safe_push,
+               trusted_fetch)
 
 
 class TurnDenied(Exception):
@@ -239,7 +240,8 @@ def run_turn(loop: dict, scope: broker_ipc.RunScope, *, source: Path, venv: Path
              prompt: str, timeout: int = 600, work_root: Path | None = None,
              no_write: bool = False, observed: dict | None = None,
              api_mode: str = 'chat_completions', credential=None, proxy_model: str = '',
-             client_identity: str = '', review_diff: str | None = None) -> int:
+             client_identity: str = '', review_diff: str | None = None,
+             prefetch_timeout: int = deps.FETCH_TIMEOUT) -> int:
     """Stage a live PR head, start host capabilities, execute Hermes within bwrap.
 
     ``api_mode`` picks the proxy contract and the sandbox's provider config; ``credential`` (a
@@ -255,6 +257,10 @@ def run_turn(loop: dict, scope: broker_ipc.RunScope, *, source: Path, venv: Path
     ``review_diff``, when given, is the host-built diff of the PR (``run_supervisor.pr_change``);
     it is mounted read-only at ``/opt/review/pr.diff``, outside the ``/work`` a fixer publishes
     from, so it can never become part of a push.
+
+    Before launch the host prefetches the staged head's pinned dependencies (``deps``) into the
+    loop's private cache, mounted read-only; the seat's query says whether that worked, so an
+    unavailable build is judged by reading rather than counted against the PR.
     """
     if scope.repo != loop.get('repo') or scope.role not in TOOLS:
         raise TurnDenied('scope mismatch')
@@ -288,8 +294,6 @@ def run_turn(loop: dict, scope: broker_ipc.RunScope, *, source: Path, venv: Path
         if env_text:
             (home / '.env').write_text(env_text)
             (home / '.env').chmod(0o600)
-        query = root / 'query.txt'
-        query.write_text(prompt + '\n\n' + tool_instructions(scope.role) + '\n')
         review = None
         if review_diff is not None:
             review = root / 'review'
@@ -299,6 +303,19 @@ def run_turn(loop: dict, scope: broker_ipc.RunScope, *, source: Path, venv: Path
         checkout = trusted_fetch.stage(loop, repo=scope.repo, number=scope.number,
                                        head=scope.head, ref=scope.branch, role=scope.role,
                                        sandbox_root=root / 'export')
+        try:
+            cache: Path | None = deps.cache_root(loop)
+        except OSError:  # includes a non-private cache: never fetched into, never mounted
+            cache = None
+        prefetched = deps.prepare(checkout, cache, Path(rust), timeout=prefetch_timeout)
+        if observed is not None:
+            observed['dependencies'] = [(r.ecosystem, r.status, r.reason) for r in prefetched]
+        note = deps.seat_note(prefetched, scope.role)
+        query = root / 'query.txt'
+        # The note leads the message: the prompt ends with PR records (data a PR author can shape),
+        # so a host fact placed after them could be imitated there.
+        query.write_text((note + '\n\n' if note else '') + prompt + '\n\n'
+                         + tool_instructions(scope.role) + '\n')
         with ExitStack() as stack:
             sockets = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix='rl-', dir=tempfile.gettempdir())))
             # AF_UNIX has a ~108-byte pathname limit, independent of work_root.
@@ -324,6 +341,7 @@ def run_turn(loop: dict, scope: broker_ipc.RunScope, *, source: Path, venv: Path
                     inference_socket_dir=inference.directory,
                     broker_socket_dir=broker.socket_path.parent,
                     client_code=client.parent, review_dir=review, timeout=timeout,
+                    dependency_caches={r.ecosystem: r.cache for r in prefetched if r.ready},
                     # A ruling is judgement, not a change: the adjudicator's tree is mounted
                     # read-only so nothing it runs can dress up the head it rules on.
                     checkout_writable=scope.role != 'adjudicator')
