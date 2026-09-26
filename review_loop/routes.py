@@ -19,6 +19,7 @@ import pathlib
 import tempfile
 import time
 import urllib.request
+import uuid
 from contextlib import contextmanager
 
 from . import config
@@ -255,12 +256,32 @@ def target(name: str, host: str | None = None, *, expected: dict | None = None):
     return url, secret.encode()
 
 
+def delivery_id(tag: str) -> str:
+    """A fresh ``X-GitHub-Delivery`` for one notice: the tag, plus entropy.
+
+    The gateway keys its 3600s idempotency window on this header, so it has to identify *the
+    notice*. It used to be ``tag + int(time.time())``, and the tags repeat by construction — they
+    are per event and per PR ("opened-7", "digest-3", "drain-review-7") — so two distinct notices
+    sharing a tag inside one second collapsed onto one delivery id: the gateway dropped the
+    second and the loop recorded it as delivered. A uuid4 suffix makes each distinct notice its
+    own delivery; the tag stays in front of it so an operator reading the header still knows what
+    it was.
+    """
+    return f"{tag}-{uuid.uuid4().hex}"
+
+
 def fire(name: str, event: str, payload: dict, tag: str, host: str | None = None,
-         *, expected: dict | None = None, on_attempt=None) -> bool:
+         *, expected: dict | None = None, on_attempt=None, delivery: str | None = None) -> bool:
     """POST a signed payload; on_attempt marks the boundary before transport I/O.
 
     A false result before that callback is known not delivered; a false result
     after it may have reached the gateway and must not be blindly replayed.
+
+    ``delivery`` pins the ``X-GitHub-Delivery`` header. Leave it out for a notice the gateway has
+    not seen — a distinct notice is a distinct delivery — and pass the id the first attempt used
+    when re-sending *one* logical delivery: the header is the gateway's idempotency key, so a
+    retry of the same notice is then deduplicated if the first attempt did reach the gateway
+    after all, instead of the second copy being silently swallowed.
     """
     target_ = target(name, host, expected=expected)
     if not target_:
@@ -271,7 +292,7 @@ def fire(name: str, event: str, payload: dict, tag: str, host: str | None = None
         "Content-Type": "application/json",
         "X-GitHub-Event": event,
         "X-Hub-Signature-256": "sha256=" + hmac.new(secret, body, hashlib.sha256).hexdigest(),
-        "X-GitHub-Delivery": f"{tag}-{int(time.time())}",
+        "X-GitHub-Delivery": delivery or delivery_id(tag),
         "User-Agent": "hermes-review-loop",
     })
     try:

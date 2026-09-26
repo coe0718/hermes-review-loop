@@ -30,10 +30,14 @@ def group_observer() -> None:
     check("  event", block["event"], "handoff")
     check("  head", block["head"], HEAD_A)
     check("  the direct PR link", block["url"], f"https://github.com/{REPO}/pull/7")
-    check("  seat, event, head, actor and next turn in one line",
+    # The gate holds this turn — this harness has no private runtime, so `on_queued` ran on its
+    # fail-closed path — and the claim the transition was handed ("reviewer queued") is therefore
+    # not what the notice says. The gate's own reason is (see group_observer_honesty).
+    hold = load_state("pending.json")["reviewer"][f"{REPO}#7"]["reason"]
+    check("  seat, event, head, actor and the hold reason in one line",
           block["message"].splitlines()[0],
           f"🔧 [widgets] #7 `{HEAD_A[:7]}` fix pushed · review requested (dev-fixer) "
-          f"· round 1/3 · next: reviewer queued")
+          f"· round 1/3 · next: held — {hold}")
     check("  the link is on its own line", block["message"].splitlines()[1], block["url"])
     secret = json.loads(SUBS.read_text())["widgets-observe"]["secret"]
     check("  no token, no secret, no review body in the ping",
@@ -64,10 +68,11 @@ def group_observer() -> None:
     check("  exactly one notice", len(observer_posts()), 1)
     block = notice(observer_posts()[0])
     check("  event", block["event"], "verdict")
-    check("  outcome, actor, round and next turn",
+    hold = load_state("pending.json")["fixer"][f"{REPO}#7"]["reason"]
+    check("  outcome, actor, round and the hold reason in one line",
           block["message"].splitlines()[0],
           f"🔍 [widgets] #7 `{HEAD_A[:7]}` review posted — changes requested (rev-coach) "
-          f"· round 1/3 · next: fixer queued")
+          f"· round 1/3 · next: held — {hold}")
     state_file("locks.json").write_text("{}")
     state_file("inflight.json").write_text("{}")
     run("gate_fixer.py", review_payload(rid=5))
@@ -589,8 +594,135 @@ def group_observer_cli() -> None:
           config.load_id("widgets")["observer"]["route"], "widgets-observe")
 
 
+def group_observer_honesty() -> None:
+    """The notice repeats what the loop recorded, never what the transition claimed.
+
+    ``gate.block_pr_agent`` calls ``on_queued`` after a turn was committed to the host run ledger
+    *and* after it failed closed and held the turn, so "reviewer queued" is a claim the caller was
+    handed, not evidence. A held turn reads as held, with the gate's own reason (nothing else an
+    operator can see carries it); a real queue entry, an armed turn and a hold recorded for
+    another head are all left exactly as the transition worded them.
+    """
+    from unittest.mock import patch as mock_patch
+
+    from review_loop import config, gate, observer, state as state_mod
+    from review_loop.run_supervisor import Supervisor
+
+    section("observer — the notice repeats the loop's record, not the caller's claim")
+
+    # -- a held turn is never reported as a queued one ------------------------------
+    reset(prs={"7": pr(7)})
+    observer_route()
+    run("gate_reviewer.py", pr_payload())
+    reason = load_state("pending.json")["reviewer"][f"{REPO}#7"]["reason"]
+    check("a held turn: the gate recorded the hold and its reason",
+          reason.startswith("isolated worker unavailable"), True)
+    line = notice(observer_posts()[0])["message"].splitlines()[0]
+    check("  the notice does not claim the turn is queued", "queued" in line, False)
+    check("  it carries the gate's own reason", reason in line, True)
+    check("  and reads as a hold", line,
+          f"🔧 [widgets] #7 `{HEAD_A[:7]}` fix pushed · review requested (dev-fixer) "
+          f"· round 1/3 · next: held — {reason}")
+
+    # the same claim, from the other gate script and the other seat
+    reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, rid=5)]}})
+    observer_route()
+    run("gate_fixer.py", review_payload(rid=5))
+    reason = load_state("pending.json")["fixer"][f"{REPO}#7"]["reason"]
+    check("held verdict: the fixer's hold reads the same way",
+          notice(observer_posts()[0])["message"].splitlines()[0],
+          f"🔍 [widgets] #7 `{HEAD_A[:7]}` review posted — changes requested (rev-coach) "
+          f"· round 1/3 · next: held — {reason}")
+
+    # -- a turn that really was committed still reads as queued ---------------------
+    # The detached worker is never started here: the ledger row is the contract, the way the
+    # adjudicator tests treat it, and the row is what a real enqueue leaves behind.
+    reset(prs={"7": pr(7)})
+    observer_route()
+    runtime = HOME / "review-loop-runtime.json"
+    runtime.write_text("{}")
+    runtime.chmod(0o600)
+    try:
+        loop = config.load_id("widgets")
+        st = state_mod.state_for(loop)
+        with mock_patch.object(Supervisor, "_spawn"):
+            gate.enqueue_isolated(loop, "reviewer", 7, HEAD_A)
+        check("an armed turn leaves nothing in the queue to hold it",
+              st.queue_items("reviewer"), {})
+        observer.notify(loop, st, "handoff", 7, HEAD_A, identity="review_requested", actor=FIXER,
+                        next_turn="reviewer queued", round_no=1)
+        check("a genuinely queued run still reads as queued",
+              notice(observer_posts()[0])["message"].splitlines()[0],
+              f"🔧 [widgets] #7 `{HEAD_A[:7]}` fix pushed · review requested (dev-fixer) "
+              f"· round 1/3 · next: reviewer queued")
+    finally:
+        runtime.unlink(missing_ok=True)
+
+    # Not every queue entry is a hold: waiting for a seat is a queue.
+    reset(prs={"7": pr(7)})
+    observer_route()
+    loop = config.load_id("widgets")
+    st = state_mod.state_for(loop)
+    st.queue_add("reviewer", f"{REPO}#7", HEAD_A, f"https://github.com/{REPO}/pull/7",
+                 "reviewer at capacity 1/1: acme/widgets#9 (12s)")
+    observer.notify(loop, st, "opened", 7, HEAD_A, next_turn="reviewer queued")
+    check("waiting for a seat reads as queued, not as held",
+          notice(observer_posts()[0])["message"], f"📬 [widgets] #7 `{HEAD_A[:7]}` opened — "
+          f"first look · next: reviewer queued\nhttps://github.com/{REPO}/pull/7")
+
+    # A hold recorded for an older head is not this turn's.
+    reset(prs={"7": pr(7)})
+    observer_route()
+    loop = config.load_id("widgets")
+    st = state_mod.state_for(loop)
+    st.queue_replace_if("reviewer", f"{REPO}#7", None, HEAD_B,
+                        f"https://github.com/{REPO}/pull/7",
+                        "isolated worker unavailable: OSError: boom")
+    observer.notify(loop, st, "opened", 7, HEAD_A, next_turn="reviewer queued")
+    check("a hold recorded for another head is not this turn's",
+          " · next: reviewer queued" in notice(observer_posts()[0])["message"], True)
+
+    # The claim names the seat, and the gate scripts are where the claims come from: a claim the
+    # feed cannot read would go out unverified, so the shapes are pinned here, not on a phone.
+    for script in ("gate_reviewer.py", "gate_fixer.py"):
+        claims = re.findall(r'next_turn="([^"]+)"', (ROOT / "scripts" / script).read_text())
+        check(f"{script}: every queued claim is one the feed verifies",
+              [claim for claim in claims if "queued" in claim and not observer.claimed_seat(claim)],
+              [])
+    check("the watchdog's retarget claim is read the same way",
+          observer.claimed_seat("reviewer queued (fresh review)"), "reviewer")
+    check("a clause that claims no queued turn is left alone",
+          [observer.claimed_seat(clause) for clause in
+           ("you merge", "nothing — cleanup attempted", "adjudicator delivery pending")],
+          ["", "", ""])
+
+    # -- one notice, one delivery id ------------------------------------------------
+    # The gateway's 3600s idempotency window keys on X-GitHub-Delivery: two *distinct* notices
+    # must differ (the routes group proves that), while a retry of *one* logical notice
+    # re-presents the id it was issued with — so the window dedups a first attempt the loop had
+    # ruled out rather than swallowing the retry of a notice nobody received.
+    reset(prs={"7": {**pr(7), "reviews": [review(REVIEWER, rid=5)]}})
+    observer_route(secret=False)              # no secret: the POST cannot even be signed
+    run("gate_fixer.py", review_payload(rid=5))
+    loop = config.load_id("widgets")
+    st = state_mod.state_for(loop)
+    entry = next(iter(load_state("observations.json")["entries"].values()))
+    check("a notice that could not be sent still records its delivery id",
+          str(entry.get("delivery") or "").startswith("verdict-7-"), True)
+    subs = json.loads(SUBS.read_text())
+    subs["widgets-observe"]["secret"] = hashlib.sha256(b"widgets-observe").hexdigest()
+    SUBS.write_text(json.dumps(subs))
+    set_prs({})                     # nothing open: this sweep is only about what is owed
+    before = len(observer_posts())
+    observer.retry(loop, st)
+    check("the sweep re-sends the notice the loop still owed", len(observer_posts()) - before, 1)
+    check("  under the id it was issued with, not a fresh one",
+          observer_posts()[-1]["delivery"], entry["delivery"])
+
+
 GROUPS = {
     "observer": group_observer,
     "observer_safety": group_observer_safety,
+    "observer_honesty": group_observer_honesty,
     "observer_cli": group_observer_cli,
 }
