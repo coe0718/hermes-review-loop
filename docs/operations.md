@@ -85,8 +85,9 @@ Who serves each seat, and how the plugin-level defaults reach a loop, is covered
 
 ## Token files: one PAT per account
 
-Each GitHub account the loop uses gets its **own fine-grained PAT in its own file**, and the loop
-config (or the settings form) holds only the path:
+Each GitHub account the loop uses gets its **own PAT in its own file**, and the loop config (or the
+settings form) holds only the path. The scopes each role needs are in
+[Token scopes by role](#token-scopes-by-role) below.
 
 ```bash
 (umask 077; mkdir -p ~/.hermes/keys)   # paste each account's PAT into its own <login>-pat file
@@ -113,6 +114,73 @@ hermes review-loop init --repo owner/name \
   two hats, and the review loop exists so a different account reviews the fixer's work.
 * **Never a token value.** `status`, `settings`, `doctor` and every refusal print paths; `doctor`
   reports each seat's file as `path (exists: yes, private: yes)`.
+
+## Token scopes by role
+
+A token has to be able to do its seat's job, and on a repo owned by a **user account** there is no
+narrower option than the broad scope. That is a property of the platform, not a choice this loop
+makes.
+
+| role | account | what it does | token | why nothing narrower works |
+| --- | --- | --- | --- | --- |
+| reader (`read_token`) | the repo owner | reads PRs, refs and the repo's hooks | **fine-grained, read-only**: `contents: read`, `pull_requests: read`, `repository_hooks: read` (classic `repo` also works) | the owner *is* the fine-grained token's resource owner, so this is the one seat that can hold a read-only credential on a user-owned repo. `doctor` and `explain` read the hooks to tell *armed* from *paused*; without hook read access the line reports the state as unknown |
+| reviewer | collaborator (write) | posts one review | classic, `repo` | a review POST needs pull-request write, and on a user-owned repo that is the same permission that can push code |
+| fixer | collaborator (write) | pushes a fix commit | classic, `repo` | the fix is a commit |
+| adjudicator login | collaborator (write) | posts one comment | classic, `repo` | a comment needs only read, but a user-owned repo refuses a read-only collaborator grant (`422`), so the account can write whatever its token says |
+
+* **A fine-grained PAT cannot serve any of the *collaborator* seats** — the reviewer, the fixer and
+  the adjudicator login. GitHub's documented gap: a fine-grained token cannot "contribute to
+  repositories where the user is an outside or repository collaborator", and it is bound to a single
+  *resource owner*; for a repo you do not own that owner is a different account, i.e. a different
+  identity, exactly what the four-identity rule forbids. The **reader is the exception**: it is the
+  owner, and an owner can scope a fine-grained token to their own repo with read-only permissions —
+  which is the least-privilege credential worth using where it is available.
+* **Scope cannot make a reviewer or an adjudicator safe.** If the account can post a review or a
+  comment it can also push; there is no token shape on a user-owned repo that separates the two.
+  What keeps a seat's write credential away from a turn is the
+  [boundary](issue-16-boundary.md) — the sandboxed agent never receives the token, and one seat's
+  proxy holds only that seat's credential — plus one PAT per login, so a leak or a rotation touches
+  one seat. Give the adjudicator its own file even though its account can push: the loop then never
+  holds the credential a seat pushes with.
+
+**Org-owned repos** narrow the same roles to fine-grained tokens, which is the practical reason to
+move a repo you intend to run a loop on into an organization:
+
+| role | fine-grained permissions |
+| --- | --- |
+| reader | `contents: read`, `repository_hooks: read` |
+| reviewer | `pull_requests: write` |
+| fixer | `contents: write`, `pull_requests: write` |
+| adjudicator | `pull_requests: write` |
+
+An org repo also has a read-only collaborator role, so an account that only reads needs no write
+permission at all.
+
+In both cases: absolute path, mode 600, one file per login — and know each token's expiry, because a
+seat whose PAT lapsed mid-turn fails as an authentication error that reads like a code bug. Ask
+GitHub rather than trusting a note:
+
+```bash
+GH_TOKEN=$(cat ~/.hermes/keys/<login>-pat) gh api -i / | grep -i github-authentication-token-expiration
+```
+
+Not `curl -H "Authorization: token $(cat …)"`: that puts the token in the command's argument list,
+where `ps` can read it while the call runs. An environment variable does not.
+
+A `repo`-scoped classic PAT does **not** carry `workflow` — but a seat never gets that far: the
+broker refuses any path under `.github/`, along with `.gitmodules`, `.gitattributes` and
+`CODEOWNERS`, before it invokes git at all. Workflow edits are always a human's, made with a
+credential that has `workflow`.
+
+Creating the repo's hooks (`init` with `--hooks`, or `apply`) needs hook *write* **and delete**
+access, which a classic `repo` token already has: `admin:repo_hook` is the narrower hooks-only
+scope, not an extra requirement on top of `repo`. It is `admin:repo_hook` and not the narrower still
+`write:repo_hook` because a failed install rolls back: `init --hooks` deletes the hooks it already
+created and re-reads the listing to confirm they are gone (`_install_hooks` in `review_loop/cli.py`),
+so a write-only token turns a partial failure into an orphaned hook and a `ROLLBACK FAILED` report.
+An owner's fine-grained reader token needs `repository_hooks: write` to create them — that permission
+offers only read and write, so `write` is what covers the rollback — so either widen that file once
+or create the hooks with the owner's classic credential.
 
 ## Preflight: `doctor`
 
@@ -141,8 +209,9 @@ One line per check, in one of four states:
 
 Each failure is followed by the one command that fixes it, failures exit 1, and `unknown` is never
 reported as `absent`: "the API refused to tell me" and "there are no hooks" are different claims,
-and printing the second when the first is true sends you hunting for a hook that exists (reading
-the repo's hooks needs `admin:repo_hook`, so a token without it shows ⚠️, not ❌).
+and printing the second when the first is true sends you hunting for a hook that exists (reading the
+repo's hooks needs hook read access, which classic `repo` or the narrower `read:repo_hook` grants, so
+a token without either shows ⚠️, not ❌).
 
 It writes nothing — no config, no route registry, no state, no GitHub hook — unless you pass
 `--repair`, whose one write is restoring this loop's own routes from the plugin's intent record
@@ -210,7 +279,7 @@ $ hermes review-loop doctor --loop widgets
   ✅ state_dir            doctor-demo/state (created under doctor-demo on the first run)
   ✅ roots                1 configured: doctor-demo/reviews
   ✅ gateway              127.0.0.1:43651 accepts a connection
-  ⚠️ hooks                could not read /repos/acme/widgets/hooks — nothing was proved about 2 hook(s) (a token without admin:repo_hook reads as denied)
+  ⚠️ hooks                could not read /repos/acme/widgets/hooks — nothing was proved about 2 hook(s) (a token without hook read access — `repo`, or the narrower `read:repo_hook` — reads as denied)
 
 widgets: 12 verified, 6 failed, 1 unknown (of 19 checks)
   6 failed: profile:fixer, token:dev-fixer, route:widgets-review, route:widgets-fix, cron:shim, cron:job — fix the ❌ lines above before this loop is armed.
@@ -221,10 +290,10 @@ sink for the probe, a stubbed GitHub, short relative paths. A run against a live
 prints the same lines with absolute paths and the real hook list.)
 
 Each seat needs its own GitHub token, and that is deliberate: the token that reviews, the token
-that pushes and the token that reads are separate and revocable one at a time. A classic PAT with
-`repo` is enough for the seats; creating hooks additionally needs `admin:repo_hook`. A loop that
-names tokens must name one per seat, and the file has to be there — checked before `init` or `apply`
-writes anything, because a missing PAT otherwise surfaces hours later as an unauthenticated read.
+that pushes and the token that reads are separate and revocable one at a time
+([scopes by role](#token-scopes-by-role)). A loop that names tokens must name one per seat, and the
+file has to be there — checked before `init` or `apply` writes anything, because a missing PAT
+otherwise surfaces hours later as an unauthenticated read.
 
 The checks and the reasoning behind them are in
 [architecture: Preflight](architecture.md#preflight-can-this-installation-run).

@@ -822,9 +822,11 @@ def check_hooks(loop: dict, offline: bool) -> list[Check]:
     if not complete:
         return [Check("hooks", UNKNOWN,
                       f"could not read the complete /repos/{loop['repo']}/hooks listing — nothing was proved about "
-                      f"{len(expected)} hook(s) (a token without admin:repo_hook reads as denied)",
-                      f"give the read token admin:repo_hook (or repo) scope and re-run; check by "
-                      f"hand with `gh api repos/{loop['repo']}/hooks`")]
+                      f"{len(expected)} hook(s) (a token without hook read access — `repo`, or the "
+                      f"narrower `read:repo_hook` — reads as denied)",
+                      f"give the read token hook read access — `repo`, or the narrower "
+                      f"`read:repo_hook` — and re-run; check by hand with "
+                      f"`gh api repos/{loop['repo']}/hooks`")]
     checks = []
     for seat, name, url in expected:
         checks.append(check_hook(loop, hooks, seat, name, url))
@@ -846,9 +848,9 @@ def check_hook(loop: dict, hooks: list, seat: str, name: str, url: str) -> Check
                   event in (hook.get("events") or [])), None) or (candidates[0] if candidates else None)
     if match is None:
         return Check(f"hook:{name}", ABSENT, "no repo hook posts to [webhook URL redacted]",
-                     f"re-run init --hooks --admin-token <login> (needs admin:repo_hook on "
-                     f"{loop['repo']}), or add the hook by hand with that URL and the route's "
-                     f"secret")
+                     f"re-run init --hooks --admin-token <login> (needs hook write and delete access on "
+                     f"{loop['repo']}: `repo`, or the narrower `admin:repo_hook`), or add the hook by "
+                     f"hand with that URL and the route's secret")
     hook_id = match.get("id")
     posted = posted_url(match)
     if posted.removesuffix("/") != url.removesuffix("/"):

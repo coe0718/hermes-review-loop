@@ -225,7 +225,8 @@ against a head that moved on.
 
 The "is this loop armed at all?" question is answered by `gate.hooks_read`, which the watchdog and
 `explain` share: both seat routes must exist as active repo hooks. An unreadable hook list is
-**not** "paused" — a token without `admin:repo_hook` cannot see hooks that may well be active — so
+**not** "paused" — a token without hook read access (classic `repo`, or the narrower
+`read:repo_hook`) cannot see hooks that may well be active — so
 the watchdog stays silent there and `explain` prints "unknown" rather than guessing in either
 direction.
 
@@ -384,7 +385,8 @@ Four states, and the difference between the last two is the point:
 * ❌ **mismatch** — there, but not what this loop needs: a route waking another profile, a hook on
   another gateway, a shim pinned to a stale plugin path, a world-readable PAT;
 * ⚠️ **unknown** — could not be decided from here: a hooks read the token was not allowed to make
-  (reading a repo's hooks needs `admin:repo_hook`), or a probe skipped with `--offline`.
+  (reading a repo's hooks needs hook read access: classic `repo`, or the narrower `read:repo_hook`),
+  or a probe skipped with `--offline`.
 
 **Unknown is never folded into absent.** "The API refused to tell me" and "there are no hooks" are
 different claims, and printing the second when the first is true sends the operator hunting for a
