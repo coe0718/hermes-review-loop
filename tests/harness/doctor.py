@@ -95,6 +95,17 @@ def install_doctor_fixture() -> dict:
     return config.load_id("widgets")
 
 
+def _have(module: str) -> bool:
+    """Is ``module`` importable here? ``find_spec`` raises for a dotted name whose parent is
+    missing (and ValueError for a module cached as None), which is not the same answer as "not
+    installed" — a reader-less CI image would crash the group instead of being reported."""
+    import importlib.util
+    try:
+        return importlib.util.find_spec(module) is not None
+    except (ImportError, ValueError):
+        return False
+
+
 def seat_config_style() -> str:
     """``yaml`` or ``json``: what ``write_seat_models`` can hand this interpreter's resolver.
 
@@ -102,8 +113,7 @@ def seat_config_style() -> str:
     stdlib-only CI image) can only be given JSON. Naming the style keeps that difference visible:
     JSON-mode coverage is not YAML-mode coverage, which is how #46 hid.
     """
-    import importlib.util
-    return "yaml" if any(importlib.util.find_spec(m) for m in ("yaml", "ruamel.yaml")) else "json"
+    return "yaml" if any(_have(m) for m in ("yaml", "ruamel.yaml")) else "json"
 
 
 def write_seat_models() -> list[pathlib.Path]:
@@ -209,10 +219,8 @@ def group_doctor() -> None:
     check("doctor and init agree on the shim name", doctor.SHIM_NAME, cli.SHIM_NAME)
     check("doctor and init agree on the watchdog job name",
           doctor.watchdog_job_name({"id": "x"}), cli.watchdog_job_name({"id": "x"}))
-    import importlib.util as _importlib_util
-    _reader = any(_importlib_util.find_spec(m) for m in ("yaml", "ruamel.yaml"))
     check("the seat configs match what this interpreter can read",
-          seat_config_style(), "yaml" if _reader else "json")
+          seat_config_style(), "yaml" if any(_have(m) for m in ("yaml", "ruamel.yaml")) else "json")
 
     install_doctor_fixture()
     added = doctor_runtime_fixture()
