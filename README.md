@@ -1,13 +1,16 @@
 # hermes-review-loop
 
-> **Safety hold (issue #16): PR-facing reviewer, fixer and adjudicator agents are
-> disabled in this branch.** Eligible gate events are queued with an actionable
-> reason and emit `[SILENT]`, so Hermes never falls through to its normal
-> credential-owning gateway agent. The checkout is NOT a security sandbox.
-> Do not install this branch expecting an operational review loop. The broker
-> has isolated transport and exact-ref lease primitives, but an exact-ref lease
-> cannot atomically authorize PR state/author at receive-pack. The descriptions
-> below document the previous operational design, not current enabled behavior.
+> **What runs, and when (issue #16).** No gateway agent ever handles a PR event: every gate
+> answers `[SILENT]`, so Hermes never falls through to its normal credential-owning agent.
+> Seats run only as **isolated turns** — credentialless, in a bubblewrap sandbox, writing
+> through the host broker — and nothing runs until *both* switches in
+> [First run](#first-run-in-order) are on: the private runtime file
+> (`~/.hermes/review-loop-runtime.json`) that the worker needs, and `arm`, which turns on the
+> repo hooks `init --hooks` created paused. Without the file an eligible event is queued with
+> its reason and held; with it and the hooks armed, **a reviewer turn posts a real GitHub
+> review** as the reviewer login, and a spent cap runs the adjudicator. The fixer is the
+> exception: unattended fixer pushes stay **off** (below) until you opt in per loop. Each
+> run's checkout is a scratch copy, not a security boundary; the sandbox and broker are.
 >
 > **Adjudication is isolated like the seats.** A spent cap enqueues an isolated
 > adjudicator turn in the host run ledger (never the legacy gateway route, which
@@ -18,25 +21,20 @@
 > distinct `seats.adjudicator.login` identity is configured. It never merges,
 > pushes or reviews. See [`docs/configuration.md#adjudication-the-isolated-ruling`](docs/configuration.md#adjudication-the-isolated-ruling).
 >
-> **Operator decision: no unattended fixer push rollout.** The gate rejects
-> verdicts for PRs whose webhook author is not in `fixers`; the credentialed
-> broker independently reads the live PR author before every fixer write and
-> rejects missing/outsider authors. These checks do not close the time-of-check
-> race: a PR can close, become draft, change author/target, or close and reopen
-> after the final API read and before Git receives a ref update. The lease only
-> compares `refs/heads/<branch>` to the old SHA, not GitHub PR metadata. A
-> post-push readback can flag some transitions but cannot undo a published
-> commit or observe a transient close/reopen. Do not call that an atomic PR
-> policy. Keep the production worker config absent, PR-facing routes silent,
-> and fixer credentials unavailable to agents. For an individual fix, a human
-> operator must inspect the live PR owner, state, draft flag, base/head repo,
-> review and intended diff, then make the authorized branch write manually and
-> verify the exact PR/ref afterwards; stop and reconcile ambiguous outcomes,
-> never blindly retry. Before enabling any automation, require a provider-side
-> transaction/authorization mechanism spanning PR metadata and ref mutation (or
-> an explicitly accepted weaker threat model), plus uncertain-worker manual
-> reconciliation, notification delivery, credential-transport validation, and
-> end-to-end production-like tests. None is established by this branch.
+> **Operator decision: unattended fixer pushes are off by default.** A changes-requested
+> verdict is held for you and no fixer turn starts until
+> `hermes review-loop fixer-push --loop ID --enable --acknowledge-pr-race`. The gate rejects
+> verdicts for PRs whose webhook author is not in `fixers`, and the credentialed broker reads
+> the live PR author before every fixer write and rejects missing/outsider authors. These
+> checks do not close the time-of-check race: a PR can close, become draft, change
+> author/target, or close and reopen after the final API read and before Git receives a ref
+> update. The lease only compares `refs/heads/<branch>` to the old SHA, not GitHub PR
+> metadata, and a post-push readback can flag some transitions but cannot undo a published
+> commit. Do not call that an atomic PR policy; read
+> [the push policy](docs/issue-16-boundary.md#unattended-fixer-push-policy-host-operator-not-github-owner-consent) before enabling it. With pushes off, make an
+> individual fix by hand: inspect the live PR owner, state, draft flag, base/head repo, review
+> and intended diff, push, verify the exact PR/ref afterwards, and reconcile an ambiguous
+> outcome instead of retrying it.
 
 **Two agents review each other's pull requests, unattended — and every step in between is a
 script, not a model.**
@@ -149,13 +147,15 @@ and reversible; see [what `init` writes](docs/operations.md#what-init-writes) an
 base):
 
 ```bash
-# 0. the private runtime file (host paths; each seat's model comes from its Hermes profile)
+# 0. the private runtime file (host paths; each seat's model comes from its Hermes profile).
+#    Switch one of two: with it, an eligible event runs an isolated seat turn instead of being held.
 (umask 077; touch ~/.hermes/review-loop-runtime.json); chmod 600 ~/.hermes/review-loop-runtime.json; $EDITOR ~/.hermes/review-loop-runtime.json
 hermes review-loop doctor   --loop ID                       # installation preflight
 hermes review-loop selftest --loop ID --no-model            # 1,2,4,6: runtime, bwrap, identities, ledger — free
 hermes review-loop selftest --loop ID --pr N                # + one tiny completion per seat model + broker dry run
 hermes review-loop selftest --loop ID --pr N --live-turn    # + one real isolated reviewer turn, NOT posted
 python -m review_loop.run_supervisor status ~/.hermes/state/review-loop-runs.sqlite
+hermes review-loop arm --loop ID                            # switch two: the hooks go live — reviewer turns now post
 ```
 
 What each step proves, and how to read a failure, is in

@@ -1,14 +1,14 @@
 # Architecture
 
-> **Current status:** the diagrams below describe the intended operational loop,
-> not a safely running one. Gates presently queue eligible PR events and return
-> `[SILENT]` before gateway dispatch; a breach enqueues an isolated adjudicator
-> turn instead of waking the legacy gateway route. This is a
-> deliberate safety hold pending an enforced, credentialless whole-agent runner.
-> `review_loop/broker.py` contains trusted REST authorization primitives and
-> `review_loop/broker_ipc.py` a scoped Unix-socket service; an offline worker
-> exercises a bubblewrapped Hermes turn. This is NOT production authorization
-> for unattended fixer pushes.
+> **Current status:** gates never dispatch to a gateway agent — they queue an eligible PR
+> event as an isolated turn in the host run ledger and return `[SILENT]`. A worker runs that
+> turn credentialless in a bubblewrap sandbox, and its only way out is the host broker
+> (`review_loop/broker.py`, `review_loop/broker_ipc.py`). Nothing runs until the private
+> runtime file exists (without it a turn is held with its reason) and the repo hooks are
+> armed; with both, a reviewer turn posts a real review and a breach runs the isolated
+> adjudicator. Unattended fixer pushes stay off per loop until
+> `fixer-push --enable --acknowledge-pr-race` — that is not atomic PR authorization. The
+> diagrams below show the gate logic; the "agent" boxes are those isolated turns.
 
 Five processes, four state files, one rule: **the control plane never guesses.**
 
