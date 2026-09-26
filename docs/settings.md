@@ -86,7 +86,7 @@ without writing config, routes, hooks or cron.
 
 ```bash
 hermes review-loop settings                      # the form's seat mapping, and what each loop runs as today
-hermes review-loop init --repo owner/name --dry-run   # preview: seats, routes, nothing written
+hermes review-loop init --repo owner/name --read-token reader-bot --token reader-bot=~/.hermes/keys/reader-bot-pat --dry-run   # preview: seats, routes, nothing written
 hermes review-loop apply --loop name --dry-run   # what a push would change, including routes
 hermes review-loop status --loop name            # each seat, its profile, and whether its route agrees
 ```

@@ -372,7 +372,7 @@ Example transcripts are in [Operating a loop](operations.md#preflight-doctor).
 | `profile:reviewer` / `profile:fixer` | each seat's Hermes profile home exists (`~/.hermes/profiles/<name>`, or `~/.hermes` itself for `default`) |
 | `credential:<seat>` | a nonempty token file is mapped for that seat's login through `gh.token_path`; profile `GH_TOKEN` alone is not used by the gates |
 | `token:<login>` | every credential file named in the config exists, is non-empty, and is not readable by group or other users |
-| `read_token` | the login the gates read GitHub as is one of those mappings |
+| `read_token` | the login the gates read GitHub as is one of those mappings, and is its own account: not a seat, not the adjudicator login, no shared token file (the four-identity rule) |
 | `route:<name>` | the gateway's registry holds the route, it wakes *this* seat's profile, it carries a secret and a prompt, it runs the right gate script for the right event, and it resolves to this loop's own gateway origin — and, when the plugin has an intent record for it, still matches that record (a rotated secret looks well-formed but no longer matches GitHub's hook) |
 | `scripts` | the plugin's `watchdog.py`, both gates and `cleanup.py` are on disk |
 | `cron:shim` | `~/.hermes/scripts/review-loop-watchdog.py` exists **and is pinned to the plugin install that is here now** — an upgrade that moves the directory leaves the scheduler running an old path |

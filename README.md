@@ -105,18 +105,28 @@ Then configure one loop per repository:
 hermes review-loop init \
   --repo owner/name \
   --fixer dev-account \
-  --reviewer rev-account --reviewer-seat rev-bot \
+  --reviewer rev-bot \
   --fixer-profile drey --reviewer-profile vex \
   --cap 3 \
   --reviewer-concurrency 2 --fixer-concurrency 1 \
   --clone ~/projects/name \
   --root ~/reviews --root ~/.hermes/cache/scratch \
+  --read-token owner-account \
+  --token owner-account=~/.hermes/keys/owner-account-pat \
   --token rev-bot=~/.hermes/keys/rev-bot-pat \
-  --read-token rev-bot \
+  --token dev-account=~/.hermes/keys/dev-account-pat \
   --host https://your-gateway.example \
   --hooks --admin-token owner-account \
   --schedule 15m --watchdog-deliver telegram
 ```
+
+The reader (`--read-token`), the reviewer seat and the fixer seat are three different accounts, each
+with its own token file (a fourth, `--adjudicator-login`, is optional) — `init` and `set` refuse a
+reader that is a seat or shares a seat's file, because the broker would refuse every write. Each
+seat login must be in its `--reviewer`/`--fixer` allowlist. `--hooks` creates the repo hooks as
+`--admin-token`'s login, so that login's file needs hook write access; leave `--hooks` off to keep
+the reader's token read-only and add the hooks by hand. A reader can be changed later with
+`hermes review-loop set --loop ID --read-token LOGIN --token LOGIN=/path/to/pat`.
 
 Each `--token` is a *path* to one account's **classic** PAT (mode 600) — never the token itself, and
 never a fine-grained token, which GitHub refuses for a seat that is a collaborator on someone else's
