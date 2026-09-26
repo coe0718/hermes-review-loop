@@ -153,4 +153,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # Crash, overrun or a silence after a failed read is recorded for the watchdog (#75).
+    from review_loop import gate_failures  # noqa: E402
+    gate_failures.run("gate_reviewer", main)

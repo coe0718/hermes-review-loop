@@ -453,6 +453,55 @@ all — an unknown loop, or several loops and no `--loop`.
 The guard order `explain` walks is in
 [architecture: Explain](architecture.md#explain--why-is-this-pr-not-moving).
 
+## When a gate crashes or runs out of time
+
+The Hermes gateway runs a gate synchronously inside the webhook request: payload on stdin, no
+headers (so no delivery id), and a platform-wide `script_timeout_seconds` (default 30s) after which
+the gate is killed. A crash, a timeout, empty output and `[SILENT]` all get the same HTTP 200
+`ignored` reply. No script outcome yields a non-2xx, and GitHub does not redeliver failed
+deliveries by itself, so a non-2xx "retry me" is neither available nor useful. The loop keeps its
+own record instead:
+
+* **Budget.** Each gate has 20s (`REVIEW_LOOP_GATE_BUDGET_S`) and shrinks it to fit the
+  `script_timeout_seconds` of the gateway running it. The gateway reads `gateway.json` and
+  `config.yaml` from its own home, so the gate reads those same files.
+  - A `/p/<profile>/` route on the multiplexing host gateway (the default setup) runs under the
+    root home's limit. The script's `HERMES_HOME` is still the profile's home.
+  - A profile with `gateway.standalone: true` runs its own gateway and uses its own limit.
+
+  From inside the script these two cases look the same. So for a profile that isn't marked
+  standalone, the gate uses the lower of the host's and the profile's limits. Every GitHub call
+  is clipped to the time left, a timer 3s later interrupts anything else that hangs, and a
+  gate-triggered queue drain gets at most half the remaining time. `doctor` prints one
+  `gate:timeout:<profile>` line for each profile hosting a loop route (reviewer, fixer,
+  adjudicator, observer). Each line names the gateway and file, flags any limit below 28s, and
+  says which file to fix.
+* **Seats.** Gates enqueue isolated turns and do not hold seat locks. Still, a gate that
+  crashes or times out releases any seat claim its own process made, so a failed delivery never
+  keeps a seat until `ttl_min`.
+* **Ledger.** A crash (exit 2), a timeout (exit 3), or a `[SILENT]` that followed a failed GitHub
+  read is written to `gate-failures.json` in the loop's state directory. The entry holds the gate,
+  repo, PR, head, action, exception type and message, and a bounded traceback, and the payload is
+  stored beside it. Failures that happen before a loop can be named go to
+  `~/.hermes/state/review-loop-gate-failures/`. The same event delivered again (same payload)
+  bumps its attempt count instead of adding an entry.
+* **Watchdog.** Each sweep alerts on unresolved entries, once per new failure and again after the
+  cooldown. It re-drives reviewer and fixer events by running the gate again on the stored
+  payload. This is safe because those gates re-read the live PR and the run ledger dedups a second
+  enqueue. It stops after 3 re-drives. Adjudicator failures are alerted but never re-driven,
+  because that gate's output is its dispatch. An entry resolves when the same event later
+  completes cleanly, whether through a re-drive or a manual redelivery from GitHub.
+* **`explain`** lists unresolved gate failures for the PR as blockers.
+* **One owner per failed read.** When a gate's GitHub read fails, the event's
+  `gate-failures.json` entry owns it: that is what raises the alert and triggers the re-drive.
+  `github-reads.json` still records it as the last failed call, which `explain` shows on its
+  `github:` line, but marks it `owned_by`. The watchdog's GitHub-health check therefore doesn't
+  announce it again. The watchdog's own reads (the `/user` probe and the hook list) and any
+  failed read no gate-failure entry claims are still reported by the health check.
+* **The watchdog is budgeted too.** Its GitHub reads are capped at 20s each and the run at
+  600s (`REVIEW_LOOP_WATCHDOG_BUDGET_S`). When GitHub hangs, the sweep stops with one "watchdog
+  stopped" line and the next cron run starts fresh.
+
 ## How it handles a burst
 
 Fifty PRs arrive in an hour. Ten of them wake the reviewer, and forty-one queue — the queue costs

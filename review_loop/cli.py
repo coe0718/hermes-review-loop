@@ -1464,6 +1464,8 @@ def cmd_explain(args) -> int:
         print(f"  {'hooks:':<12}{report['hooks']}")
         print(f"  {'sweep:':<12}{report['sweep']}")
         print(f"  {'github:':<12}{report['github']}")
+        if not report.get("gate_failures"):
+            print(f"  {'gates:':<12}no unresolved gate failure recorded for this PR")
         for text in report["blockers"]:
             print(f"  {'blocked:':<12}{text}")
         if not report["blockers"]:
