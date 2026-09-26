@@ -32,7 +32,7 @@ import sys
 import time
 import urllib.request
 
-from . import config, gh, isolation, observer, routes, situation, transition, state as state_mod
+from . import config, gate_failures, gh, isolation, observer, routes, situation, transition, state as state_mod
 from .util import iso_at, log, now_iso, silence
 
 
@@ -507,6 +507,19 @@ def explain_facts(loop: dict, number: int) -> dict:
             "receipts": receipts, "receipts_error": receipts_error}
 
 
+def gate_failure_line(entry: dict) -> str:
+    redrives = int(entry.get("redrives") or 0)
+    status = ("not re-drivable — re-deliver the event from GitHub by hand"
+              if not entry.get("redrivable") else
+              f"gave up after {redrives} watchdog re-drive(s) — needs you"
+              if redrives >= gate_failures.MAX_REDRIVES else
+              f"{redrives} watchdog re-drive(s) so far; the next sweep retries it")
+    return (f"gate failure {entry.get('id')}: {entry.get('gate')} {entry.get('kind')} at head "
+            f"{str(entry.get('head') or '?')[:7]} ({entry.get('action') or '?'}), last "
+            f"{iso_at(float(entry.get('last_at') or 0))}, {entry.get('attempts')} attempt(s): "
+            f"{entry.get('error_type')}: {str(entry.get('error') or '')[:160]} — {status}")
+
+
 def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> dict:
     """Why one PR is not moving, and the single event that would move it. Reads nothing itself.
 
@@ -547,6 +560,9 @@ def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> di
                  if isinstance(entry, dict)}
     request_pending = bool(loop["reviewer_seat"]) and loop["reviewer_seat"] in requested
     blockers: list[str] = []
+    # A gate that crashed, overran or silenced after a failed read (#75) is not a decision.
+    gate_failed = [gate_failure_line(entry) for entry in gate_failures.open_for(loop, number)]
+    blockers.extend(gate_failed)
 
     # -- what the gates conclude about this head (their predicates, not new ones) -------------
     spent: int | None = None
@@ -892,7 +908,7 @@ def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> di
         "inflight": local["inflight"], "escalation": local["escalation"], "hooks": hooks_line,
         "sweep": local["sweep"],
         "github": local.get("github", "no failed GitHub call recorded"),
-        "blockers": blockers, "next": {"kind": kind, "action": action},
+        "gate_failures": gate_failed, "blockers": blockers, "next": {"kind": kind, "action": action},
     }
 
 

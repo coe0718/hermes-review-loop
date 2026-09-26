@@ -43,7 +43,7 @@ import time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from review_loop import config, gate, gh, observer, route_intent, routes, situation, transition, state as state_mod  # noqa: E402
+from review_loop import config, gate, gate_failures, gh, observer, route_intent, routes, situation, transition, state as state_mod  # noqa: E402
 from review_loop.util import age_min, epoch, log, now_iso  # noqa: E402
 
 TEST = bool(os.environ.get("REVIEW_LOOP_TEST"))
@@ -54,6 +54,17 @@ HEAD_RETENTION_SEC = 30 * 86400  # retain absent PRs long enough for transient l
 READ_FAILURE_SWEEPS = 3
 EXPIRY_WARN_DAYS = 7
 EXPIRY_WARN_EVERY_SEC = 86400
+SCRIPTS = pathlib.Path(__file__).resolve().parent
+
+
+def sweep_gate_failures(ledger: gate_failures.Ledger, header: str, cooldown_s: float,
+                        may_redrive: bool) -> list[str]:
+    """A gate that crashed, overran, or silenced after a failed read (#75): alert, re-drive."""
+    try:
+        return gate_failures.sweep(ledger, header, SCRIPTS, cooldown_s=cooldown_s,
+                                   may_redrive=may_redrive)
+    except Exception as exc:                      # never let this hide the stall scan
+        return [f"⚠️ Review loop {header} gate-failure sweep failed: {type(exc).__name__}: {exc}"]
 
 
 def valid_clock(value: object, now: float) -> float | None:
@@ -503,8 +514,10 @@ def retry_pending_breaches(loop: dict, st: state_mod.LoopState, prs: list) -> No
                         marker.get("reason", "review cap reached"))
 
 
-def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
-    lines: list[str] = []
+def sweep_loop(loop: dict, st: state_mod.LoopState, lines: list[str] | None = None) -> list[str]:
+    # Filled in place, so the lines a failing sweep already produced (a gate-failure alert
+    # among them) still reach the operator next to the error.
+    lines = [] if lines is None else lines
     watch = st.watch()
     now = time.time()
 
@@ -535,9 +548,19 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
         watch["last_run"] = now_iso()
         st.watch_save(watch)
         st.note(f"run: blind — hook list unreadable ({armed_error or 'no reason given'})")
+        if loop.get("state_dir"):                 # gate failures still alert; re-drives wait
+            lines.extend(sweep_gate_failures(
+                gate_failures.loop_ledger(loop), f"[{loop['id']}] {loop['repo']}",
+                0.0 if TEST else float(loop.get("cooldown_h") or 6) * 3600, may_redrive=False))
         return lines
 
     prs = gh.open_prs(loop)
+    # Re-drive only while GitHub answers: a re-run during an outage would only fail again.
+    if loop.get("state_dir"):
+        lines.extend(sweep_gate_failures(
+            gate_failures.loop_ledger(loop), f"[{loop['id']}] {loop['repo']}",
+            0.0 if TEST else float(loop.get("cooldown_h") or 6) * 3600,
+            may_redrive=isinstance(prs, list)))
     if not isinstance(prs, list):
         # Without a complete listing, even individually readable PRs cannot establish
         # that the sweep's scheduling view is current. Explicit --drain still rechecks.
@@ -785,10 +808,16 @@ def main() -> None:
             sup.notify(lambda message: print(message, flush=True))
         except Exception as exc:
             out.append(f"⚠️ Review-loop operator notification sweep failed: {type(exc).__name__}: {exc}")
+    if not args.loop:
+        # Failures no loop could be named for (a malformed payload, a broken config).
+        out.extend(sweep_gate_failures(gate_failures.fallback_ledger(), "(no loop)",
+                                       0.0 if TEST else 6 * 3600, may_redrive=True))
     for loop in loops:
+        lines: list[str] = []
         try:
-            out.extend(sweep_loop(loop, state_mod.state_for(loop)))
+            out.extend(sweep_loop(loop, state_mod.state_for(loop), lines))
         except Exception as exc:                  # one bad loop must not hide the others
+            out.extend(lines)
             out.append(f"⚠️ Review loop [{loop.get('id', '?')}] watchdog failed: "
                        f"{type(exc).__name__}: {exc}")
     if out:
