@@ -886,15 +886,15 @@ def check_hook(loop: dict, hooks: list, seat: str, name: str, url: str) -> Check
         active = sum(1 for hook in named if hook.get("active"))
         repo = loop["repo"]
         deletes = "; ".join(f"`gh api -X DELETE {shlex.quote(f'repos/{repo}/hooks/{i}')}`"
-                            for i in ids)
+                            for i in ids[:-1])
         return Check(f"hook:{name}", MISMATCH,
                      f"{len(named)} repo hooks post to this route (ids "
                      f"{', '.join(str(i) for i in ids)}; {active} active) — duplicates from a "
                      "previous install sign with a secret this route no longer holds, so their "
                      "deliveries are refused",
                      f"`hermes review-loop uninstall --loop {shlex.quote(loop['id'])}` deletes "
-                     "them all, then re-run init --hooks; or delete every hook but the one the "
-                     f"latest init created: {deletes}")
+                     "them all, then re-run init --hooks; or keep only the newest (GitHub ids "
+                     f"only grow, so {ids[-1]} is the latest init's) and delete the rest: {deletes}")
     match = next((hook for hook in candidates if hook.get("active") and
                   event in (hook.get("events") or [])), None) or (candidates[0] if candidates else None)
     if match is None:

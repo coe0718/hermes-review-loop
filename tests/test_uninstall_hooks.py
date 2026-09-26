@@ -299,6 +299,7 @@ class DoctorDuplicateTest(Base):
         self.assertIn("1 active", check.detail)
         self.assertIn("`gh api -X DELETE repos/acme/widgets/hooks/3`", check.fix)
         self.assertIn("uninstall --loop widgets", check.fix)
+        self.assertNotIn("hooks/101", check.fix)  # the newest is the one kept
         single = doctor.check_hook(loop, hooks[:1], "reviewer", "widgets-review", url)
         self.assertEqual(single.status, doctor.VERIFIED)
 
