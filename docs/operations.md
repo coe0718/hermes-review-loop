@@ -121,7 +121,14 @@ failure, a job the scheduler will not remove) it refuses, changes nothing else, 
 exact `gh api -X DELETE …` / `hermes cron remove …` commands; `--keep-hooks` is the explicit
 opt-out. `init --hooks` refuses when hooks from a previous install still post to the loop's
 routes (they sign with a secret the new routes will not hold), and `doctor` fails a route with
-more than one hook.
+more than one hook, or whose latest delivery the gateway answered 401/403 (a secret that does not
+match). After `arm` (and `init --hooks --arm`) activates the hooks it asks GitHub to **ping** each
+one and waits up to 10s for the delivery: `✅ … signature accepted`, `❌ … HTTP 401 — signature
+rejected` (exit 1), or `⚠️ no ping delivery seen` (nothing proven yet). A ping is harmless: the
+gateway checks its signature, then ignores it, because the loop's routes subscribe only to
+`pull_request` / `pull_request_review`. `doctor` never pings; `selftest` reads the recorded
+deliveries and pings only with `--ping` (its single GitHub write, e.g.
+`hermes review-loop selftest --loop name --no-model --ping --admin-token LOGIN`).
 
 `set` is how you change the knobs after install — `--reviewer-concurrency`, `--fixer-concurrency`,
 `--concurrency` (the default for both seats), `--cap`, `--clone`, `--base`, `--grace-min`,

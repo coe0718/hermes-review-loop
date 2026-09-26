@@ -1215,6 +1215,9 @@ def cmd_init(args) -> int:
         print(f"  {line}")
     if not args.hooks:
         print("  (repo hooks not created — pass --hooks, or add them by hand with the route URLs)")
+    # Armed at birth: prove the secret now, as `arm` does, rather than at the first real event.
+    pinged = (_ping_loop_hooks(loop, args.admin_token)
+              if args.hooks and getattr(args, "arm", False) else True)
     schedule_lines, scheduled = (_install_schedule(loop, args.schedule, args.watchdog_deliver)
                                  if args.schedule else ([], True))
     for line in schedule_lines:
@@ -1224,6 +1227,10 @@ def cmd_init(args) -> int:
         # install script's `init && ...` does not read a missing watchdog as success.
         print("\ninit INCOMPLETE: the watchdog job was not scheduled — run the command above, "
               f"then `hermes review-loop doctor --loop {loop['id']}`")
+        return 1
+    if not pinged:
+        print(f"\ninit INCOMPLETE: a hook's ping was rejected — see the ❌ line above, then "
+              f"`hermes review-loop doctor --loop {loop['id']}`")
         return 1
     # The seats never hold a GitHub token: every write goes through the host broker with the token
     # files mapped above, so a GH_TOKEN in a seat profile's .env is only an extra copy to leak.
@@ -1939,7 +1946,8 @@ def cmd_selftest(args) -> int:
         print(f"cannot selftest loop: {doctor._safe_report_text(str(exc))}")
         return 2
     return selftest.run(loop, pr=args.pr, model=not args.no_model, live_turn=args.live_turn,
-                        timeout=args.timeout)
+                        timeout=args.timeout, ping=getattr(args, "ping", False),
+                        ping_login=getattr(args, "admin_token", "") or None)
 
 
 def cmd_models(args) -> int:
@@ -2001,6 +2009,28 @@ def cmd_models(args) -> int:
     return 0
 
 
+def _ping_loop_hooks(loop: dict, login: str | None) -> bool:
+    """After arming: ping each of the loop's hooks and report how the gateway answered.
+
+    An active hook whose secret the route does not hold looks armed and wakes nothing; this is
+    the moment to find out. False only on a ping the gateway rejected or one that could not be
+    sent — no delivery seen within the bounded wait is a warning, not a verdict.
+    """
+    from . import hook_ping
+    hooks, error = _loop_hooks(loop, login)
+    if hooks is None:
+        print(f"[{loop['id']}] ⚠️ hooks not pinged: cannot read the repo's hooks ({error})")
+        return True
+    ok = True
+    for hook in sorted(hooks, key=lambda item: item["id"]):
+        status, line = hook_ping.ping(loop, hook["id"], login)
+        for part in line.split("\n"):
+            print(f"[{loop['id']}] {part}")
+        if status in (hook_ping.REJECTED, hook_ping.ERROR) and not line.startswith("⚠️"):
+            ok = False
+    return ok
+
+
 def cmd_arm(args) -> int:
     """Arm or pause loops by flipping their repo hooks; exit 1 unless GitHub confirms every one."""
     try:
@@ -2018,6 +2048,8 @@ def cmd_arm(args) -> int:
         for line in lines:
             print(f"[{loop['id']}] {line}")
         if not ok:
+            failed.append(loop["id"])
+        elif not args.pause and not _ping_loop_hooks(loop, args.admin_token):
             failed.append(loop["id"])
     if failed:
         print(f"{'pause' if args.pause else 'arm'} NOT confirmed for: {', '.join(failed)} "
@@ -2391,6 +2423,11 @@ def register_cli(ctx, settings: dict | None = None) -> None:
         check.add_argument("--live-turn", action="store_true",
                            help="with --pr: run one real isolated reviewer turn whose verdict is "
                                 "printed and never posted")
+        check.add_argument("--ping", action="store_true",
+                           help="ask GitHub to ping each loop hook and report whether the gateway "
+                                "accepted its signature (the selftest's only GitHub write)")
+        check.add_argument("--admin-token", default="",
+                           help="login whose token may ping hooks (admin:repo_hook or repo)")
         check.add_argument("--timeout", type=int, default=600,
                            help="live turn budget in seconds (default 600; the production worker uses its own child_timeout)")
         check.set_defaults(func=cmd_selftest)

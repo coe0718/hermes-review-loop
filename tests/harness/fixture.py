@@ -128,7 +128,21 @@ hook_deliveries = re.search(r"/hooks/(\\d+)/deliveries", path)
 if method != "GET" and ("/hooks" in path) and os.environ.get("GH_LOGIN", "") in world.get("hook_write_denied", []):
     sys.stderr.write("HTTP 403 Resource not accessible by personal access token")
     sys.exit(1)
-if hook_deliveries:
+hook_ping = re.search(r"/hooks/(\\d+)/pings$", path)
+if hook_ping and method == "POST":
+    # GitHub signs and sends a `ping`; its delivery lands in the hook's log with the status the
+    # gateway answered (world "ping_status" per hook id, default 200). "ping_silent" records none.
+    hid = hook_ping.group(1)
+    world.setdefault("pings", []).append(int(hid))
+    if not world.get("ping_silent"):
+        log = world.setdefault("deliveries", {}).setdefault(hid, [])
+        world["next_delivery_id"] = world.get("next_delivery_id", 5000) + 1
+        log.insert(0, {"id": world["next_delivery_id"], "event": "ping",
+                       "status_code": (world.get("ping_status") or {}).get(hid, 200),
+                       "delivered_at": "2026-09-26T12:00:%02dZ" % (world["next_delivery_id"] % 60)})
+    open(os.environ["GH_WORLD"], "w").write(json.dumps(world))
+    print("null")
+elif hook_deliveries:
     # GitHub's recent-delivery log for a hook; none recorded reads as an empty list.
     print(json.dumps((world.get("deliveries") or {}).get(hook_deliveries.group(1), [])))
 elif method == "POST" and path.endswith("/hooks"):

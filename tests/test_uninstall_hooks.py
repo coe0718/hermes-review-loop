@@ -6,6 +6,7 @@ scheduler is the harness's fake ``hermes`` — no test here can reach a real rep
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import pathlib
@@ -408,6 +409,88 @@ class DoctorDeliveriesTest(Base):
         check = self.check("not a list")
         self.assertEqual(check.status, doctor.UNKNOWN)
         self.assertIn("deliveries", check.detail)
+
+
+class PingTest(Base):
+    """`arm` proves each hook's secret with a GitHub ping; a ping itself never starts anything."""
+
+    def setUp(self):
+        super().setUp()
+        from review_loop import hook_ping
+        self.hook_ping = hook_ping
+        self.fresh_install()
+        self.ids = sorted(hook["id"] for hook in self.hooks())
+
+    def test_arm_pings_every_loop_hook_and_reports_the_signature_accepted(self):
+        rc, out = self.cli("arm", "--loop", "widgets")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(sorted(json.loads(t.WORLD_FILE.read_text())["pings"]), self.ids)
+        for hook_id in self.ids:
+            self.assertIn(f"hook {hook_id}: ping answered HTTP 200 — signature accepted", out)
+
+    def test_a_rejected_ping_fails_arm_with_the_fix(self):
+        self.world(ping_status={str(self.ids[0]): 401})
+        rc, out = self.cli("arm", "--loop", "widgets")
+        self.assertEqual(rc, 1, out)
+        self.assertIn(f"hook {self.ids[0]}: ping answered HTTP 401 — signature rejected", out)
+        self.assertIn("uninstall --loop widgets", out)
+        self.assertIn(f"hook {self.ids[1]}: ping answered HTTP 200", out)
+
+    def test_no_delivery_within_the_wait_is_a_warning_not_a_pass(self):
+        self.world(ping_silent=True)
+        wait = self.hook_ping.PING_WAIT
+        self.hook_ping.PING_WAIT = 0.2
+        self.addCleanup(setattr, self.hook_ping, "PING_WAIT", wait)
+        rc, out = self.cli("arm", "--loop", "widgets")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("no ping delivery seen within 0.2s", out)
+        self.assertNotIn("signature accepted", out)
+
+    def test_init_arm_pings_the_hooks_it_created(self):
+        rc, out = self.cli("uninstall", "--loop", "widgets")
+        self.assertEqual(rc, 0, out)
+        self.world(ping_status={str(self.ids[-1] + 1): 401})
+        rc, out = self.init("--hooks", "--arm")
+        self.assertEqual(rc, 1, out)
+        self.assertIn(f"hook {self.ids[-1] + 1}: ping answered HTTP 401", out)
+        self.assertIn("init INCOMPLETE", out)
+
+    def test_pause_sends_no_ping(self):
+        self.cli("arm", "--loop", "widgets")
+        self.world(pings=[])
+        rc, out = self.cli("arm", "--loop", "widgets", "--pause")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(json.loads(t.WORLD_FILE.read_text())["pings"], [])
+
+    def test_the_gates_treat_a_ping_as_a_no_op(self):
+        payload = {"zen": "Keep it logically awesome.", "hook_id": self.ids[0],
+                   "hook": {"id": self.ids[0], "type": "Repository", "events": ["pull_request"]},
+                   "repository": {"full_name": t.REPO}, "sender": {"login": "owner"}}
+        state_before = sorted(str(p.relative_to(t.STATE_DIR)) for p in t.STATE_DIR.rglob("*"))
+        for script in ("gate_reviewer.py", "gate_fixer.py"):
+            kind, out, err = t.run(script, payload)
+            self.assertEqual(kind, "SILENT", (script, out, err))
+            self.assertNotIn("Traceback", err)
+        state_after = sorted(str(p.relative_to(t.STATE_DIR)) for p in t.STATE_DIR.rglob("*"))
+        self.assertEqual([p for p in state_after if "pending" in p or "queue" in p],
+                         [p for p in state_before if "pending" in p or "queue" in p])
+
+    def test_selftest_reads_evidence_and_pings_only_when_asked(self):
+        from review_loop import selftest
+        loop = config.load_id("widgets")
+        report = selftest.Report(out=io.StringIO())
+        with selftest.github_read_only():
+            selftest.check_hook_signatures(report, loop, ping=False)
+        self.assertEqual(json.loads(t.WORLD_FILE.read_text()).get("pings", []), [])
+        self.assertEqual({r[2] for r in report.results}, {selftest.WARN})
+        self.assertIn("unproven", report.out.getvalue())
+        report = selftest.Report(out=io.StringIO())
+        selftest.check_hook_signatures(report, loop, ping=True, login=t.FIXER)
+        self.assertEqual({r[2] for r in report.results}, {selftest.PASS})
+        self.assertEqual(sorted(json.loads(t.WORLD_FILE.read_text())["pings"]), self.ids)
+        report = selftest.Report(out=io.StringIO())
+        selftest.check_hook_signatures(report, loop, ping=False)
+        self.assertEqual({r[2] for r in report.results}, {selftest.PASS})
 
 
 class ConfigErrorTest(Base):
