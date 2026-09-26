@@ -43,3 +43,40 @@ jobs:
       - name: Boundary tests, second pass (scheduled only)
         if: github.event_name == 'schedule'
         run: python -m unittest discover -s tests -p 'test_*.py'
+
+  # Hermes blocks an install whose scan verdict is "dangerous", and --force cannot override it
+  # (#37: the plugin passed every test here and still could not be installed). Scan each change
+  # with the same scanner, pinned to the Hermes commit the loop is verified against; the scheduled
+  # run also scans with Hermes main, so a stricter upstream scanner shows up before an update does.
+  plugin-guard:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        hermes: [pinned, main]
+    env:
+      # Bump deliberately with the Hermes version the loop runs on.
+      HERMES_PINNED: f84db42a32b28a00a2ef1e11e5471a27d22cc37f
+    steps:
+      - name: Skip Hermes main outside the scheduled run
+        if: matrix.hermes == 'main' && github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+        run: echo "Hermes main is scanned on the weekly schedule only."
+      - uses: actions/checkout@v4
+        if: matrix.hermes == 'pinned' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        with:
+          path: plugin
+      - uses: actions/checkout@v4
+        if: matrix.hermes == 'pinned' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ matrix.hermes == 'pinned' && env.HERMES_PINNED || 'main' }}
+          path: hermes
+          sparse-checkout: tools
+          fetch-depth: 1
+      - uses: actions/setup-python@v5
+        if: matrix.hermes == 'pinned' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        with:
+          python-version: "3.13"
+      - name: Scan the plugin as `hermes plugins install` would
+        if: matrix.hermes == 'pinned' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        run: python plugin/.github/scripts/plugin_guard.py hermes plugin
