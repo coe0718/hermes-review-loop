@@ -848,7 +848,7 @@ def check_hook(loop: dict, hooks: list, seat: str, name: str, url: str) -> Check
                   event in (hook.get("events") or [])), None) or (candidates[0] if candidates else None)
     if match is None:
         return Check(f"hook:{name}", ABSENT, "no repo hook posts to [webhook URL redacted]",
-                     f"re-run init --hooks --admin-token <login> (needs hook write access on "
+                     f"re-run init --hooks --admin-token <login> (needs hook write and delete access on "
                      f"{loop['repo']}: `repo`, or the narrower `admin:repo_hook`), or add the hook by "
                      f"hand with that URL and the route's secret")
     hook_id = match.get("id")

@@ -172,11 +172,15 @@ broker refuses any path under `.github/`, along with `.gitmodules`, `.gitattribu
 `CODEOWNERS`, before it invokes git at all. Workflow edits are always a human's, made with a
 credential that has `workflow`.
 
-Creating the repo's hooks (`init` with `--hooks`, or `apply`) needs hook *write* access, which
-a classic `repo` token already has: `admin:repo_hook` is the narrower hooks-only scope, not an extra
-requirement on top of `repo`. An owner's fine-grained reader token needs `repository_hooks: write`
-to create them, so either widen that file once or create the hooks with the owner's classic
-credential.
+Creating the repo's hooks (`init` with `--hooks`, or `apply`) needs hook *write* **and delete**
+access, which a classic `repo` token already has: `admin:repo_hook` is the narrower hooks-only
+scope, not an extra requirement on top of `repo`. It is `admin:repo_hook` and not the narrower still
+`write:repo_hook` because a failed install rolls back: `init --hooks` deletes the hooks it already
+created and re-reads the listing to confirm they are gone (`_install_hooks` in `review_loop/cli.py`),
+so a write-only token turns a partial failure into an orphaned hook and a `ROLLBACK FAILED` report.
+An owner's fine-grained reader token needs `repository_hooks: write` to create them — that permission
+offers only read and write, so `write` is what covers the rollback — so either widen that file once
+or create the hooks with the owner's classic credential.
 
 ## Preflight: `doctor`
 
