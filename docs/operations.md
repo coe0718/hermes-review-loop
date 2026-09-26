@@ -19,7 +19,9 @@ running loop.
 1. one loop config — `~/.hermes/review-loops.d/<id>.json`
 2. three webhook routes — `<id>-review`, `<id>-fix`, `<id>-breach` — into the gateway's own
    `webhook_subscriptions.json` (generated prompts, generated secrets, file left at 0600)
-3. two GitHub hooks, on `pull_request` and `pull_request_review`, pointing at those routes
+3. two GitHub hooks, on `pull_request` and `pull_request_review`, pointing at those routes —
+   created **paused**, so nothing fires until `arm` (after `doctor` and `selftest`); `--arm` creates
+   them live instead
 4. one cron job plus a 5-line shim in `~/.hermes/scripts/` that forwards to the plugin's watchdog
 
 Route edits are serialized only among cooperating review-loop plugin processes, using a sibling
@@ -63,9 +65,9 @@ hermes review-loop apply --loop name    # push those defaults onto an existing l
 hermes review-loop apply --loop name --while-busy     # rebind even while a seat has a run out
 hermes review-loop set --loop name --reviewer-concurrency 2   # two reviews at once, one fix at a time
 hermes review-loop arm --loop name      # arm/pause by flipping the repo hooks
-hermes review-loop pause --loop name
+hermes review-loop arm --loop name --pause
 hermes review-loop drain --loop name --seat reviewer
-hermes review-loop cleanup --loop name --sweep --dry-run
+hermes review-loop cleanup --loop name --dry-run   # every closed PR; --pr N for one
 hermes review-loop uninstall --loop name
 ```
 

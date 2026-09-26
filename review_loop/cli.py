@@ -419,7 +419,7 @@ def _observer_args(args, loop_id: str) -> dict:
 
 
 
-def _install_hooks(loop: dict, token_login: str | None) -> list[str]:
+def _install_hooks(loop: dict, token_login: str | None, active: bool = False) -> list[str]:
     """Create the two repo hooks via the API. Needs hook write access on the repo: classic ``repo``,
     or the narrower ``admin:repo_hook``."""
     names = _routes_of(loop)
@@ -437,7 +437,9 @@ def _install_hooks(loop: dict, token_login: str | None) -> list[str]:
     created = []
     try:
         for event, url, secret in hooks:
-            body = {"name": "web", "active": True, "events": [event],
+            # Created paused unless the operator asked for --arm: a loop goes live with `arm`,
+            # after `doctor` and `selftest` pass, never as a side effect of writing its config.
+            body = {"name": "web", "active": active, "events": [event],
                     "config": {"url": url, "content_type": "json", "secret": secret,
                                "insecure_ssl": "0"}}
             result = gh.api(loop, f"/repos/{loop['repo']}/hooks", method="POST", body=body,
@@ -445,7 +447,8 @@ def _install_hooks(loop: dict, token_login: str | None) -> list[str]:
             if not isinstance(result, dict) or not isinstance(result.get("id"), int):
                 raise config.ConfigError(f"hook creation not confirmed for {url}")
             created.append(result["id"])
-        return [f"hook {id} → {url}" for id, (_, url, _) in zip(created, hooks)]
+        state = "armed" if active else "paused"
+        return [f"hook {id} → {url} ({state})" for id, (_, url, _) in zip(created, hooks)]
     except Exception as exc:
         failures = []
         # A lost POST response may still have created a hook: compare with the baseline.
@@ -658,6 +661,9 @@ def cmd_init(args) -> int:
     form happens to hold. Everything is validated (profiles, allowlists, credentials, route
     ownership) before the first file is written.
     """
+    if getattr(args, "arm", False) and not args.hooks:
+        print("--arm arms the repo hooks init creates; it needs --hooks")
+        return 2
     d = config.settings_defaults(_SETTINGS)
     tokens = {}
     for pair in args.token or []:
@@ -783,7 +789,8 @@ def cmd_init(args) -> int:
         for name in _routes_of(loop).values():
             print(f"  would write route: {name}")
         if args.hooks:
-            print("  would create the two repo hooks (pull_request, pull_request_review)")
+            print("  would create the two repo hooks (pull_request, pull_request_review), "
+                  + ("armed (--arm)" if getattr(args, "arm", False) else "paused until `arm`"))
         if args.schedule:
             print(f"  would install the watchdog cron job ({args.schedule})")
         if loop.get("observer", {}).get("route"):
@@ -834,7 +841,8 @@ def cmd_init(args) -> int:
     for name in written_routes:
         print(f"route written: {name}")
     try:
-        hook_lines = _install_hooks(loop, args.admin_token) if args.hooks else []
+        hook_lines = (_install_hooks(loop, args.admin_token, active=bool(getattr(args, "arm", False)))
+                      if args.hooks else [])
     except Exception as exc:
         failed = []
         try:
@@ -864,9 +872,22 @@ def cmd_init(args) -> int:
         print("  (repo hooks not created — pass --hooks, or add them by hand with the route URLs)")
     for line in _install_schedule(loop, args.schedule, args.watchdog_deliver) if args.schedule else []:
         print(f"  {line}")
-    print("\nNext: give each seat's profile the token it needs ("
-          "GH_TOKEN in the profile .env for git push, plus the token file named here), then "
-          "`hermes review-loop status`.")
+    # The seats never hold a GitHub token: every write goes through the host broker with the token
+    # files mapped above, so a GH_TOKEN in a seat profile's .env is only an extra copy to leak.
+    lid = loop["id"]
+    steps = [f"create the runtime file {config.home() / 'review-loop-runtime.json'} "
+             "(docs/configuration.md; selftest names anything missing)",
+             f"hermes review-loop doctor --loop {lid}",
+             f"hermes review-loop selftest --loop {lid} --no-model, then --pr N, then --pr N --live-turn"]
+    if args.hooks and not getattr(args, "arm", False):
+        steps.append(f"hermes review-loop arm --loop {lid}   (the hooks were created paused)")
+    elif args.hooks:
+        steps.append("the hooks are ARMED: until the runtime file exists every turn is held")
+    print("\nNext:")
+    for n, step in enumerate(steps, 1):
+        print(f"  {n}. {step}")
+    print("  Seat tokens live only in the token files mapped above; a seat profile needs no "
+          "GH_TOKEN.")
     return 0
 
 
@@ -1665,7 +1686,8 @@ def cmd_uninstall(args) -> int:
             path.unlink()
             print(f"config removed: {path}")
     print("GitHub hooks and the cron job are NOT removed automatically:")
-    print(f"  hooks: hermes review-loop arm --loop {loop['id']}  # to pause them first")
+    print(f"  hooks: hermes review-loop arm --loop {loop['id']} --pause  # stops deliveries; "
+          "delete them on GitHub to remove them")
     print("  cron:  hermes cron list | grep review-loop-watchdog && hermes cron remove <id>")
     return 0
 
@@ -1770,7 +1792,10 @@ def register_cli(ctx, settings: dict | None = None) -> None:
                           help="how long a run may hold its seat slot")
         init.add_argument("--inflight-ttl-min", type=int, default=d["inflight_ttl_min"],
                           help="how long an in-flight mark blocks a second run at the same head")
-        init.add_argument("--hooks", action="store_true", help="create the GitHub hooks too")
+        init.add_argument("--hooks", action="store_true",
+                          help="create the GitHub hooks too, paused until `arm`")
+        init.add_argument("--arm", action="store_true",
+                          help="with --hooks: create them armed (live at once) instead of paused")
         init.add_argument("--admin-token", default="", help="login whose token can create hooks")
         init.add_argument("--schedule", default="", help="e.g. 15m — install the watchdog cron job")
         init.add_argument("--watchdog-deliver", default="local", help="cron delivery target for watchdog alerts")
