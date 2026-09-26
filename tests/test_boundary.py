@@ -3,6 +3,7 @@
 The bwrap probe does NOT prove an entire Hermes agent is contained: no agent is
 launched by this plugin. It validates a feasible isolated compiler mount layout.
 """
+import _home_guard  # noqa: F401  first import: temp HOME/HERMES_HOME (tests/_home_guard.py)
 import json
 import os
 import pathlib
@@ -115,8 +116,7 @@ class BoundaryTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("bwrap"), "bubblewrap unavailable")
     def test_credentialless_rust_namespace_probe(self):
-        toolchains = pathlib.Path.home() / ".rustup/toolchains"
-        stable = toolchains / "stable-x86_64-unknown-linux-gnu"
+        stable = _home_guard.RUST
         if not (stable / "bin/cargo").exists():
             self.skipTest("stable Rust toolchain unavailable")
         workspace = self.root / "work"
@@ -152,7 +152,7 @@ subprocess.run(["cargo", "test", "--offline"], cwd="/work", check=True)
                "--ro-bind", str(probe), "/probe.py", "--setenv", "HOME", "/tmp",
                "--setenv", "CARGO_HOME", "/tmp/cargo", "--setenv", "RUSTUP_HOME", "/tmp/rustup",
                "--setenv", "HOST_PAT", str(secret),
-               "--setenv", "HOST_ENV", str(pathlib.Path.home() / ".hermes/.env"),
+               "--setenv", "HOST_ENV", str(_home_guard.USER_HOME / ".hermes/.env"),
                "--setenv", "PATH", "/opt/rust/bin:/usr/bin:/bin", "--chdir", "/work",
                "--", "/usr/bin/python3", "/probe.py"]
         result = subprocess.run(cmd, text=True, capture_output=True, timeout=120,

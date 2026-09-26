@@ -1,4 +1,5 @@
 """Real SQLite operator outbox and no-replay recovery tests."""
+import _home_guard  # noqa: F401  first import: temp HOME/HERMES_HOME (tests/_home_guard.py)
 import json
 import os
 from pathlib import Path

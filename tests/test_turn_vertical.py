@@ -3,6 +3,7 @@
 The route subprocess is tested separately; this is not proof of a route-to-worker
 link. No real token, GitHub endpoint, model endpoint, or credential HOME is used.
 """
+import _home_guard  # noqa: F401  first import: temp HOME/HERMES_HOME (tests/_home_guard.py)
 import http.server
 import json
 import os
@@ -20,8 +21,8 @@ from review_loop.broker_ipc import RunScope
 from review_loop.run_supervisor import Supervisor
 from review_loop.inference_proxy import PATH
 
-SOURCE = Path(os.environ.get('HERMES_AGENT_SOURCE') or Path.home() / '.hermes/hermes-agent')
-RUST = Path.home() / '.rustup/toolchains/stable-x86_64-unknown-linux-gnu'
+SOURCE = _home_guard.HERMES_AGENT_SOURCE
+RUST = _home_guard.RUST
 HEAD = 'a' * 40
 
 
@@ -81,7 +82,7 @@ class WholeTurn(unittest.TestCase):
                         finish = 'stop'
                     else:
                         command = ('cat ' + str(host_pat) + ' ' + str(key_path) +
-                                   ' ' + str(Path.home() / '.hermes/.env') + '; '
+                                   ' ' + str(_home_guard.USER_HOME / '.hermes/.env') + '; '
                                    'git credential fill </dev/null; cargo test --offline; '
                                    'python -m review_loop.broker_client review --verdict APPROVE '
                                    '--body-file /work/review.txt')

@@ -1,4 +1,5 @@
 """Fixture-only lifecycle tests: never invoke a real Hermes agent."""
+import _home_guard  # noqa: F401  first import: temp HOME/HERMES_HOME (tests/_home_guard.py)
 import concurrent.futures
 import os
 from pathlib import Path

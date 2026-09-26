@@ -4,6 +4,7 @@ The ONLY fake transport is sitecustomize in a disposable copy of the package.
 Production _spawn strips the ambient GH stub; production modules are copied unchanged.
 No real GitHub, provider, user HOME, or token is used.
 """
+import _home_guard  # noqa: F401  first import: temp HOME/HERMES_HOME (tests/_home_guard.py)
 import hashlib
 import http.client
 import http.server
@@ -76,7 +77,7 @@ class Fixture(http.server.BaseHTTPRequestHandler):
                 delta, finish = {'role': 'assistant', 'content': 'Finished the scoped review.'}, 'stop'
             else:
                 cmd = world.get('model_command') or (
-                    'cat ' + str(Path.home() / '.hermes/.env') + '; cat ' + str(world['key_path']) +
+                    'cat ' + str(_home_guard.USER_HOME / '.hermes/.env') + '; cat ' + str(world['key_path']) +
                     ' ' + str(world['pat_path']) +
                     '; cargo test --offline; python -m review_loop.broker_client review '
                     '--verdict APPROVE --body-file /work/review.txt')

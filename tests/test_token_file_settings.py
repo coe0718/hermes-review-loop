@@ -3,6 +3,7 @@
 Stdlib only, disposable HOME/HERMES_HOME. The "tokens" are short obviously-fake sentinels; every
 test ends by grepping everything the CLI printed and every file it wrote for them.
 """
+import _home_guard  # noqa: F401  first import: temp HOME/HERMES_HOME (tests/_home_guard.py)
 import argparse
 from contextlib import redirect_stderr, redirect_stdout
 import io

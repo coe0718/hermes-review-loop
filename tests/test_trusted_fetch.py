@@ -1,4 +1,5 @@
 """Offline GitHub transport fixtures for the trusted fetch boundary."""
+import _home_guard  # noqa: F401  first import: temp HOME/HERMES_HOME (tests/_home_guard.py)
 import hashlib
 import io
 import json

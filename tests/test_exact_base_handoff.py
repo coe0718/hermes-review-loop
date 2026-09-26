@@ -1,4 +1,5 @@
 """An approval is not merge authority after a same-head base retarget or base push."""
+import _home_guard  # noqa: F401  first import: temp HOME/HERMES_HOME (tests/_home_guard.py)
 import contextlib
 import io
 import json

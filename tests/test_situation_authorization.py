@@ -1,4 +1,5 @@
 """Fail-closed stacked approval tests; no GitHub network or live Hermes home."""
+import _home_guard  # noqa: F401  first import: temp HOME/HERMES_HOME (tests/_home_guard.py)
 import pathlib
 import json
 import tempfile

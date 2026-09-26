@@ -1,4 +1,5 @@
 """Executable integration proof: the real Hermes process and tool dispatcher in bwrap."""
+import _home_guard  # noqa: F401  first import: temp HOME/HERMES_HOME (tests/_home_guard.py)
 import json
 import os
 from pathlib import Path
@@ -11,7 +12,7 @@ from unittest import mock
 
 from review_loop import contained
 
-SOURCE = Path(os.environ.get('HERMES_AGENT_SOURCE') or Path.home() / '.hermes/hermes-agent')
+SOURCE = _home_guard.HERMES_AGENT_SOURCE
 
 
 class WholeAgentFixture(unittest.TestCase):
@@ -70,11 +71,11 @@ memory:
             pat.write_text('HOST_DUMMY_PAT_SENTINEL')
             key = root / 'host-dummy.model-key'
             key.write_text('HOST_DUMMY_MODEL_KEY_SENTINEL')
-            (home / 'host-paths.json').write_text(json.dumps([str(pat), str(key), str(Path.home() / '.hermes/.env')]))
+            (home / 'host-paths.json').write_text(json.dumps([str(pat), str(key), str(_home_guard.USER_HOME / '.hermes/.env')]))
             venv = SOURCE / 'venv'
             # Derive the generation directory from the absolute venv Python symlink.
             runtime = Path(os.readlink(venv / 'bin/python')).parents[2]
-            rust = Path.home() / '.rustup/toolchains/stable-x86_64-unknown-linux-gnu'
+            rust = _home_guard.RUST
             if not (rust / 'bin/cargo').exists():
                 self.skipTest('offline stable Rust toolchain unavailable')
             result = contained.run(code=code, venv=venv, runtime=runtime,
