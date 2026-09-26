@@ -54,7 +54,35 @@ See [Preflight](architecture.md#preflight-can-this-installation-run) and, for ex
 | `cooldown_h` | `6` | repeat suppression per stall |
 | `ttl_min` | `45` | seat-lock lifetime; past this a crashed run has lost its seat |
 | `inflight_ttl_min` | `10` | how long a same-head burst is considered already handled |
+| `turn_budget_s` | `900` | wall-clock seconds one isolated seat turn may run — read the PR, build, run tests, submit. See [Turn budget](#turn-budget-how-long-one-turn-may-run). Plugin setting `turn_budget_s`; `init`/`set --turn-budget N` |
+| `seats.<seat>.turn_budget_s` | loop default | this seat's own budget (`reviewer`, `fixer`, `adjudicator`), overriding `turn_budget_s`. `init`/`set --reviewer-turn-budget N` / `--fixer-turn-budget N`; the adjudicator's is set in the file |
 | `observer` | `{}` | the read-only observer feed. `{}` means no feed, and the loop is untouched by its absence — see [The observer feed](#the-observer-feed) |
+
+## Turn budget: how long one turn may run
+
+Every isolated seat turn (reviewer, fixer, adjudicator) runs against one wall clock, in seconds,
+60–14400, default **900**:
+
+- it is Hermes's `--run-budget`: at 80% Hermes tells the agent to wrap up, and its last request is
+  capped to the budget;
+- the sandbox is SIGKILLed 30 s after it (a grace so Hermes's own clean stop wins the race);
+- a broker request already in flight when the sandbox dies — a push is several GitHub calls plus a
+  git fetch and push — is let finish (up to 600 s) rather than abandoned, so a kill mid-push
+  resolves the push instead of leaving its intent open and quarantining the run as uncertain.
+  The worker's ledger heartbeat keeps the run's lease alive the whole time, however long the
+  budget: a healthy long turn is never swept as lost.
+
+The gate records the budget on the run's ledger row when it enqueues the turn, so whichever worker
+claims it (a worker spawned by another loop's event included) runs it on this loop's terms; a
+`set` changes turns enqueued after it. `status` and `doctor` print each seat's budget, and
+`doctor` warns (⚠️) when a budget is longer than `grace_min`, since the watchdog could then call a
+healthy long turn a stall. A turn killed at its budget fails with
+`isolated turn failed: TimeoutExpired — killed at the Ns turn budget`, visible in the run ledger's
+`status`. `selftest --live-turn` runs for the loop's reviewer budget unless `--timeout` says
+otherwise, so a passing selftest means the turn fits what production enforces.
+
+Before this setting (issue #49) every production turn got a hard-coded 120 s — too short for any
+review that builds and tests.
 
 ## The observer feed
 

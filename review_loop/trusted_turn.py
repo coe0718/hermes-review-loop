@@ -17,6 +17,16 @@ import tempfile
 
 from . import broker_ipc, contained, gh, inference_proxy, trusted_fetch
 
+# The turn budget is Hermes's own --run-budget: it warns the agent at 80% and caps its last
+# request to the budget. The sandbox is SIGKILLed only this long after, so Hermes's clean stop
+# wins the race instead of a kill landing mid-tool-call (#49).
+KILL_GRACE_S = 30
+# After the sandbox is gone, a broker request already in flight (a push is several GitHub calls
+# plus git fetch/push, each bounded at 90s) is let finish instead of abandoned: abandoning it
+# leaves the push intent unresolved and quarantines the run. The worker's heartbeat keeps the
+# run's lease alive meanwhile. An idle broker stops within its 0.2s accept poll.
+BROKER_DRAIN_S = 600
+
 
 class TurnDenied(Exception):
     pass
@@ -284,7 +294,7 @@ def run_turn(loop: dict, scope: broker_ipc.RunScope, *, source: Path, venv: Path
                     home=home, checkout=checkout, rust=rust, query=query, entry=command,
                     inference_socket_dir=inference.directory,
                     broker_socket_dir=broker.socket_path.parent,
-                    client_code=client.parent, timeout=timeout,
+                    client_code=client.parent, timeout=timeout + KILL_GRACE_S,
                     # A ruling is judgement, not a change: the adjudicator's tree is mounted
                     # read-only so nothing it runs can dress up the head it rules on.
                     checkout_writable=scope.role != 'adjudicator')
@@ -297,6 +307,6 @@ def run_turn(loop: dict, scope: broker_ipc.RunScope, *, source: Path, venv: Path
                 return result.returncode
             finally:
                 broker.close()
-                server.join(timeout=5)
+                server.join(timeout=BROKER_DRAIN_S)
                 if server.is_alive():
                     raise TurnDenied('broker did not shut down')

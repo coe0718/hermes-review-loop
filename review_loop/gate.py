@@ -101,8 +101,11 @@ def enqueue_isolated(loop: dict, seat: str, number: int, head: str, *, turn_key:
     )
     supervisor.recover()
     delivery = f"{loop['repo']}:{number}:{head}:{seat}"
+    # The turn's wall clock rides on the row (#49): whichever worker claims it — possibly one
+    # spawned by another loop's event — runs it for this loop's seat budget, not a worker default.
     supervisor.enqueue(delivery + (f':{turn_key}' if turn_key else ''),
-                       loop["repo"], number, head, seat, turn_key=turn_key)
+                       loop["repo"], number, head, seat, turn_key=turn_key,
+                       budget=config.turn_budget(loop, seat))
 
 
 def block_pr_agent(loop: dict, st: state_mod.LoopState, seat: str,

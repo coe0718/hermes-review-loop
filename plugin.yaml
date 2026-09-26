@@ -61,6 +61,11 @@ config_schema:
     type: int
     default: 10
     description: "Minutes an in-flight mark blocks a second run at the same head"
+  turn_budget_s:
+    label: "Turn budget (seconds)"
+    type: int
+    default: 900
+    description: "Wall-clock seconds one isolated seat turn may run: Hermes's --run-budget, and the sandbox is killed shortly after. A real review builds and tests, so keep it generous (60-14400)"
   host:
     label: "Webhook host"
     type: str

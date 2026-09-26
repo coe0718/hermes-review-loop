@@ -176,6 +176,22 @@ def check_config(loop: dict) -> Check:
                  f"{path} (repo {loop['repo']}, cap {loop['cap']}, base {loop['base']})")
 
 
+def check_turn_budget(loop: dict) -> Check:
+    """The wall clock each isolated seat turn gets (#49) — Hermes's --run-budget and the kill."""
+    seats = ["reviewer", "fixer"] + (["adjudicator"] if (loop.get("adjudicator") or {}).get("route")
+                                     else [])
+    budgets = {seat: config.turn_budget(loop, seat) for seat in seats}
+    detail = " · ".join(f"{seat} {value}s" for seat, value in budgets.items())
+    grace = int(loop.get("grace_min") or 0) * 60
+    if grace and max(budgets.values()) > grace:
+        return Check("turn-budget", UNKNOWN,
+                     f"{detail} — longer than the {loop['grace_min']}m watchdog grace, so a "
+                     "healthy long turn can be reported as a stall",
+                     f"raise --grace-min above {-(-max(budgets.values()) // 60)} or lower the "
+                     "turn budget (`hermes review-loop set`)")
+    return Check("turn-budget", VERIFIED, f"{detail} per isolated turn (sandbox killed past it)")
+
+
 def _check_profile(name: str, seat: str) -> Check:
     if not name:
         return Check(f"profile:{seat}", ABSENT, "no profile named for this seat",
@@ -899,7 +915,7 @@ def _safe_report_text(text: str) -> str:
 def check_loop(loop: dict, offline: bool = False) -> list[Check]:
     """Every check, in the order an operator reads an install: what it is, who runs it, what
     wakes it, what schedules it, and where it works."""
-    checks = [check_config(loop)]
+    checks = [check_config(loop), check_turn_budget(loop)]
     for seat in ("reviewer", "fixer"):
         checks.append(check_profile(loop, seat))
         checks.append(check_credential(loop, seat))

@@ -751,12 +751,17 @@ def cmd_init(args) -> int:
                                            / (args.id or args.repo.split("/")[-1])),
         "host": args.host, "grace_min": args.grace_min,
         "ttl_min": args.ttl_min, "inflight_ttl_min": args.inflight_ttl_min,
+        "turn_budget_s": getattr(args, "turn_budget", None),
         "observer": _observer_args(args, args.id or args.repo.split("/")[-1]),
     }
     # A seat-level capacity wins over the loop default, so only write it when it was asked for.
     for seat, value in (("reviewer", args.reviewer_concurrency), ("fixer", args.fixer_concurrency)):
         if value is not None:
             raw["seats"][seat]["concurrency"] = value
+    for seat, value in (("reviewer", getattr(args, "reviewer_turn_budget", None)),
+                         ("fixer", getattr(args, "fixer_turn_budget", None))):
+        if value is not None:
+            raw["seats"][seat]["turn_budget_s"] = value
     names = routes_for(raw)
     raw["seats"]["reviewer"]["route"] = names["reviewer"]
     raw["seats"]["fixer"]["route"] = names["fixer"]
@@ -908,7 +913,8 @@ def cmd_set(args) -> int:
     wanted = {"concurrency": args.concurrency, "cap": args.cap, "base": args.base,
               "clone": args.clone, "grace_min": args.grace_min,
               "marker_grace_min": args.marker_grace_min, "ttl_min": args.ttl_min,
-              "inflight_ttl_min": args.inflight_ttl_min, "host": args.host}
+              "inflight_ttl_min": args.inflight_ttl_min, "host": args.host,
+              "turn_budget_s": getattr(args, "turn_budget", None)}
     changes = {k: v for k, v in wanted.items()
                if v is not None and v != "" and v != loop.get(k)}
 
@@ -958,6 +964,12 @@ def cmd_set(args) -> int:
         if value is not None and value != config.seat_concurrency(loop, seat):
             seats[seat]["concurrency"] = value
             seat_changes[seat] = value
+    budget_changes = {}
+    for seat, value in (("reviewer", getattr(args, "reviewer_turn_budget", None)),
+                         ("fixer", getattr(args, "fixer_turn_budget", None))):
+        if value is not None and value != (seats[seat].get("turn_budget_s")):
+            budget_changes[seat] = (config.turn_budget(loop, seat), value)
+            seats[seat]["turn_budget_s"] = value
 
     # The observer is a nested block, so it is collected the same way the seats are: flags the
     # operator did not pass leave the existing answer alone, and a flag that means "drop it"
@@ -989,10 +1001,11 @@ def cmd_set(args) -> int:
     if args.observer_unmute:
         observer_cfg["mute"] = False
 
-    if (not changes and not seat_changes and not adj_changed
+    if (not changes and not seat_changes and not budget_changes and not adj_changed
             and observer_cfg == (loop.get("observer") or {})):
         print("nothing to change — pass at least one setting "
               "(--concurrency, --reviewer-concurrency, --fixer-concurrency, --cap, --clone, "
+              "--turn-budget, "
               "--observer-profile, ...)")
         return 0
 
@@ -1077,6 +1090,8 @@ def cmd_set(args) -> int:
     for seat, value in seat_changes.items():
         was = config.seat_concurrency(loop, seat)
         print(f"  {seat} concurrency: {was} → {value}  (this seat only)")
+    for seat, (was, value) in budget_changes.items():
+        print(f"  {seat} turn budget: {was}s → {value}s  (this seat only)")
     if adj_after != adj_before:
         shown = adj_after or "(none — rulings go to the operator only)"
         print(f"  adjudicator login: {adj_before or '(none)'} → {shown}")
@@ -1087,6 +1102,16 @@ def cmd_set(args) -> int:
         print(f"  observer: {observer.describe(loop.get('observer') or {})} → "
               f"{observer.describe(updated.get('observer') or {})}")
     print(f"loop config updated: {path}")
+
+    if "turn_budget_s" in changes:
+        for seat in ("reviewer", "fixer"):
+            if (updated["seats"].get(seat) or {}).get("turn_budget_s") is not None:
+                print(f"  note: {seat} has its own turn budget "
+                      f"({updated['seats'][seat]['turn_budget_s']}s) — the loop default does not "
+                      "apply to it")
+    if "turn_budget_s" in changes or budget_changes:
+        print("  turn budget now: " + _budget_line(updated)
+              + "   (queued turns keep the budget they were enqueued with)")
 
     if "concurrency" in changes:
         # Say it out loud, because a loop-wide default that a seat overrides is exactly the kind
@@ -1151,7 +1176,8 @@ def cmd_apply(args) -> int:
         return 2
 
     changes = []
-    for key in ("cap", "base", "host", "grace_min", "ttl_min", "inflight_ttl_min"):
+    for key in ("cap", "base", "host", "grace_min", "ttl_min", "inflight_ttl_min",
+                "turn_budget_s"):
         if updated.get(key) != loop.get(key):
             changes.append((key, loop.get(key), updated.get(key)))
     if (updated.get("clone") or "") != (loop.get("clone") or ""):
@@ -1319,6 +1345,13 @@ def cmd_settings(args) -> int:
     return 0
 
 
+def _budget_line(loop: dict) -> str:
+    """Each seat's turn budget, the way status/doctor/set print it."""
+    seats = ["reviewer", "fixer"] + (["adjudicator"] if (loop.get("adjudicator") or {}).get("route")
+                                     else [])
+    return " · ".join(f"{seat} {config.turn_budget(loop, seat)}s" for seat in seats)
+
+
 def cmd_list(args) -> int:
     loops = config.all_loops()
     if not loops:
@@ -1345,6 +1378,7 @@ def cmd_status(args) -> int:
             + ("" if config.seat_concurrency(loop, seat) > 1 else " (serialized)")
             for seat in ("reviewer", "fixer")))
         print(f"  clone:      {loop['clone'] or '(none)'}")
+        print(f"  turn:       {_budget_line(loop)} per turn (killed past it)")
         print("  fixer push: " + ("ENABLED — operator accepted PR-metadata/ref race"
                                   if config.unattended_fixer_push_enabled(loop)
                                   else "off (unattended pushes disabled)"))
@@ -1509,7 +1543,7 @@ def cmd_selftest(args) -> int:
     if args.live_turn and args.no_model:
         print("--live-turn needs the model; drop --no-model")
         return 2
-    if args.timeout < 1:
+    if getattr(args, "timeout", None) is not None and args.timeout < 1:
         print("--timeout must be positive")
         return 2
     try:
@@ -1517,8 +1551,11 @@ def cmd_selftest(args) -> int:
     except config.ConfigError as exc:
         print(f"cannot selftest loop: {doctor._safe_report_text(str(exc))}")
         return 2
+    # Default to what production gives the reviewer seat, so a passing selftest proves the turn
+    # fits the budget the unattended worker will actually enforce (#49).
     return selftest.run(loop, pr=args.pr, model=not args.no_model, live_turn=args.live_turn,
-                        timeout=args.timeout)
+                        timeout=(args.timeout if getattr(args, "timeout", None) is not None
+                                 else config.turn_budget(loop, "reviewer")))
 
 
 def cmd_models(args) -> int:
@@ -1792,6 +1829,13 @@ def register_cli(ctx, settings: dict | None = None) -> None:
                           help="how long a run may hold its seat slot")
         init.add_argument("--inflight-ttl-min", type=int, default=d["inflight_ttl_min"],
                           help="how long an in-flight mark blocks a second run at the same head")
+        init.add_argument("--turn-budget", type=int, default=d["turn_budget_s"],
+                          help="seconds one isolated seat turn may run, build and tests included "
+                               f"(default {d['turn_budget_s']}; the sandbox is killed past it)")
+        init.add_argument("--reviewer-turn-budget", type=int, default=None,
+                          help="the reviewer seat's own turn budget in seconds (overrides --turn-budget)")
+        init.add_argument("--fixer-turn-budget", type=int, default=None,
+                          help="the fixer seat's own turn budget in seconds (overrides --turn-budget)")
         init.add_argument("--hooks", action="store_true",
                           help="create the GitHub hooks too, paused until `arm`")
         init.add_argument("--arm", action="store_true",
@@ -1835,8 +1879,9 @@ def register_cli(ctx, settings: dict | None = None) -> None:
         check.add_argument("--live-turn", action="store_true",
                            help="with --pr: run one real isolated reviewer turn whose verdict is "
                                 "printed and never posted")
-        check.add_argument("--timeout", type=int, default=600,
-                           help="live turn budget in seconds (default 600; the production worker uses its own child_timeout)")
+        check.add_argument("--timeout", type=int, default=None,
+                           help="live turn budget in seconds (default: the loop's reviewer "
+                                "turn_budget_s — the budget the production worker enforces)")
         check.set_defaults(func=cmd_selftest)
 
         models = sub.add_parser("models", help="Read-only: list the models a seat's Hermes "
@@ -1863,6 +1908,12 @@ def register_cli(ctx, settings: dict | None = None) -> None:
         change.add_argument("--marker-grace-min", type=int)
         change.add_argument("--ttl-min", type=int, help="how long a run may hold its slot")
         change.add_argument("--inflight-ttl-min", type=int)
+        change.add_argument("--turn-budget", type=int,
+                            help="seconds one isolated seat turn may run (loop default)")
+        change.add_argument("--reviewer-turn-budget", type=int, default=None,
+                            help="the reviewer seat's own turn budget in seconds")
+        change.add_argument("--fixer-turn-budget", type=int, default=None,
+                            help="the fixer seat's own turn budget in seconds")
         change.add_argument("--host", help="gateway webhook host")
         change.add_argument("--adjudicator-login", default=None,
                             help="optional fourth GitHub account the ruling is also posted as; "

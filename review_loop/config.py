@@ -33,7 +33,7 @@ File shape (all keys except ``repo`` have defaults)::
       "clone": "~/projects/attest",
       "roots": ["~/reviews", "~/.hermes/cache/scratch"],
       "grace_min": 25, "marker_grace_min": 60, "cooldown_h": 6,
-      "ttl_min": 45, "inflight_ttl_min": 10
+      "ttl_min": 45, "inflight_ttl_min": 10, "turn_budget_s": 900
     }
 
 ``config.py`` is deliberately strict: a loop that cannot be resolved to a repository,
@@ -85,6 +85,11 @@ SETTINGS_SCHEMA: dict = {
     "inflight_ttl_min": {"label": "In-flight mark TTL (minutes)", "type": "int", "default": 10,
                          "description": "Minutes an in-flight mark blocks a second run at the "
                                         "same head"},
+    "turn_budget_s": {"label": "Turn budget (seconds)", "type": "int", "default": 900,
+                      "description": "Wall-clock seconds one isolated seat turn may run: Hermes's "
+                                     "--run-budget, and the sandbox is killed shortly after. A "
+                                     "real review builds and tests, so keep it generous "
+                                     "(60-14400)"},
     "host": {"label": "Webhook host", "type": "str", "default": "",
              "description": "Your gateway's public webhook origin (required to create GitHub hooks)"},
     "reviewer_profile": {"label": "Reviewer's Hermes profile", "type": "str", "default": "",
@@ -197,7 +202,8 @@ def apply_settings(loop_raw: dict, settings: dict | None) -> dict:
     host = d["host"] or loop_raw.get("host") or ""
     overlaid = {**loop_raw, "cap": d["cap"], "clone": clone, "base": d["base"],
                 "host": host, "grace_min": d["grace_min"], "ttl_min": d["ttl_min"],
-                "inflight_ttl_min": d["inflight_ttl_min"], "seats": seats}
+                "inflight_ttl_min": d["inflight_ttl_min"], "turn_budget_s": d["turn_budget_s"],
+                "seats": seats}
     # Seat identity rides the same push: the form names who serves each seat, and a blank field
     # stays blank rather than unsetting what the loop already answered for itself.
     return apply_seats(overlaid, settings)
@@ -422,6 +428,7 @@ DEFAULTS: dict = {
     "cooldown_h": 6,
     "ttl_min": 45,            # seat lock lifetime: past this a crashed run has lost its seat
     "inflight_ttl_min": 10,
+    "turn_budget_s": 900,     # wall clock for one isolated seat turn (seats.<seat>.turn_budget_s wins)
     "host": "",
     "unattended_fixer_push": False,  # per-repository; never inherited from plugin settings
 }
@@ -435,6 +442,39 @@ def unattended_fixer_push_enabled(loop: dict) -> bool:
     return isinstance(loop, dict) and loop.get("unattended_fixer_push") is True
 
 SEAT_KEYS = ("reviewer", "fixer")
+
+# One isolated turn's wall clock, in seconds. It is Hermes's ``--run-budget`` and (plus a short
+# grace) the sandbox kill deadline. A real review reads the diff, builds and runs tests: two
+# minutes (the old hard-coded worker value) cannot fit that, and a kill mid-push quarantines the run.
+DEFAULT_TURN_BUDGET_S = 900
+TURN_BUDGET_RANGE = (60, 14400)
+
+
+def turn_budget(loop: dict, seat: str) -> int:
+    """Seconds one isolated ``seat`` turn may run: the seat's own value, else the loop's.
+
+    Tolerates an un-normalized loop dict (the worker and tests read raw configs): a missing value
+    is the default, never zero. ``normalize`` is where a bad value is refused.
+    """
+    seat_cfg = (loop.get("seats") or {}).get(seat) or {}
+    value = seat_cfg.get("turn_budget_s")
+    if value is None or value == "":
+        value = loop.get("turn_budget_s")
+    if value is None or value == "":
+        value = DEFAULT_TURN_BUDGET_S
+    return int(value)
+
+
+def _check_budget(value, what: str, where: str) -> int:
+    low, high = TURN_BUDGET_RANGE
+    try:
+        budget = int(value)
+    except (TypeError, ValueError):
+        raise ConfigError(f"{where}: {what} must be whole seconds, got {value!r}") from None
+    if isinstance(value, bool) or not low <= budget <= high:
+        raise ConfigError(f"{where}: {what} must be {low}-{high} seconds, got {value!r} — it is "
+                          "the whole wall clock of one seat turn (build and tests included)")
+    return budget
 
 
 def seat_concurrency(loop: dict, seat: str) -> int:
@@ -474,9 +514,13 @@ def _adjudicator_seat(raw, loop: dict, where: str) -> dict:
     """
     if raw is None or raw == {}:
         return {}
-    if not isinstance(raw, dict) or not set(raw) <= {"login", "concurrency"}:
-        raise ConfigError(f"{where}: seats.adjudicator may only hold 'login' and 'concurrency'")
+    if not isinstance(raw, dict) or not set(raw) <= {"login", "concurrency", "turn_budget_s"}:
+        raise ConfigError(f"{where}: seats.adjudicator may only hold 'login', 'concurrency' and "
+                          "'turn_budget_s'")
     seat: dict = {}
+    if raw.get("turn_budget_s") not in (None, ""):
+        seat["turn_budget_s"] = _check_budget(raw["turn_budget_s"],
+                                              "seats.adjudicator.turn_budget_s", where)
     if raw.get("concurrency") not in (None, ""):
         seat["concurrency"] = int(raw["concurrency"])
         if seat["concurrency"] < 1:
@@ -901,6 +945,14 @@ def normalize(raw: dict, source: pathlib.Path | None = None) -> dict:
         seats[seat]["concurrency"] = int(raw)
         if seats[seat]["concurrency"] < 1:
             raise ConfigError(f"{where}: seats.{seat}.concurrency must be >= 1 (1 = serialized)")
+
+    loop["turn_budget_s"] = _check_budget(
+        DEFAULT_TURN_BUDGET_S if loop.get("turn_budget_s") in (None, "") else loop["turn_budget_s"],
+        "'turn_budget_s'", where)
+    for seat in SEAT_KEYS:
+        if seats[seat].get("turn_budget_s") not in (None, ""):
+            seats[seat]["turn_budget_s"] = _check_budget(
+                seats[seat]["turn_budget_s"], f"seats.{seat}.turn_budget_s", where)
 
     if not loop.get("clone"):
         # Above one run at once, isolation is not a preference: without a clone to isolate from,

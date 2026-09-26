@@ -19,6 +19,8 @@ import time
 import uuid
 from contextlib import nullcontext
 
+from .config import DEFAULT_TURN_BUDGET_S
+
 SILENT = "[SILENT]"
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -208,7 +210,7 @@ def isolated_prompt(loop: dict, row, reviews, marker=None) -> str:
 class Supervisor:
     def __init__(self, db: str | Path, *, fixture_command: list[str] | None = None,
                  fixture_mode: bool = False, capacity: dict[str, int] | None = None,
-                 lease_seconds: float = 60, child_timeout: float = 120,
+                 lease_seconds: float = 60, child_timeout: float = DEFAULT_TURN_BUDGET_S,
                  production_config: str | Path | None = None,
                  hermes_home: str | Path | None = None):
         if fixture_mode and production_config is not None:
@@ -250,6 +252,10 @@ class Supervisor:
                 con.execute('ALTER TABLE runs ADD COLUMN push_intent REAL')
             if 'push_confirmed' not in {r[1] for r in con.execute('PRAGMA table_info(runs)')}:
                 con.execute('ALTER TABLE runs ADD COLUMN push_confirmed REAL')
+            if 'budget' not in {r[1] for r in con.execute('PRAGMA table_info(runs)')}:
+                # The turn's wall clock, fixed at enqueue (#49). NULL on legacy rows: the worker's
+                # own child_timeout applies to them.
+                con.execute('ALTER TABLE runs ADD COLUMN budget REAL')
             con.execute('COMMIT')
 
     def _connect(self):
@@ -269,7 +275,7 @@ class Supervisor:
         """Read-only, bounded operator view; no lease or worker is altered."""
         with self._connect() as con:
             return [dict(row) for row in con.execute(
-                "SELECT r.id,r.repo,r.pr,r.head,r.seat,r.state,r.pid,r.error,"
+                "SELECT r.id,r.repo,r.pr,r.head,r.seat,r.state,r.pid,r.error,r.budget,"
                 "r.outcome,n.state AS notice FROM runs r LEFT JOIN operator_notices n "
                 "ON n.run_id=r.id WHERE r.state IN ('failed','uncertain') "
                 "ORDER BY r.created,r.id LIMIT 100")]
@@ -514,8 +520,17 @@ class Supervisor:
         return count
 
     def enqueue(self, delivery: str, repo: str, pr: int, head: str, seat: str,
-                *, turn_key: str = '') -> str:
-        """Commit identity before any spawn. A repeated delivery cannot change terms."""
+                *, turn_key: str = '', budget: float | None = None) -> str:
+        """Commit identity before any spawn. A repeated delivery cannot change terms.
+
+        ``budget`` is this turn's wall clock in seconds (the loop's per-seat ``turn_budget_s``),
+        recorded on the row so whichever worker claims it runs it on the loop's terms; ``None``
+        means this supervisor's ``child_timeout``.
+        """
+        if budget is None:
+            budget = self.child_timeout
+        if isinstance(budget, bool) or not isinstance(budget, (int, float)) or not budget > 0:
+            raise ValueError("positive turn budget required")
         if not all(isinstance(v, str) and v and len(v) <= 256 for v in
                    (delivery, repo, head, seat)) or not isinstance(turn_key, str) or len(turn_key) > 256 or type(pr) is not int or pr <= 0:
             raise ValueError("invalid run identity")
@@ -541,10 +556,11 @@ class Supervisor:
                 prior = con.execute("SELECT * FROM runs WHERE repo=? AND pr=? AND head=? AND seat=? AND turn_key=?",
                                     (repo, pr, head, seat, turn_key)).fetchone()
                 if not prior:
-                    con.execute("INSERT INTO runs(id,delivery,repo,pr,head,seat,turn_key,state,created,updated,push_admitted) "
-                                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    con.execute("INSERT INTO runs(id,delivery,repo,pr,head,seat,turn_key,state,created,updated,push_admitted,budget) "
+                                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                                 (uuid.uuid4().hex, delivery, repo, pr, head, seat, turn_key,
-                                 "pending" if self.fixture_mode or self.production_config else "blocked", now, now, admitted))
+                                 "pending" if self.fixture_mode or self.production_config else "blocked", now, now, admitted,
+                                 float(budget)))
             con.execute("COMMIT")
         # A redelivery of an unclaimed run must rearm the worker after a
         # transient generation/read outage; active or completed runs stay deduped.
@@ -778,16 +794,23 @@ class Supervisor:
             con.execute('COMMIT')
             return True
 
+    def budget_of(self, run_id: str) -> float:
+        """The row's own turn budget; a legacy row without one gets this worker's child_timeout."""
+        with self._connect() as con:
+            row = con.execute("SELECT budget FROM runs WHERE id=?", (run_id,)).fetchone()
+        return float(row['budget']) if row is not None and row['budget'] else float(self.child_timeout)
+
     def _run_one(self):
         claim = self._claim()
         if not claim:
             return
         run_id, owner = claim
+        budget = self.budget_of(run_id)
         with self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
             con.execute("UPDATE runs SET state='launching', launch_intent=?, lease=?, "
                         "updated=? WHERE id=? AND owner=? AND state='claimed'",
-                        (time.time(), time.time() + self.child_timeout + self.lease_seconds,
+                        (time.time(), time.time() + budget + self.lease_seconds,
                          time.time(), run_id, owner))
             con.execute("COMMIT")
         # From here onward recovery must NEVER launch this job again.
@@ -799,13 +822,14 @@ class Supervisor:
             if self.production_config is not None:
                 self._run_production(run_id, owner)
                 return
-            self._run_fixture(run_id, owner)
+            self._run_fixture(run_id, owner, budget)
         finally:
             heartbeat_stop.set()
             heartbeat.join(timeout=2)
 
-    def _run_fixture(self, run_id: str, owner: str) -> None:
+    def _run_fixture(self, run_id: str, owner: str, budget: float | None = None) -> None:
         assert self.fixture_command is not None
+        budget = self.child_timeout if budget is None else budget
         child = None
         rc = None
         error = None
@@ -813,7 +837,9 @@ class Supervisor:
         try:
             child = subprocess.Popen(self.fixture_command,
                                      env={"PATH": "/usr/bin:/bin", "HOME": os.environ["HOME"],
-                                          "HERMES_HOME": os.environ["HERMES_HOME"]},
+                                          "HERMES_HOME": os.environ["HERMES_HOME"],
+                                          # What the production turn hands Hermes as --run-budget.
+                                          "REVIEW_LOOP_TURN_BUDGET": str(int(budget))},
                                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL, close_fds=True,
                                      start_new_session=True)
@@ -822,7 +848,7 @@ class Supervisor:
                             "WHERE id=? AND owner=? AND state='launching'",
                             (child.pid, time.time() + self.lease_seconds, time.time(), run_id, owner))
             try:
-                rc = child.wait(timeout=self.child_timeout)
+                rc = child.wait(timeout=budget)
             except subprocess.TimeoutExpired:
                 os.killpg(child.pid, signal.SIGKILL)
                 child.wait()
@@ -846,6 +872,7 @@ class Supervisor:
         """Worker-only host control plane; never pass credentials to bwrap."""
         from . import broker_ipc, config, gh, seat_model, trusted_turn
         rc, error = None, None
+        budget = int(self.budget_of(run_id))
         try:
             assert self.production_config is not None
             try:
@@ -914,8 +941,12 @@ class Supervisor:
                   key=inference.key, model=inference.model,
                   api_mode=inference.api_mode, credential=inference.credential_provider(),
                   proxy_model=inference.proxy_model, client_identity=inference.client_identity,
-                  prompt=prompt, timeout=int(self.child_timeout),
+                  prompt=prompt, timeout=budget,
                   work_root=Path(loop["state_dir"]) / "isolated-runs")
+        except subprocess.TimeoutExpired:
+            # Name the clock: an opaque "TimeoutExpired" hides that a setting killed the turn.
+            error = (f"isolated turn failed: TimeoutExpired — killed at the {budget}s turn budget "
+                     "(raise turn_budget_s)")
         except Exception as exc:
             error = f"isolated turn failed: {type(exc).__name__}"
         finally:

@@ -48,7 +48,9 @@ from . import config, doctor, gh
 PASS, FAIL, WARN, SKIP = "pass", "fail", "warn", "skip"
 MARKS = {PASS: "✅", FAIL: "❌", WARN: "⚠️ ", SKIP: "⏭️ "}
 RUNTIME_KEYS = ("source", "venv", "runtime", "rust")   # required; the model comes from each seat
-DEFAULT_TIMEOUT = 600  # a real review routinely outlasts a two-minute budget
+# No selftest-only budget: the live turn runs for the loop's reviewer ``turn_budget_s``, the same
+# clock the production worker enforces, so a pass here means the turn fits in production (#49).
+DEFAULT_TIMEOUT = None
 
 
 class WriteBlocked(RuntimeError):
@@ -883,8 +885,10 @@ def run_live_turn(report: Report, loop: dict, settings: dict | None, pr: dict | 
         report.add(step, "turn:reviewer", FAIL,
                    f"turn did not finish with a verdict ({error or f'rc={rc}'})"
                    + ("; last output: " + " | ".join(t[:120] for t in tail) if tail else ""),
-                   f"raise --timeout (now {timeout}s) if it timed out; otherwise read the output "
-                   "above — the production worker runs the same turn")
+                   f"if it timed out ({timeout}s), production would kill it too: raise the "
+                   f"budget with `hermes review-loop set --loop {loop['id']} "
+                   "--reviewer-turn-budget N`; otherwise read the output above — the production "
+                   "worker runs the same turn")
         return
     if not submissions[-1].get("authorized"):
         report.add(step, "turn:reviewer", FAIL, "the agent's verdict would have been denied",
@@ -897,9 +901,14 @@ def run_live_turn(report: Report, loop: dict, settings: dict | None, pr: dict | 
 # -- driver ------------------------------------------------------------------------------------
 
 def run(loop: dict, *, pr: int | None = None, model: bool = True, live_turn: bool = False,
-        timeout: int = DEFAULT_TIMEOUT, out=None, runtime_file: Path | None = None,
+        timeout: int | None = DEFAULT_TIMEOUT, out=None, runtime_file: Path | None = None,
         resolver=None) -> int:
-    """Run every step; return 1 when any check failed, else 0."""
+    """Run every step; return 1 when any check failed, else 0.
+
+    ``timeout`` defaults to the loop's reviewer turn budget — what production gives the turn.
+    """
+    if timeout is None:
+        timeout = config.turn_budget(loop, "reviewer")
     runtime_file = Path(runtime_file or runtime_path())
     redact = Redactor()
     for raw in (loop.get("tokens") or {}).values():

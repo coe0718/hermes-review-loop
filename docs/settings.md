@@ -33,6 +33,7 @@ The plugin declares a `config_schema`, so it has a settings form at
 | `grace_min` | 25 | quiet minutes before the watchdog speaks |
 | `ttl_min` | 45 | how long a seat slot survives a run that died without a verdict |
 | `inflight_ttl_min` | 10 | how long a mark blocks a second run at the same head |
+| `turn_budget_s` | 900 | seconds one isolated seat turn may run (Hermes's `--run-budget`; the sandbox is killed shortly after) |
 | `host` | unset | your gateway's webhook origin; required for `init`, or supply `--host` |
 
 The form shows friendly labels (`Reviews at once`, `Reviewer's Hermes profile`, `Clone path

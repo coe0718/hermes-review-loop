@@ -64,6 +64,7 @@ hermes review-loop init --repo owner/name --dry-run   # preview a loop: seats, r
 hermes review-loop apply --loop name    # push those defaults onto an existing loop (--dry-run)
 hermes review-loop apply --loop name --while-busy     # rebind even while a seat has a run out
 hermes review-loop set --loop name --reviewer-concurrency 2   # two reviews at once, one fix at a time
+hermes review-loop set --loop name --fixer-turn-budget 1800   # let a fix run (build + tests) for 30 minutes
 hermes review-loop arm --loop name      # arm/pause by flipping the repo hooks
 hermes review-loop arm --loop name --pause
 hermes review-loop drain --loop name --seat reviewer
@@ -73,7 +74,8 @@ hermes review-loop uninstall --loop name
 
 `set` is how you change the knobs after install — `--reviewer-concurrency`, `--fixer-concurrency`,
 `--concurrency` (the default for both seats), `--cap`, `--clone`, `--base`, `--grace-min`,
-`--ttl-min` — through the same validation `init` uses, so a capacity above 1 without a clone is
+`--ttl-min`, `--turn-budget` (and per seat `--reviewer-turn-budget` / `--fixer-turn-budget`) —
+through the same validation `init` uses, so a capacity above 1 without a clone is
 refused here exactly as it is at init. Prompts are rendered from the payload at fire time, so a
 change takes effect on the next event with nothing to re-install. The observer feed is changed the
 same way: `--observer-profile`, `--observer-route`, `--observer-deliver`, `--observer-events`,
@@ -228,6 +230,7 @@ A correct installation:
 $ hermes review-loop doctor --loop widgets
 [widgets] acme/widgets — preflight (read-only: it writes nothing and fires nothing)
   ✅ config               doctor-demo/loops/widgets.json (repo acme/widgets, cap 3, base main)
+  ✅ turn-budget          reviewer 900s · fixer 900s · adjudicator 900s per isolated turn (sandbox killed past it)
   ✅ profile:reviewer     reviewer-profile → doctor-demo/hermes-home/profiles/reviewer-profile
   ✅ credential:reviewer  rev-coach → a nonempty token file (identity and API access not checked)
   ✅ profile:fixer        fixer-profile → doctor-demo/hermes-home/profiles/fixer-profile
@@ -248,7 +251,7 @@ $ hermes review-loop doctor --loop widgets
   ✅ hook:widgets-review  hook 41 → http://127.0.0.1:43651/p/reviewer-profile/webhooks/widgets-review (pull_request, active)
   ✅ hook:widgets-fix     hook 42 → http://127.0.0.1:43651/p/fixer-profile/webhooks/widgets-fix (pull_request_review, active)
 
-widgets: 20 verified, 0 failed, 0 unknown (of 20 checks)
+widgets: 21 verified, 0 failed, 0 unknown (of 21 checks)
   every check passed — this loop can wake a seat and post a verdict.
 ```
 
@@ -258,6 +261,7 @@ and the same loop with six of the ways it really breaks:
 $ hermes review-loop doctor --loop widgets
 [widgets] acme/widgets — preflight (read-only: it writes nothing and fires nothing)
   ✅ config               doctor-demo/loops/widgets.json (repo acme/widgets, cap 3, base main)
+  ✅ turn-budget          reviewer 900s · fixer 900s · adjudicator 900s per isolated turn (sandbox killed past it)
   ✅ profile:reviewer     reviewer-profile → doctor-demo/hermes-home/profiles/reviewer-profile
   ✅ credential:reviewer  rev-coach → a nonempty token file (identity and API access not checked)
   ❌ profile:fixer        no profile home at doctor-demo/hermes-home/profiles/fixer-profile
@@ -283,7 +287,7 @@ $ hermes review-loop doctor --loop widgets
   ✅ gateway              127.0.0.1:43651 accepts a connection
   ⚠️ hooks                could not read /repos/acme/widgets/hooks — nothing was proved about 2 hook(s) (a token without hook read access — `repo`, or the narrower `read:repo_hook` — reads as denied)
 
-widgets: 12 verified, 6 failed, 1 unknown (of 19 checks)
+widgets: 13 verified, 6 failed, 1 unknown (of 20 checks)
   6 failed: profile:fixer, token:dev-fixer, route:widgets-review, route:widgets-fix, cron:shim, cron:job — fix the ❌ lines above before this loop is armed.
 ```
 
@@ -329,7 +333,7 @@ python -m review_loop.run_supervisor status ~/.hermes/state/review-loop-runs.sql
 | 4 identities | read, reviewer, fixer (and optional adjudicator) PATs resolve via `/user` to the expected logins and distinct principals; the repo is readable |
 | 5 authorization | with `--pr N`: the broker's reviewer-write checks (`broker.authorize`, reads only) and the host receipt generation |
 | 6 supervisor | the ledger migrates and `status` reads; the route would accept the runtime file; `doctor`'s state dir, cron shim/job and gateway checks; the observer route |
-| 7 live turn | with `--live-turn --pr N`: a real isolated reviewer turn with the reviewer seat's resolved model (`--timeout`, default 600 s); the verdict and body the agent *would* submit are printed |
+| 7 live turn | with `--live-turn --pr N`: a real isolated reviewer turn with the reviewer seat's resolved model, for the loop's reviewer `turn_budget_s` — the budget production enforces — unless `--timeout N` overrides it; the verdict and body the agent *would* submit are printed |
 
 Example step-1/3 lines for a ChatGPT-subscription reviewer and an API-key fixer:
 
@@ -341,6 +345,10 @@ Example step-1/3 lines for a ChatGPT-subscription reviewer and an API-key fixer:
 
 A subscription seat's step 3 spends a request from **your** plan's usage window (the seat shares
 it with your own use of that account); a 429 there means that window is spent.
+
+A live turn that times out here would be killed in production too: raise the seat's budget
+(`set --reviewer-turn-budget N`, see [Turn budget](configuration.md#turn-budget-how-long-one-turn-may-run))
+rather than only `--timeout`.
 
 The live turn runs in the CLI process, not through the supervisor, so it adds no ledger row and
 raises no operator notice; confirming alerts still needs a real enqueued turn and a watchdog sweep.

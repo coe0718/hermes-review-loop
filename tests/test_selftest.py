@@ -432,7 +432,8 @@ class RegistrationTests(unittest.TestCase):
         captured["setup"](parser)
         args = parser.parse_args(["selftest", "--loop", "demo", "--pr", "7", "--live-turn"])
         self.assertIs(args.func, cli.cmd_selftest)
-        self.assertEqual((args.pr, args.live_turn, args.no_model, args.timeout), (7, True, False, 600))
+        # No selftest-only default: None means "the loop's reviewer turn budget" (#49).
+        self.assertEqual((args.pr, args.live_turn, args.no_model, args.timeout), (7, True, False, None))
         with mock.patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(SystemExit):
             parser.parse_args(["selftest"])  # --loop is required
 
