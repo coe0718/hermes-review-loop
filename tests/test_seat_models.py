@@ -5,6 +5,7 @@ and a fake ``hermes_cli`` package (the same entry points the resolver imports fr
 Hermes source tree) resolves them. The model upstream is never contacted.
 """
 import argparse
+import importlib.util
 import io
 import json
 import os
@@ -105,6 +106,76 @@ def write_profile(home: pathlib.Path, name: str, model: dict, env: dict | None =
     return path
 
 
+def write_yaml_profile(home: pathlib.Path, name: str, model: dict) -> pathlib.Path:
+    """A profile whose config.yaml is YAML — comments and block mappings, as Hermes writes it.
+
+    ``write_profile`` writes JSON, which the fake ``hermes_cli`` reads with ``json.load``. That
+    covers the describe path only for readers that accept JSON, and a suite that never hands the
+    resolver real YAML cannot tell a working reader chain from a broken one (#46).
+    """
+    path = home if name == "default" else home / "profiles" / name
+    path.mkdir(parents=True, exist_ok=True)
+    lines = ["# profile config, as Hermes writes it", "model:", f"  default: {model['default']}"]
+    if model.get("provider"):
+        lines.append(f"  provider: {model['provider']}")
+    (path / "config.yaml").write_text("\n".join(lines) + "\n")
+    return path
+
+
+def block_reader(source: pathlib.Path, reader: str) -> None:
+    """Shadow ``reader`` in the fake Hermes source, so importing it there raises ImportError.
+
+    The resolver's child puts that directory first on ``sys.path``, so a module here wins over
+    anything installed — the same way the interpreter the host picks decides it for real.
+    """
+    if reader == "yaml":
+        (source / "yaml.py").write_text('raise ImportError("no PyYAML in this interpreter")\n')
+        return
+    (source / "ruamel").mkdir(exist_ok=True)
+    (source / "ruamel" / "__init__.py").write_text(
+        'raise ImportError("no ruamel.yaml in this interpreter")\n')
+
+
+def resolver_venv(dest: pathlib.Path) -> str:
+    """A venv whose child can import the YAML readers this interpreter has — and nothing else.
+
+    A bare ``bin/python`` symlink is not a venv — no ``pyvenv.cfg``, no ``site-packages`` — so the
+    child silently resolves its base interpreter's modules instead, and that is where a YAML reader
+    is missing in the first place (#46). Linking the whole site-packages would also make a *real*
+    Hermes importable inside the child, which the tests that simulate a broken install rely on not
+    happening, so only the readers are linked.
+    """
+    import sysconfig
+    (dest / "bin").mkdir(parents=True, exist_ok=True)
+    python = dest / "bin" / "python"
+    if not python.exists():
+        python.symlink_to(sys.executable)
+    (dest / "pyvenv.cfg").write_text(f"home = {pathlib.Path(sys.executable).parent}\n"
+                                     "include-system-site-packages = false\n"
+                                     f"version = {sys.version.split()[0]}\n")
+    packages = dest / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+    packages.mkdir(parents=True, exist_ok=True)
+    for entry in pathlib.Path(sysconfig.get_paths()["purelib"]).iterdir():
+        if entry.name.split(".")[0] in ("yaml", "ruamel") or entry.name.startswith("_yaml"):
+            link = packages / entry.name
+            if not link.exists():
+                link.symlink_to(entry)
+    return str(dest)
+
+
+def _have(module: str) -> bool:
+    """Is ``module`` importable here? ``find_spec`` raises for a dotted name whose parent is
+    missing, which is not the same answer as "not installed"."""
+    try:
+        return importlib.util.find_spec(module) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+HAS_RUAMEL = _have("ruamel.yaml")
+HAS_READER = HAS_RUAMEL or _have("yaml")
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
@@ -119,7 +190,7 @@ class Base(unittest.TestCase):
         venv = self.root / "venv"
         (venv / "bin").mkdir(parents=True)
         (venv / "bin" / "python").symlink_to(sys.executable)
-        self.settings = {"source": str(source), "venv": str(venv),
+        self.settings = {"source": str(source), "venv": resolver_venv(venv),
                          "runtime": str(self.root), "rust": str(self.root)}
         write_profile(self.home, "rev", {"default": "vendor/rev-model", "provider": "openrouter"},
                       {"OPENROUTER_API_KEY": KEYS["rev"]})
@@ -372,6 +443,67 @@ class DoctorAndModels(Base):
         rc, text = self.models(profile="ghost")
         self.assertEqual(rc, 1)
         self.assertIn("does not exist", text)
+
+
+class ReaderChain(Base):
+    """#46: which YAML reader the resolver's interpreter has decides whether a seat can run.
+
+    A packaged install runs Hermes on its own bundled python, which ships neither PyYAML nor
+    ruamel.yaml. The child had one reader and a JSON fallback, so on that interpreter every seat
+    failed with "profile config.yaml unreadable" — for a config that was perfectly fine.
+    """
+
+    def describe(self, profile: str = "rev") -> dict:
+        return seat_model.run_resolver(profile, "describe", self.settings)
+
+    @unittest.skipUnless(HAS_READER, "needs a YAML reader in this interpreter")
+    def test_a_real_yaml_config_is_read(self):
+        write_yaml_profile(self.home, "rev",
+                           {"default": "vendor/rev-model", "provider": "openrouter"})
+        answer = self.describe()
+        self.assertEqual((answer.get("model"), answer.get("requested")),
+                         ("vendor/rev-model", "openrouter"))
+
+    @unittest.skipUnless(HAS_RUAMEL, "needs ruamel.yaml, the reader Hermes itself ships")
+    def test_ruamel_alone_is_enough(self):
+        block_reader(self.root / "hermes-agent", "yaml")
+        write_yaml_profile(self.home, "rev",
+                           {"default": "vendor/rev-model", "provider": "openrouter"})
+        answer = self.describe()
+        self.assertNotIn("error", answer)
+        self.assertEqual(answer.get("model"), "vendor/rev-model")
+
+    def test_no_reader_at_all_names_the_interpreter_not_the_config(self):
+        for reader in ("yaml", "ruamel"):
+            block_reader(self.root / "hermes-agent", reader)
+        write_yaml_profile(self.home, "rev",
+                           {"default": "vendor/rev-model", "provider": "openrouter"})
+        answer = self.describe()
+        self.assertEqual(answer.get("kind"), "interpreter")
+        self.assertIn("no YAML library", str(answer.get("error")))
+        self.assertIn("review-loop-runtime.json", str(answer.get("error")))
+        self.assertNotIn("config.yaml unreadable", str(answer.get("error")))
+
+    def test_a_json_config_still_resolves_with_no_reader(self):
+        for reader in ("yaml", "ruamel"):
+            block_reader(self.root / "hermes-agent", reader)
+        answer = self.describe()                    # the fixture's profiles are JSON documents
+        self.assertEqual(answer.get("model"), "vendor/rev-model")
+
+    def test_doctor_names_the_runtime_file_when_the_interpreter_cannot_read_yaml(self):
+        for reader in ("yaml", "ruamel"):
+            block_reader(self.root / "hermes-agent", reader)
+        # the seat's own config, in the form a reader-less interpreter cannot parse at all
+        write_yaml_profile(self.home, "rev",
+                           {"default": "vendor/rev-model", "provider": "openrouter"})
+        runtime = self.home / "review-loop-runtime.json"
+        runtime.write_text(json.dumps(self.settings))
+        runtime.chmod(0o600)
+        checks = {c.name: c for c in doctor.check_seat_models(self.loop)}
+        self.assertEqual(checks["model:reviewer"].status, doctor.ABSENT)
+        self.assertIn("will be held", checks["model:reviewer"].detail)
+        self.assertIn("review-loop-runtime.json", checks["model:reviewer"].fix)
+        self.assertNotIn("set a supported provider", checks["model:reviewer"].fix)
 
 
 if __name__ == "__main__":

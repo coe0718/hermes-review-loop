@@ -308,16 +308,49 @@ def expiry(runtime, key):
             continue
     return jwt_exp(key)
 
+
+class NoYamlReader(Exception):
+    """No YAML reader in this interpreter: the config cannot be read at all, and calling it
+    "unreadable" would blame a file that is perfectly fine."""
+
+
+def read_config(raw):
+    """Parse a config.yaml with whichever reader this interpreter has.
+
+    Hermes reads its configs with ruamel.yaml, and the interpreter running this check was chosen
+    by the host — on a packaged install that is Hermes's own bundled python, which ships neither
+    PyYAML nor ruamel. Try both readers, then JSON (a JSON config is valid YAML), and when there
+    is no reader at all report *that*: the profile's config being readable is exactly what made
+    this failure look like a corrupt file.
+    """
+    for name in ("yaml", "ruamel.yaml"):
+        try:
+            if name == "yaml":
+                import yaml as module
+                loaded = module.safe_load(raw)
+            else:
+                from ruamel.yaml import YAML
+                loaded = YAML(typ="safe").load(raw)
+        except ImportError:
+            continue
+        return loaded or {}
+    try:
+        return json.loads(raw)
+    except ValueError:
+        raise NoYamlReader("this interpreter (" + sys.executable + ") has no YAML library "
+                           "(looked for yaml and ruamel.yaml), so it cannot read a profile's "
+                           "config at all; name a venv with Hermes's own dependencies in "
+                           "$HERMES_HOME/review-loop-runtime.json (docs/configuration.md)") from None
+
+
 home = os.environ["HERMES_HOME"]
 if mode == "describe":             # read-only: the profile's config, no credential lookup
     try:
         with open(os.path.join(home, "config.yaml"), encoding="utf-8") as handle:
             raw = handle.read()
-        try:
-            import yaml
-            cfg = yaml.safe_load(raw) or {}
-        except ImportError:          # a JSON config is valid YAML; Hermes itself always has yaml
-            cfg = json.loads(raw)
+        cfg = read_config(raw)
+    except NoYamlReader as exc:
+        done(kind="interpreter", error=str(exc))
     except Exception as exc:
         done(kind="config", error="profile config.yaml unreadable (" + text(exc) + ")")
     block = cfg.get("model") if isinstance(cfg, dict) else None
@@ -653,6 +686,9 @@ def resolve_profile(profile: str, seat: str, settings: dict | None, *,
              "credential": f"give profile {profile} its provider login or key (`hermes -p {profile} "
                            "auth`, or its .env), or add a seats override",
              "config": f"repair {config.profile_dir(profile) / 'config.yaml'}",
+             "interpreter": "name a venv with Hermes's own dependencies in the runtime file "
+                            "($HERMES_HOME/review-loop-runtime.json): the interpreter the host "
+                            "picked cannot read YAML, so no profile's model can be resolved",
              "unavailable": "point source/venv in the runtime file at the Hermes install"}
     if answer.get("error"):
         kind = str(answer.get("kind") or "")
@@ -738,6 +774,11 @@ def describe_seat(loop: dict, seat: str, settings: dict | None) -> tuple[str, st
         configured = str(answer.get("api_mode") or "")
         if answer.get("error"):
             reason = f"profile {profile}: {_redact(answer['error'])}"
+            if str(answer.get("kind") or "") == "interpreter":
+                return ("fail", f"{reason}; the {seat} turn will be held",
+                        "name a venv with Hermes's own dependencies in "
+                        f"{config.home() / 'review-loop-runtime.json'} — the interpreter the host "
+                        "picked cannot read YAML at all (docs/configuration.md)")
         elif requested in ("", "auto"):
             reason = f"profile {profile} names no model.provider"
         elif requested in UNSUPPORTED_PROVIDERS:

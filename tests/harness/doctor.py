@@ -95,6 +95,17 @@ def install_doctor_fixture() -> dict:
     return config.load_id("widgets")
 
 
+def seat_config_style() -> str:
+    """``yaml`` or ``json``: what ``write_seat_models`` can hand this interpreter's resolver.
+
+    Seat models are read by a child process running this interpreter, so a reader-less one (a
+    stdlib-only CI image) can only be given JSON. Naming the style keeps that difference visible:
+    JSON-mode coverage is not YAML-mode coverage, which is how #46 hid.
+    """
+    import importlib.util
+    return "yaml" if any(importlib.util.find_spec(m) for m in ("yaml", "ruamel.yaml")) else "json"
+
+
 def write_seat_models() -> list[pathlib.Path]:
     """Give every seat profile — and the runtime home — a model a resolver can report.
 
@@ -103,11 +114,16 @@ def write_seat_models() -> list[pathlib.Path]:
     machine, and not the interpreter a stdlib-only CI image hands you. A fixture that omits it is
     "a complete installation" only in the one mode no user runs.
 
-    JSON is valid YAML, and the reader falls back to json without PyYAML (CI has none).
-    Returns the paths it created, for the caller to remove.
+    The document is real YAML (comments, block mappings) whenever this interpreter can read YAML:
+    a profile's config.yaml looks like that on every machine a user has. Returns the paths it
+    created, for the caller to remove.
     """
     home = TMP / "hermes-home"
-    model = json.dumps({"model": {"default": "test-model", "provider": "openrouter"}}) + "\n"
+    if seat_config_style() == "yaml":
+        model = ("# the profile's config, as Hermes writes it\nmodel:\n"
+                 "  default: test-model\n  provider: openrouter\n")
+    else:
+        model = json.dumps({"model": {"default": "test-model", "provider": "openrouter"}}) + "\n"
     added = []
     for profile in ("reviewer-profile", "fixer-profile"):
         profile_home = home / "profiles" / profile
@@ -119,6 +135,34 @@ def write_seat_models() -> list[pathlib.Path]:
     return added
 
 
+def resolver_venv(dest: pathlib.Path) -> str:
+    """A venv whose child can import the YAML readers this interpreter has — and nothing else.
+
+    A bare ``bin/python`` symlink is not a venv — no ``pyvenv.cfg``, no ``site-packages`` — so the
+    child resolves its base interpreter's modules instead, and that is where a YAML reader is
+    missing in the first place (#46). Without this the whole doctor group runs the resolver in a
+    library-less child, where only JSON profile configs can ever pass. Linking the whole
+    site-packages would also make a *real* Hermes importable inside the child, which the groups
+    that simulate a broken install rely on not happening.
+    """
+    import sysconfig
+    (dest / "bin").mkdir(parents=True, exist_ok=True)
+    python = dest / "bin" / "python"
+    if not python.exists():
+        python.symlink_to(sys.executable)
+    (dest / "pyvenv.cfg").write_text(f"home = {pathlib.Path(sys.executable).parent}\n"
+                                     "include-system-site-packages = false\n"
+                                     f"version = {sys.version.split()[0]}\n")
+    packages = dest / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}" / "site-packages"
+    packages.mkdir(parents=True, exist_ok=True)
+    for entry in pathlib.Path(sysconfig.get_paths()["purelib"]).iterdir():
+        if entry.name.split(".")[0] in ("yaml", "ruamel") or entry.name.startswith("_yaml"):
+            link = packages / entry.name
+            if not link.exists():
+                link.symlink_to(entry)
+    return str(dest)
+
+
 def doctor_runtime_fixture() -> list[pathlib.Path]:
     """A runtime file whose "Hermes" is this interpreter, and a provider in each seat profile.
 
@@ -128,11 +172,8 @@ def doctor_runtime_fixture() -> list[pathlib.Path]:
     import sys
     home = TMP / "hermes-home"
     venv = TMP / "doctor-venv"
-    (venv / "bin").mkdir(parents=True, exist_ok=True)
-    if not (venv / "bin" / "python").exists():
-        (venv / "bin" / "python").symlink_to(sys.executable)
     runtime = home / "review-loop-runtime.json"
-    runtime.write_text(json.dumps({"source": str(TMP), "venv": str(venv),
+    runtime.write_text(json.dumps({"source": str(TMP), "venv": resolver_venv(venv),
                                    "runtime": str(TMP), "rust": str(TMP)}))
     runtime.chmod(0o600)
     return [runtime] + write_seat_models()
@@ -168,6 +209,10 @@ def group_doctor() -> None:
     check("doctor and init agree on the shim name", doctor.SHIM_NAME, cli.SHIM_NAME)
     check("doctor and init agree on the watchdog job name",
           doctor.watchdog_job_name({"id": "x"}), cli.watchdog_job_name({"id": "x"}))
+    import importlib.util as _importlib_util
+    _reader = any(_importlib_util.find_spec(m) for m in ("yaml", "ruamel.yaml"))
+    check("the seat configs match what this interpreter can read",
+          seat_config_style(), "yaml" if _reader else "json")
 
     install_doctor_fixture()
     added = doctor_runtime_fixture()
