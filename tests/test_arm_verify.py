@@ -92,6 +92,11 @@ class ArmVerifyTests(unittest.TestCase):
         self.assertIn("hook 1 is still active, not paused", out)
         self.assertIn("HTTP 403", out)
         self.assertEqual(out.count("--admin-token <owner login>"), 1, out)
+        # On a user-owned repo the reader usually *is* the owner, so "--admin-token <owner>" alone
+        # would name the same read-only file: the fix must say the reader's file needs hook write.
+        self.assertIn("that is the reader's file", out)
+        self.assertIn("if the reader is the owner give that file hook write", out)
+        self.assertIn("`repository_hooks: write`", out)
         self.assertEqual([h["active"] for h in fake.hooks.values()], [True, True, True])
         self.assertNotIn(("PATCH", "/repos/owner/widgets/hooks/3", "reader"), fake.calls)
 
@@ -100,6 +105,8 @@ class ArmVerifyTests(unittest.TestCase):
         rc, out = self.arm(fake, pause=True, admin_token="owner")
         self.assertEqual(rc, 1)
         self.assertIn("'owner'", out)
+        self.assertIn("check that login's token file", out)
+        self.assertNotIn("reader's file", out)
         self.assertIn(("PATCH", "/repos/owner/widgets/hooks/1", "owner"), fake.calls)
 
     def test_accepted_but_unchanged_patch_fails(self):

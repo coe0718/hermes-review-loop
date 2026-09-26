@@ -485,7 +485,28 @@ def _hook_listing(loop: dict, token_login: str | None = None) -> list[dict]:
     return hooks
 
 
-def _hook_write_fix(token_login: str | None, transient: bool = False) -> str:
+def hook_write_need(loop: dict, token_login: str | None) -> str:
+    """Which login's file creates, arms and pauses this loop's hooks, and what it must carry.
+
+    ``init --hooks`` and ``arm`` act as ``--admin-token``'s login, else as the reader. The reader
+    is the one role that can hold a read-only token — and on a user-owned repo it is usually the
+    owner, the only account that can manage hooks at all — so say which case this is.
+    """
+    reader = str(loop.get("read_token") or "")
+    login = token_login or reader
+    need = (f"the token for {login!r} needs hook write access on {loop.get('repo')} (classic `repo` or "
+            "`admin:repo_hook`, or fine-grained `repository_hooks: write`)")
+    if login and login.lower() == reader.lower():
+        need += (" — that is the reader's file. On a user-owned repo only the owner can manage "
+                 "hooks, so if the reader is the owner give that file hook write; otherwise pass "
+                 "--admin-token <owner login> (a login mapped with its own --token at init)")
+    else:
+        need += " — check that login's token file"
+    return need
+
+
+def _hook_write_fix(token_login: str | None, transient: bool = False,
+                    loop: dict | None = None) -> str:
     """What to do when a hook read or write failed with the token ``arm`` used.
 
     ``transient`` is for failures that were neither a refusal nor a write that did not stick (a
@@ -493,12 +514,8 @@ def _hook_write_fix(token_login: str | None, transient: bool = False) -> str:
     """
     if transient:
         return ("retry `arm`; if it fails again, check the repo's webhooks on GitHub — "
-                + _hook_write_fix(token_login))
-    if token_login:
-        return (f"the token for {token_login!r} needs hook access on the repo (classic `repo`, "
-                "or `admin:repo_hook`) — check that login's token file")
-    return ("the loop's read token cannot manage repo hooks (by design it is read-only): re-run "
-            "with --admin-token <owner login>, a login whose token file has `admin:repo_hook`")
+                + _hook_write_fix(token_login, loop=loop))
+    return hook_write_need(loop or {}, token_login)
 
 
 def _set_hooks(loop: dict, active: bool, token_login: str | None) -> tuple[list[str], bool]:
@@ -516,7 +533,8 @@ def _set_hooks(loop: dict, active: bool, token_login: str | None) -> tuple[list[
     try:
         hooks = _hook_listing(loop, token_login)
     except config.ConfigError as exc:
-        return [f"could not read the repo's hooks: {exc}", f"  fix: {_hook_write_fix(token_login)}"], False
+        return [f"could not read the repo's hooks: {exc}",
+                f"  fix: {_hook_write_fix(token_login, loop=loop)}"], False
     out, ok, errors = [], True, []
     found = False
     for hook in hooks:
@@ -555,7 +573,7 @@ def _set_hooks(loop: dict, active: bool, token_login: str | None) -> tuple[list[
         # GitHub answers 404 to a token that may not see hooks, so 404 counts as a refusal too.
         refused = any(e == "refused" or any(f"HTTP {code}" in e for code in (401, 403, 404))
                       for e in errors)
-        out.append(f"fix: {_hook_write_fix(token_login, transient=not refused)}")
+        out.append(f"fix: {_hook_write_fix(token_login, transient=not refused, loop=loop)}")
     return out, ok
 
 
