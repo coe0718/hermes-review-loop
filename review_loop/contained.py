@@ -57,6 +57,28 @@ MAX_CAPTURE = 256 * 1024
 IGNORED_SIZE_OVERRIDES: list[tuple[str, str, str]] = []
 
 
+def _note_ignored_override(name: str, raw: str, why: str) -> None:
+    """Record a refusal for ``name``, replacing any earlier one.
+
+    One entry per name, not an ever-growing log: a name that is still broken must not be reported
+    twice, and a long-lived supervisor must not accumulate entries for the life of the process.
+    """
+    IGNORED_SIZE_OVERRIDES[:] = [o for o in IGNORED_SIZE_OVERRIDES if o[0] != name]
+    IGNORED_SIZE_OVERRIDES.append((name, raw, why))
+
+
+def live_ignored_overrides() -> list[tuple[str, str, str]]:
+    """The refusals that are still true in *this* environment.
+
+    A refusal matters while the bad value is still set, and stops mattering the moment it is gone:
+    a caller that provoked one (a test, a probe, an operator who has since fixed the value) must
+    not inherit a permanent failure, and a green install must not stay red for a value that was
+    corrected — this record is process-wide and the resolution is read once per process.
+    """
+    return [o for o in IGNORED_SIZE_OVERRIDES
+            if os.environ.get(f"REVIEW_LOOP_{o[0]}_GIB", "").strip() == o[1]]
+
+
 def _size_from_env(name: str, gib: int) -> int:
     """A mount bound, overridable with ``REVIEW_LOOP_<NAME>_GIB``.
 
@@ -74,7 +96,7 @@ def _size_from_env(name: str, gib: int) -> int:
         if raw:
             print(f"contained: ignoring REVIEW_LOOP_{name}_GIB={raw!r} ({exc}); using {gib} GiB",
                   file=sys.stderr)
-            IGNORED_SIZE_OVERRIDES.append((name, raw, str(exc)))
+            _note_ignored_override(name, raw, str(exc))
         value = gib
     return value * 1024 ** 3
 

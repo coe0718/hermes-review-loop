@@ -765,9 +765,10 @@ def check_sandbox_caps(loop: dict) -> Check:
     worst = per_turn * turns
     detail = (f"/work {_gib(contained.CHECKOUT_SIZE)} + /tmp {_gib(contained.SCRATCH_SIZE)}"
               f" = {_gib(per_turn)} per turn, {_gib(worst)} at {turns} concurrent turns")
-    if contained.IGNORED_SIZE_OVERRIDES:
+    refused_overrides = contained.live_ignored_overrides()
+    if refused_overrides:
         refused = ", ".join(f"REVIEW_LOOP_{name}_GIB={raw!r} ({why})"
-                            for name, raw, why in contained.IGNORED_SIZE_OVERRIDES)
+                            for name, raw, why in refused_overrides)
         return Check("sandbox:caps", MISMATCH, f"{detail} — with an override refused: {refused}",
                      "fix the value (an integer 1..1024 GiB) and restart the gateway: the launcher "
                      "reads it once, when the supervisor imports it")

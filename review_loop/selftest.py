@@ -805,7 +805,7 @@ def check_build_fits(report: Report, loop: dict, number: int | None) -> None:
     from . import contained
     step = "sandbox"
     caps = (f"/work {_gib(contained.CHECKOUT_SIZE)}, /tmp {_gib(contained.SCRATCH_SIZE)}")
-    for name, raw, why in contained.IGNORED_SIZE_OVERRIDES:
+    for name, raw, why in contained.live_ignored_overrides():
         report.add(step, f"sandbox:override:{name}", FAIL,
                    f"REVIEW_LOOP_{name}_GIB={raw!r} was refused ({why}); the default is in force",
                    "fix the value: an integer 1..1024 GiB")

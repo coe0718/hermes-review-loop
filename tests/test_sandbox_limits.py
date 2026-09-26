@@ -237,6 +237,24 @@ class SandboxLimitTests(unittest.TestCase):
         with mock.patch.dict("os.environ", {"REVIEW_LOOP_CHECKOUT_SIZE_GIB": "0"}):
             self.assertEqual(contained._size_from_env("CHECKOUT_SIZE", 8), 8 * 1024 ** 3)
 
+    def test_a_refusal_stops_being_reported_once_the_value_is_gone(self):
+        """The record is process-wide: a refusal must not outlive the bad value that caused it.
+
+        A malformed override provoked by one test used to leave every later selftest in the same
+        process refusing to call itself green, and the record grew one entry per resolution.
+        """
+        from review_loop import contained
+        with mock.patch.dict("os.environ", {"REVIEW_LOOP_CHECKOUT_SIZE_GIB": "0"}):
+            contained._size_from_env("CHECKOUT_SIZE", 8)
+            self.assertEqual(len(contained.live_ignored_overrides()), 1,
+                             "a bad value is reported while it is set")
+            contained._size_from_env("CHECKOUT_SIZE", 8)
+            self.assertEqual(len(contained.live_ignored_overrides()), 1,
+                             "and a second resolution does not duplicate it")
+        self.assertEqual(contained.live_ignored_overrides(), [],
+                         "a corrected value stops being reported")
+        self.assertEqual(contained._size_from_env("CHECKOUT_SIZE", 8), 8 * 1024 ** 3)
+
     def test_real_sized_budgets_stop_a_runaway_writer(self):
         facts = self.probe(limit=WRITE_LIMIT, tiny_sizes=True)
         for name, budget, where in (("scratch", TINY_SCRATCH, "/tmp"),
@@ -344,11 +362,20 @@ class BrokerClaimTests(unittest.TestCase):
         self.assertIn("more than the 4.0 GiB available", small.detail)
         self.assertIn("one at a time", small.fix)
         with mock.patch.object(contained, "IGNORED_SIZE_OVERRIDES",
-                               [("CHECKOUT_SIZE", "sixteen", "not an integer")]):
+                               [("CHECKOUT_SIZE", "sixteen", "not an integer")]), \
+                mock.patch.dict("os.environ", {"REVIEW_LOOP_CHECKOUT_SIZE_GIB": "sixteen"}):
             refused = doctor.check_sandbox_caps({"id": "t"})
         self.assertEqual(refused.status, "mismatch")
         self.assertIn("REVIEW_LOOP_CHECKOUT_SIZE_GIB", refused.detail)
         self.assertIn("fix the value", refused.fix)
+        # The record is process-wide and the resolution is read once per process, so a refusal
+        # must stop being reported once the value is gone — otherwise one bad value seen once
+        # leaves a healthy install red for the life of the process (and every later test in it).
+        with mock.patch.object(contained, "IGNORED_SIZE_OVERRIDES",
+                               [("CHECKOUT_SIZE", "sixteen", "not an integer")]):
+            corrected = doctor.check_sandbox_caps({"id": "t"})
+        self.assertEqual(corrected.status, "verified",
+                         "a corrected override must not leave the install red forever")
 
 
 if __name__ == "__main__":
