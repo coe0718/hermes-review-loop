@@ -377,7 +377,14 @@ def check_read_token(loop: dict) -> Check:
         return Check("read_token", MISMATCH, f"read_token names {name!r}, which has no token file",
                      f"re-run init with --token {name}=/path/to/pat: the gates read every PR "
                      f"state as this login")
-    return Check("read_token", VERIFIED, f"{name} (mapped in tokens)")
+    problem = config.reader_problem(loop)
+    if problem:
+        # The broker refuses every write while the reader is a seat, so a loop in this shape
+        # installs, "passes", and then never posts a review.
+        return Check("read_token", MISMATCH, f"{problem} — {config.FOUR_IDENTITY_RULE}",
+                     f"hermes review-loop set --loop {loop.get('id') or '<id>'} --read-token "
+                     "<its own login> --token <that login>=/path/to/pat")
+    return Check("read_token", VERIFIED, f"{name} (mapped in tokens; its own account and file)")
 
 
 def _route_entry(data: dict, name: str) -> dict | None:

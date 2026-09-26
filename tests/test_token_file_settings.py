@@ -188,7 +188,7 @@ class TokenFileSettingsTests(unittest.TestCase):
         self.assert_refused([*base, ADJ, "--token", f"{ADJ}=keys/adj.pat"],
                             r"not an absolute path")
         self.assert_refused(["set", "--loop", "widgets", "--token", f"{REV}={self.pats['rev2']}"],
-                            r"only maps the adjudicator")
+                            r"only maps the token file of the login named by --read-token or --adjudicator-login")
         self.assert_no_leak()
 
     # -- plugin settings → apply / init -----------------------------------------------------

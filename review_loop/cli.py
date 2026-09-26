@@ -821,7 +821,7 @@ def cmd_init(args) -> int:
         "adjudicator": ({"route": args.adjudicator_route, "profile": adjudicator_profile}
                         if args.adjudicator_route else {}),
         "skill": args.skill,
-        "tokens": tokens, "read_token": args.read_token or reviewer_seat,
+        "tokens": tokens, "read_token": args.read_token,
         "clone": args.clone, "roots": args.root or [],
         "state_dir": args.state_dir or str(config.home() / "state" / "review-loops"
                                            / (args.id or args.repo.split("/")[-1])),
@@ -844,12 +844,25 @@ def cmd_init(args) -> int:
         # Routes are installed even without --hooks; never write a partial loop with
         # route URLs that cannot resolve to this operator's own gateway.
         config.webhook_host(loop["host"], required=True)
+        # The reader is named, never inferred: a default seat login (or the first token) is the
+        # one-account-two-hats shape the broker refuses at the first write.
+        if not args.read_token:
+            raise config.ConfigError(
+                "--read-token LOGIN names the account the gates read GitHub as (map its file with "
+                f"--token LOGIN=/path/to/pat) — {config.FOUR_IDENTITY_RULE}")
         # Who does what, and may they: profiles, allowlists, distinct credentials and route
         # ownership are all checked before a single file is written.
         # The adjudicator's token file is checked first, so a relative, missing or shared-readable
         # path is refused by its own name rather than as a generic missing file.
         config.verify_adjudicator_token(loop)
         config.verify_seats(loop, roles)
+        # Hooks are created as --admin-token's login, after the config and routes are written;
+        # an unmapped login would fail there and roll everything back, so refuse it up front.
+        if args.hooks and args.admin_token and args.admin_token.lower() not in {
+                str(k).lower() for k in loop.get("tokens") or {}}:
+            raise config.ConfigError(
+                f"--admin-token {args.admin_token!r} has no token file — add "
+                f"--token {args.admin_token}=/path/to/pat (hook write access)")
         _verify_routes(loop, roles)
         _observer_check(loop)
     except config.ConfigError as exc:
@@ -1004,21 +1017,31 @@ def cmd_set(args) -> int:
     seats = {seat: dict(cfg) for seat, cfg in loop["seats"].items()}
     seat_changes = {}
 
-    # The adjudicator's optional comment identity. `set` maps only *its* credential: the seats'
-    # token files move through the settings form and `apply`, which owns the in-flight rules.
+    # The adjudicator's optional comment identity and the reader. `set` maps only *their*
+    # credentials: the seats' token files move through the settings form and `apply`, which owns
+    # the in-flight rules.
     tokens = dict(loop.get("tokens") or {})
     adj_before = config.adjudicator_login(loop)
     adj_wanted = getattr(args, "adjudicator_login", None)
     adj_after = adj_before if adj_wanted is None else adj_wanted.strip()
+    read_before = str(loop.get("read_token") or "")
+    read_wanted = getattr(args, "read_token", None)
+    read_after = read_before if read_wanted is None else read_wanted.strip()
+    if read_wanted is not None and not read_after:
+        print("refused: --read-token needs a login — the gates cannot read GitHub as nobody")
+        return 2
     for pair in getattr(args, "token", None) or []:
         if "=" not in pair:
             print(f"--token expects login=/path/to/pat, got {pair!r}")
             return 2
         login, path = pair.split("=", 1)
-        if not adj_after or login.strip().lower() != adj_after.lower():
-            print(f"refused: `set --token` only maps the adjudicator login's token file "
-                  f"(--adjudicator-login); {login!r} is not it — seat token files move through "
-                  "the plugin settings and `apply`")
+        login = login.strip()
+        owner = next((name for name in (adj_after, read_after if read_wanted is not None else "")
+                      if name and login.lower() == name.lower()), "")
+        if not owner:
+            print(f"refused: `set --token` only maps the token file of the login named by "
+                  f"--read-token or --adjudicator-login; {login!r} is not it — seat token files "
+                  "move through the plugin settings and `apply`")
             return 2
         try:
             config.check_token_file(path, f"--token {login}")
@@ -1027,8 +1050,13 @@ def cmd_set(args) -> int:
             return 2
         for key in [k for k in tokens if str(k).lower() == login.lower()]:
             del tokens[key]
-        tokens[adj_after] = str(pathlib.Path(path.strip()).expanduser())
-    adj_changed = adj_after != adj_before or tokens != (loop.get("tokens") or {})
+        tokens[owner] = str(pathlib.Path(path.strip()).expanduser())
+    # gh looks a login's file up by its exact key: keep the reader spelled as its mapping is.
+    read_after = next((str(k) for k in tokens if str(k).lower() == read_after.lower()), read_after)
+    tokens_changed = tokens != (loop.get("tokens") or {})
+    adj_changed = adj_after != adj_before or tokens_changed
+    read_changed = (read_after != read_before
+                    or _token_ref({"tokens": tokens}, read_after) != _token_ref(loop, read_after))
     if adj_after != adj_before:
         adj_seat = dict(seats.get("adjudicator") or {})
         if adj_after:
@@ -1078,7 +1106,7 @@ def cmd_set(args) -> int:
     if args.observer_unmute:
         observer_cfg["mute"] = False
 
-    if (not changes and not seat_changes and not adj_changed
+    if (not changes and not seat_changes and not adj_changed and not read_changed
             and observer_cfg == (loop.get("observer") or {})):
         print("nothing to change — pass at least one setting "
               "(--concurrency, --reviewer-concurrency, --fixer-concurrency, --cap, --clone, "
@@ -1087,7 +1115,17 @@ def cmd_set(args) -> int:
 
     try:
         updated = config.normalize({**loop, **changes, "seats": seats, "observer": observer_cfg,
-                                    "tokens": tokens})
+                                    "tokens": tokens, "read_token": read_after})
+        if read_changed:
+            # The same rules init applies to the reader: mapped, its file present and private,
+            # and its own account (the four-identity rule).
+            if not _token_ref(updated, read_after):
+                raise config.ConfigError(
+                    f"no token file mapped for the reader {read_after!r} — add "
+                    f"--token {read_after}=/path/to/pat")
+            config.check_token_file(_token_ref(updated, read_after),
+                                    f"token file for the reader {read_after!r}")
+            config.verify_credentials(updated, {"read"})
         if adj_changed and config.adjudicator_login(updated):
             # The same file-level rules init applies, plus: the file must exist and be private.
             config.verify_adjudicator_token(updated)
@@ -1166,6 +1204,11 @@ def cmd_set(args) -> int:
     for seat, value in seat_changes.items():
         was = config.seat_concurrency(loop, seat)
         print(f"  {seat} concurrency: {was} → {value}  (this seat only)")
+    if read_after != read_before:
+        print(f"  read_token: {read_before or '(none)'} → {read_after}")
+    if read_after and _token_ref(loop, read_after) != _token_ref(updated, read_after):
+        print(f"  reader token file ({read_after}): {_token_ref(loop, read_after) or '(none)'}"
+              f" → {_token_ref(updated, read_after)}")
     if adj_after != adj_before:
         shown = adj_after or "(none — rulings go to the operator only)"
         print(f"  adjudicator login: {adj_before or '(none)'} → {shown}")
@@ -1876,7 +1919,9 @@ def register_cli(ctx, settings: dict | None = None) -> None:
         init.add_argument("--root", action="append", default=[], help="a directory reviews may clean (repeatable)")
         init.add_argument("--state-dir", default="")
         init.add_argument("--token", action="append", default=[], help="login=/path/to/pat (repeatable)")
-        init.add_argument("--read-token", default="", help="login whose token reads GitHub")
+        init.add_argument("--read-token", default="",
+                          help="required: login whose token reads GitHub — its own account, never "
+                               "a seat or the adjudicator login (the four-identity rule)")
         init.add_argument("--skill", default="",
                           help="skill the seats are told to load. A plugin-provided skill is "
                                "qualified, e.g. hermes-review-loop:review-loop")
@@ -1985,9 +2030,13 @@ def register_cli(ctx, settings: dict | None = None) -> None:
         change.add_argument("--adjudicator-login", default=None,
                             help="optional fourth GitHub account the ruling is also posted as; "
                                  "\"\" clears it (rulings go to the operator only)")
+        change.add_argument("--read-token", default=None,
+                            help="the login the gates read GitHub as — its own account, never a "
+                                 "seat or the adjudicator login (the four-identity rule); map a "
+                                 "new login with --token LOGIN=/path")
         change.add_argument("--token", action="append", default=[],
-                            help="LOGIN=/path/to/pat for the adjudicator login only (a path, "
-                                 "never the token)")
+                            help="LOGIN=/path/to/pat for the --read-token or --adjudicator-login "
+                                 "login only (a path, never the token)")
         change.add_argument("--observer-route", help="route the observer feed delivers through")
         change.add_argument("--observer-profile", help="profile that owns the observer destination")
         change.add_argument("--observer-deliver",
