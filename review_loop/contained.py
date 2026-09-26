@@ -35,6 +35,7 @@ from pathlib import Path
 import selectors
 import signal
 import subprocess
+import sys
 import time
 
 MAX_CAPTURE = 256 * 1024
@@ -45,8 +46,35 @@ MAX_CAPTURE = 256 * 1024
 # exported head (at most 100 MiB — ``trusted_fetch._MAX_BYTES``) plus the build output of a turn
 # whose wall-clock bound is minutes. Both are orders of magnitude below the host filesystem free
 # space they used to be able to consume.
-SCRATCH_SIZE = 1024 * 1024 * 1024
-CHECKOUT_SIZE = 2 * 1024 * 1024 * 1024
+#
+# The defaults are sized against what this loop actually builds, not against what a test writes:
+# a Rust debug target for the repos it watches is 2.2 GiB (patchhive/attest) and two other real
+# workspaces' are 3.3 GiB and 3.9 GiB, all of which land in ``/work`` because ``CARGO_TARGET_DIR``
+# points there. A cap below a real target does not fail loudly — the seat reports "could not
+# verify" and every review requests changes, which is the failure the crate cache exists to fix.
+def _size_from_env(name: str, gib: int) -> int:
+    """A mount bound, overridable with ``REVIEW_LOOP_<NAME>_GIB``.
+
+    These are environment settings rather than config keys because the number that matters is a
+    property of the *host* — its RAM, and how large a build in the repos it watches grows — not of
+    one loop. A value nobody can parse is reported and ignored rather than fatal: a bound that
+    cannot be read must not take an unattended loop down.
+    """
+    raw = os.environ.get(f"REVIEW_LOOP_{name}_GIB", "").strip()
+    try:
+        value = int(raw) if raw else gib
+        if not 1 <= value <= 1024:
+            raise ValueError(f"outside 1..1024")
+    except ValueError as exc:
+        if raw:
+            print(f"contained: ignoring REVIEW_LOOP_{name}_GIB={raw!r} ({exc}); using {gib} GiB",
+                  file=sys.stderr)
+        value = gib
+    return value * 1024 ** 3
+
+
+SCRATCH_SIZE = _size_from_env("SCRATCH_SIZE", 2)
+CHECKOUT_SIZE = _size_from_env("CHECKOUT_SIZE", 8)
 
 # Where a writable checkout's read-only source export is mounted, and the loader that stages it
 # into the sized tmpfs at /work before the seat runs. bubblewrap has no "copy this tree" mount, so

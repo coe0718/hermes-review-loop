@@ -209,11 +209,33 @@ class SandboxLimitTests(unittest.TestCase):
             # 32 GiB. Whatever the exact number is, it has to be a small one.
             if size is None:
                 self.fail(f"{where} must be a sized tmpfs, not {mount['options']}")
-            self.assertLessEqual(size, 4 * 1024 * MiB, where)
+            # Still a bound and not the bwrap default (half of RAM, 32 GiB here), but /work is not
+            # a small one: it holds the checkout plus a debug target that is 2.2-3.9 GiB in the
+            # repos this loop watches. See test_the_caps_hold_a_real_rust_build below.
+            self.assertLess(size, 16 * 1024 * MiB, where)
+            if where == "/work":
+                self.assertGreaterEqual(size, 4 * 1024 * MiB, where)
         self.assertIn("ro", facts["mounts"]["/"]["options"].split(","))
         # Enforced by the kernel, not merely requested: the seat's own writes are refused.
         self.assertEqual(facts["root_write"], "EROFS")
         self.assertEqual(facts["dev_write"], "EROFS")
+
+    def test_the_caps_hold_a_real_rust_build(self):
+        """A cap under a real debug target turns every Rust review into "could not verify"."""
+        # Measured on this host: patchhive/attest's debug target is 2.2 GiB, two other real
+        # workspaces' are 3.3 GiB and 3.9 GiB. The floor is here so a later "optimization" cannot
+        # quietly shrink the bound back under a build the loop is expected to run.
+        self.assertGreaterEqual(contained.CHECKOUT_SIZE, 8 * 1024 ** 3)
+        self.assertGreaterEqual(contained.SCRATCH_SIZE, 2 * 1024 ** 3)
+
+    def test_a_cap_can_be_overridden_and_a_bad_one_is_ignored(self):
+        """Sizes are a host property, so the operator sets them without editing code."""
+        with mock.patch.dict("os.environ", {"REVIEW_LOOP_CHECKOUT_SIZE_GIB": "3"}):
+            self.assertEqual(contained._size_from_env("CHECKOUT_SIZE", 8), 3 * 1024 ** 3)
+        with mock.patch.dict("os.environ", {"REVIEW_LOOP_CHECKOUT_SIZE_GIB": "lots of them"}):
+            self.assertEqual(contained._size_from_env("CHECKOUT_SIZE", 8), 8 * 1024 ** 3)
+        with mock.patch.dict("os.environ", {"REVIEW_LOOP_CHECKOUT_SIZE_GIB": "0"}):
+            self.assertEqual(contained._size_from_env("CHECKOUT_SIZE", 8), 8 * 1024 ** 3)
 
     def test_real_sized_budgets_stop_a_runaway_writer(self):
         facts = self.probe(limit=WRITE_LIMIT, tiny_sizes=True)
