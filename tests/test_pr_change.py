@@ -218,7 +218,12 @@ class Worker(Base):
             with sqlite3.connect(sup.db) as con:
                 state = con.execute("SELECT state, error FROM runs").fetchone()
         run_turn.assert_not_called()
-        self.assertEqual(state, ("failed", "isolated turn failed: ValueError"))
+        # The turn is held before launch, and the reason survives into the operator-visible state:
+        # assert the prefix and the detail rather than the whole literal, because pinning the tail
+        # is what made this test break the moment the message grew a reason.
+        self.assertEqual(state[0], "failed")
+        self.assertTrue(state[1].startswith("isolated turn failed: ValueError"), state[1])
+        self.assertIn("PR files unreadable", state[1])
 
 
 class Sandbox(unittest.TestCase):
