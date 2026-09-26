@@ -18,7 +18,7 @@ from unittest import mock
 
 TESTS = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(TESTS.parent))
-from review_loop import cli, config, state  # noqa: E402
+from review_loop import cli, config, gh, safe_push, state, trusted_fetch  # noqa: E402
 from review_loop.run_supervisor import Supervisor  # noqa: E402
 
 LEAKING = "test_boundary.BoundaryTests.test_gate_blocks_before_workspace_or_gateway_payload"
@@ -197,6 +197,61 @@ class LiveHermesSource(unittest.TestCase):
                          result.stderr)
         self.assertNotIn("skipped", result.stderr)
         self.assertFalse(self.marker.exists())
+
+
+
+class NoRealGitHub(unittest.TestCase):
+    """A partially mocked test fails loudly instead of reaching GitHub (or any real host).
+
+    ``urlopen`` is replaced by a recorder in every test here, so even a regression never sends
+    the dummy token anywhere: it only shows up as a recorded call.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        token = pathlib.Path(self.temp.name) / "dummy.pat"
+        token.write_text("dummy-token")
+        self.loop = {"repo": "acme/widgets", "read_token": "reader", "tokens": {"reader": str(token)}}
+        self.opened = []
+
+        def recorder(request, *args, **kwargs):
+            self.opened.append(getattr(request, "full_url", request))
+            raise OSError("recorder: no network in tests")
+        for target in ("urllib.request.urlopen",):
+            patch = mock.patch(target, recorder)
+            patch.start()
+            self.addCleanup(patch.stop)
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("REVIEW_LOOP_GH_STUB", None)
+
+    def test_mocking_only_gh_api_still_cannot_reach_github_through_gh_fetch(self):
+        with mock.patch.object(gh, "api", return_value=[]):
+            with self.assertRaises(config.RealNetworkError) as caught:
+                gh.open_prs_read(self.loop)          # reads through gh.fetch, not gh.api
+        self.assertIn("https://api.github.com/repos/acme/widgets/pulls", str(caught.exception))
+        self.assertEqual(self.opened, [])
+
+    def test_trusted_fetch_request_is_refused(self):
+        with self.assertRaises(config.RealNetworkError):
+            trusted_fetch._request(self.loop, "/repos/acme/widgets/pulls/7", "reader", 10, "x")
+        self.assertEqual(self.opened, [])
+
+    def test_safe_push_refuses_the_github_remote(self):
+        with self.assertRaises(config.RealNetworkError):
+            safe_push._git_cas(self.loop, "acme/widgets", "fix-7", "a" * 40, [], "m", "reader",
+                               {"name": "n", "email": "e@example.invalid"})
+
+    def test_loopback_fakes_keep_working(self):
+        for url in ("http://127.0.0.1:8080/x", "http://localhost/x", "http://[::1]:9/x",
+                    "file:///tmp/remote.git", "/tmp/remote.git"):
+            self.assertEqual(config.guard_network(url), url)
+        with mock.patch.object(gh, "API", "http://127.0.0.1:9"):
+            _, error = gh.fetch(self.loop, "/user")
+        self.assertIn("recorder", error)
+        self.assertEqual(self.opened, ["http://127.0.0.1:9/user"])
 
 
 if __name__ == "__main__":

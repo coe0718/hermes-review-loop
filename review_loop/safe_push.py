@@ -141,7 +141,7 @@ def _git_cas(loop: dict, repo: str, branch: str, head: str,
     `remote` is a private local-fixture seam, never sourced from IPC or config.
     Only validated manifest paths/bytes reach Git's temporary private bare repo.
     """
-    url = remote if remote is not None else f"https://github.com/{repo}.git"
+    url = config.guard_network(remote if remote is not None else f"https://github.com/{repo}.git")
     protocol = "file" if remote is not None else "https"
     with tempfile.TemporaryDirectory(prefix="review-loop-git-") as temp:
         root = Path(temp)

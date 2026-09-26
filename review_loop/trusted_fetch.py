@@ -45,6 +45,8 @@ def _publish_exclusive(private: pathlib.Path, root: pathlib.Path) -> None:
 
 def _request(loop: dict, path: str, login: str, limit: int, accept: str) -> bytes:
     """Read at most limit+1 bytes, including for chunked and dishonest responses."""
+    from .config import guard_network
+    guard_network(f"{gh.API}{path}")    # under the test guard: loopback fakes only
     try:
         credential = gh.token(loop, login)
         req = urllib.request.Request(

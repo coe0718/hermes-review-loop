@@ -312,6 +312,8 @@ class _NoRedirectConnection:
         ``chunks`` yields the body as it arrives (bounded by ``MAX_RESPONSE``) and closes the
         connection when exhausted or closed. Redirects are never followed.
         """
+        from .config import guard_network
+        guard_network(self.url.geturl())
         cls = http.client.HTTPSConnection if self.url.scheme == 'https' else http.client.HTTPConnection
         conn = cls(self.url.hostname or '', self.url.port, timeout=UPSTREAM_TIMEOUT)
         try:

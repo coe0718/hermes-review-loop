@@ -836,6 +836,39 @@ def guard_real_home(path: pathlib.Path | str) -> pathlib.Path:
     return path
 
 
+class RealNetworkError(BaseException):
+    """A guarded test tried to reach a real host (GitHub, Discord, a model upstream).
+
+    A ``BaseException`` for the same reason as ``RealHomeError``: the loop's broad ``except
+    Exception`` would otherwise turn the escape into an ordinary "network failed" and a pass.
+    """
+
+
+def guard_network(url: str) -> str:
+    """Return ``url``; under the test guard, raise unless it stays on this machine.
+
+    Loopback hosts (127.0.0.0/8, ::1, localhost) and local paths/``file:`` URLs are the tests'
+    own fakes and pass. Everything else — above all api.github.com and github.com — means a test
+    mocked one seam (say ``gh.api``) and not the one underneath (``gh.fetch``).
+    """
+    if not os.environ.get(TEST_HOME_GUARD_ENV):
+        return url
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    if not host and parts.scheme in ("", "file"):
+        return url
+    if host == "localhost":
+        return url
+    try:
+        if ipaddress.ip_address(host).is_loopback:
+            return url
+    except ValueError:
+        pass
+    raise RealNetworkError(f"test guard: real network call to {url} refused; mock the request "
+                           "underneath (gh.fetch, not only gh.api), set REVIEW_LOOP_GH_STUB, or "
+                           "point it at a 127.0.0.1 fake")
+
+
 def guard_real_hermes(executable: str) -> str:
     """Return ``executable``; under the test guard, raise if it is a ``hermes`` in the real home.
 
