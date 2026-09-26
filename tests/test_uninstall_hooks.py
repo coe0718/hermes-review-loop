@@ -141,6 +141,28 @@ class RoundTripTest(Base):
         self.assertEqual(rc, 0, out)
         self.assertEqual(len(self.hooks()), 3)
 
+    def test_hooks_on_another_gateway_are_info_not_a_refusal(self):
+        rc, out = self.cli("uninstall", "--loop", "widgets")
+        self.assertEqual(rc, 0, out)
+        foreign = {"id": 8, "active": True, "events": ["pull_request"],
+                   "config": {"url": "https://old-gateway.example/p/reviewer-profile/webhooks/widgets-review"}}
+        self.world(hooks=[foreign])
+        rc, out = self.init("--hooks")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("hook 8", out)
+        self.assertIn("another gateway", out)
+        self.assertEqual(len(self.hooks()), 3)
+
+    def test_same_gateway_hook_on_the_route_still_refuses(self):
+        rc, out = self.cli("uninstall", "--loop", "widgets")
+        self.assertEqual(rc, 0, out)
+        same = {"id": 8, "active": True, "events": ["pull_request"],
+                "config": {"url": f"{t.HOST}/p/old-profile/webhooks/widgets-review"}}
+        self.world(hooks=[same])
+        rc, out = self.init("--hooks")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("gh api -X DELETE repos/acme/widgets/hooks/8", out)
+
 
 class UninstallRefusalTest(Base):
     def test_a_token_github_refuses_leaves_everything_and_prints_pasteable_commands(self):
@@ -194,6 +216,8 @@ class UninstallRefusalTest(Base):
         rc, out = self.cli("uninstall", "--loop", "widgets")
         self.assertEqual(rc, 0, out)
         self.assertEqual(self.hooks(), [foreign])
+        self.assertIn("hook 9", out)
+        self.assertIn("another gateway", out)
 
 
 class CronTest(Base):
@@ -265,8 +289,25 @@ class PurgeTest(Base):
         rc, out = self.cli("uninstall", "--loop", "widgets", "--purge")
         self.assertEqual(rc, 2, out)
         self.assertIn("not the default", out)
+        self.assertIn(f"rm -rf -- {shlex.quote(str(t.STATE_DIR))}", out)
+        self.assertIn("hermes review-loop uninstall --loop widgets &&", out)
         self.assertTrue(LOOP_FILE.exists())
         self.assertTrue((t.STATE_DIR / "keep.json").exists())
+
+    def test_a_custom_state_dir_with_spaces_is_quoted(self):
+        odd = t.TMP / "my state's dir"
+        odd.mkdir()
+        cfg = json.loads(LOOP_FILE.read_text())
+        cfg["state_dir"] = str(odd)
+        LOOP_FILE.write_text(json.dumps(cfg))
+        rc, out = self.cli("uninstall", "--loop", "widgets", "--purge")
+        self.assertEqual(rc, 2, out)
+        line = next(l for l in out.splitlines() if "rm -rf --" in l)
+        self.assertEqual(shlex.split(line.split("&&")[-1])[-1], str(odd))
+        rc, out = self.cli("uninstall", "--loop", "widgets")
+        self.assertEqual(rc, 0, out)
+        self.assertIn(f"rm -rf -- {shlex.quote(str(odd))}", out)
+        self.assertTrue(odd.exists())
 
     def test_purge_refuses_a_symlinked_state_dir(self):
         target = self.default_state()
@@ -276,10 +317,12 @@ class PurgeTest(Base):
         rc, out = self.cli("uninstall", "--loop", "widgets", "--purge")
         self.assertEqual(rc, 2, out)
         self.assertIn("symlink", out)
+        self.assertIn(f"rm -- {shlex.quote(str(target))}", out)
         self.assertTrue((real / "sub" / "x.json").exists())
         self.assertTrue(LOOP_FILE.exists())
 
-    def test_without_purge_state_is_kept_and_named(self):
+    def test_without_purge_default_state_is_kept_and_named(self):
+        self.default_state()
         rc, out = self.cli("uninstall", "--loop", "widgets")
         self.assertEqual(rc, 0, out)
         self.assertIn("pass --purge", out)
@@ -302,6 +345,69 @@ class DoctorDuplicateTest(Base):
         self.assertNotIn("hooks/101", check.fix)  # the newest is the one kept
         single = doctor.check_hook(loop, hooks[:1], "reviewer", "widgets-review", url)
         self.assertEqual(single.status, doctor.VERIFIED)
+
+    def test_two_hooks_on_different_gateways_are_not_duplicates(self):
+        loop = config.load_id("widgets")
+        url = routes.url_for("widgets-review", t.HOST)
+        hooks = [{"id": 3, "active": True, "events": ["pull_request"],
+                  "config": {"url": "https://old.example/webhooks/widgets-review",
+                             "content_type": "json"}},
+                 {"id": 101, "active": True, "events": ["pull_request"],
+                  "config": {"url": url, "content_type": "json"}}]
+        check = doctor.check_hook(loop, hooks, "reviewer", "widgets-review", url)
+        self.assertEqual(check.status, doctor.VERIFIED, check.detail)
+
+
+class DoctorDeliveriesTest(Base):
+    """The one place GitHub reveals a secret mismatch: how the gateway answered its deliveries."""
+
+    def check(self, deliveries):
+        loop = config.load_id("widgets")
+        url = routes.url_for("widgets-review", t.HOST)
+        hook = {"id": 5, "active": True, "events": ["pull_request"],
+                "config": {"url": url, "content_type": "json"}}
+        self.world(hooks=[hook], deliveries={"5": deliveries})
+        return doctor.check_hook(loop, [hook], "reviewer", "widgets-review", url)
+
+    @staticmethod
+    def delivery(n, code, at):
+        return {"id": n, "status_code": code, "delivered_at": at, "event": "pull_request",
+                "status": "OK" if code < 300 else f"Invalid HTTP Response: {code}"}
+
+    def test_latest_delivery_rejected_401_is_a_secret_mismatch(self):
+        check = self.check([self.delivery(2, 401, "2026-09-02T00:00:00Z"),
+                            self.delivery(1, 202, "2026-09-01T00:00:00Z")])
+        self.assertEqual(check.status, doctor.MISMATCH)
+        self.assertIn("401", check.detail)
+        self.assertIn("secret", check.detail)
+        self.assertIn("uninstall --loop widgets", check.fix)
+        self.assertIn("init", check.fix)
+
+    def test_order_is_read_from_delivered_at_not_list_position(self):
+        check = self.check([self.delivery(1, 202, "2026-09-01T00:00:00Z"),
+                            self.delivery(2, 401, "2026-09-02T00:00:00Z")])
+        self.assertEqual(check.status, doctor.MISMATCH)
+
+    def test_a_403_is_a_refused_route(self):
+        check = self.check([self.delivery(2, 403, "2026-09-02T00:00:00Z")])
+        self.assertEqual(check.status, doctor.MISMATCH)
+        self.assertIn("403", check.detail)
+
+    def test_a_later_success_clears_an_old_rejection(self):
+        check = self.check([self.delivery(2, 202, "2026-09-02T00:00:00Z"),
+                            self.delivery(1, 401, "2026-09-01T00:00:00Z")])
+        self.assertEqual(check.status, doctor.VERIFIED)
+        self.assertIn("latest delivery 202", check.detail)
+
+    def test_no_deliveries_yet_says_the_secret_is_unproven(self):
+        check = self.check([])
+        self.assertEqual(check.status, doctor.VERIFIED)
+        self.assertIn("no deliveries yet", check.detail)
+
+    def test_an_unreadable_delivery_list_is_unknown_not_green(self):
+        check = self.check("not a list")
+        self.assertEqual(check.status, doctor.UNKNOWN)
+        self.assertIn("deliveries", check.detail)
 
 
 class ConfigErrorTest(Base):

@@ -124,10 +124,14 @@ def n_of(p):
     return int(m.group(1)) if m else None
 
 hook_one = re.search(r"/hooks/(\\d+)$", path)
+hook_deliveries = re.search(r"/hooks/(\\d+)/deliveries", path)
 if method != "GET" and ("/hooks" in path) and os.environ.get("GH_LOGIN", "") in world.get("hook_write_denied", []):
     sys.stderr.write("HTTP 403 Resource not accessible by personal access token")
     sys.exit(1)
-if method == "POST" and path.endswith("/hooks"):
+if hook_deliveries:
+    # GitHub's recent-delivery log for a hook; none recorded reads as an empty list.
+    print(json.dumps((world.get("deliveries") or {}).get(hook_deliveries.group(1), [])))
+elif method == "POST" and path.endswith("/hooks"):
     spec = json.loads(body or "{}")
     hooks = world.setdefault("hooks", [])
     # GitHub never reuses a hook id: a counter, not max(existing) + 1.

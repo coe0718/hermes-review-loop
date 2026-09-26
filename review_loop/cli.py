@@ -660,29 +660,40 @@ def _hook_origin(hook: dict) -> str:
     return f"{parts.scheme}://{parts.netloc}".lower()
 
 
-def _loop_hooks(loop: dict, login: str | None, *,
-                any_origin: bool = False) -> tuple[list[dict] | None, str]:
-    """This loop's repo hooks: those posting to one of its route names on its gateway origin.
+def _classify_hooks(loop: dict, login: str | None) -> tuple[list[dict] | None, list[dict], str]:
+    """``(own, foreign, error)`` for the hooks posting to this loop's route names.
 
-    ``any_origin`` widens the match to the same route name on any gateway — the question `init`
-    asks, where a hook left by an older install on another origin is still a collision. Every
-    page is read; a partial or malformed listing is ``(None, reason)``, never "no hooks".
+    *Own* hooks post to one of the routes on **this** loop's gateway origin (any profile prefix:
+    the gateway resolves a route by name). *Foreign* ones post to the same route name on another
+    origin — another machine's install, or an old gateway — and are only ever reported, never
+    deleted or counted as a collision. Every page is read; a partial or malformed listing is
+    ``(None, [], reason)``, never "no hooks".
     """
     listing, error = gh.hooks_read(loop, login or loop.get("read_token"))
     if error:
-        return None, error
+        return None, [], error
     if any(not isinstance(hook.get("id"), int) or not isinstance(hook.get("config"), dict)
            or not isinstance(hook["config"].get("url"), str) for hook in listing):
-        return None, "invalid hook listing"
-    origin = ""
-    if not any_origin:
-        try:
-            origin = config.webhook_host(loop.get("host")).rstrip("/").lower()
-        except config.ConfigError as exc:
-            return None, f"cannot resolve the loop's webhook host: {exc}"
+        return None, [], "invalid hook listing"
+    try:
+        origin = config.webhook_host(loop.get("host"), required=True).rstrip("/").lower()
+    except config.ConfigError as exc:
+        return None, [], f"cannot resolve the loop's webhook host: {exc}"
     names = _hook_route_names(loop)
-    return [hook for hook in listing if _hook_route_name(hook) in names
-            and (any_origin or not origin or _hook_origin(hook) == origin)], ""
+    named = [hook for hook in listing if _hook_route_name(hook) in names]
+    return ([hook for hook in named if _hook_origin(hook) == origin],
+            [hook for hook in named if _hook_origin(hook) != origin], "")
+
+
+def _loop_hooks(loop: dict, login: str | None) -> tuple[list[dict] | None, str]:
+    """This loop's own repo hooks (see ``_classify_hooks``)."""
+    own, _, error = _classify_hooks(loop, login)
+    return own, error
+
+
+def _foreign_lines(loop: dict, foreign: list[dict]) -> list[str]:
+    return [f"hook {hook['id']} posts to route {_hook_route_name(hook)!r} on another gateway "
+            f"({_hook_origin(hook)}) — not this install's, left alone" for hook in foreign]
 
 
 def _hook_delete_commands(loop: dict, hook_ids) -> list[str]:
@@ -707,10 +718,10 @@ def _delete_loop_hooks(loop: dict, login: str | None) -> tuple[list[str], list[s
     Deleted rather than paused: a paused hook still signs with a secret the next install's route
     will not hold, and it is exactly what a later ``init --hooks`` would trip over.
     """
-    hooks, error = _loop_hooks(loop, login)
+    hooks, foreign, error = _classify_hooks(loop, login)
     if hooks is None:
         return [], [f"could not read the repo's hooks: {error}"], []
-    done, failures = [], []
+    done, failures = _foreign_lines(loop, foreign), []
     login = login or loop.get("read_token")
     for hook in hooks:
         _, error = gh.fetch(loop, f"/repos/{loop['repo']}/hooks/{hook['id']}", method="DELETE",
@@ -816,12 +827,19 @@ def _purge_target(loop: dict) -> tuple[pathlib.Path | None, str]:
     base = config.home()
     default = base / "state" / "review-loops" / loop["id"]
     raw = pathlib.Path(str(loop.get("state_dir") or "")).expanduser()
+    lid = shlex.quote(loop["id"])
     if os.path.normpath(str(raw)) != os.path.normpath(str(default)):
-        return None, (f"state_dir {raw} is not the default {default}; --purge only removes the "
-                      "default location — remove a custom state directory by hand")
+        return None, (f"state_dir {raw} is not the default {default}, so --purge will not delete "
+                      "it: a custom directory could hold anything the operator pointed it at. "
+                      "Check it holds only this loop's state, then run:\n"
+                      f"  hermes review-loop uninstall --loop {lid} && "
+                      f"rm -rf -- {shlex.quote(str(raw))}")
     for path in (base / "state", base / "state" / "review-loops", default):
         if path.is_symlink():
-            return None, f"{path} is a symlink; --purge refuses to follow it"
+            return None, (f"{path} is a symlink; --purge never follows one (the target is outside "
+                          "the loop's state). To drop the link itself (not its target), run:\n"
+                          f"  hermes review-loop uninstall --loop {lid} && "
+                          f"rm -- {shlex.quote(str(path))}")
     if default.exists() and not default.is_dir():
         return None, f"{default} is not a directory"
     return default, ""
@@ -917,17 +935,22 @@ def _restore_config_locked(path: pathlib.Path, data: bytes) -> None:
 def _stale_hooks_refusal(loop: dict, admin: str | None) -> str:
     """Why ``init --hooks`` must not create hooks yet, or ``""`` when the routes have none.
 
+    Only hooks on this loop's own gateway origin collide; the same route name on another gateway
+    is printed as information (it cannot be woken by, or confused with, this install).
+
     Refuse, never adopt. Adopting would mean PATCHing a new secret onto hooks this install did not
     create: GitHub never returns a hook's secret, so nothing can prove whose they are or which of
     several is current, and an adopted hook keeps its old ``active`` state — an armed leftover
     would arm a loop that has not passed doctor/selftest. Refusing writes nothing, and the fix is
     one pasteable command per hook (or ``uninstall`` for a loop that is still configured).
     """
-    hooks, error = _loop_hooks(loop, admin, any_origin=True)
+    hooks, foreign, error = _classify_hooks(loop, admin)
     if hooks is None:
         return (f"refused: cannot read {loop['repo']}'s hooks to check for a previous install's "
                 f"({error}); nothing written. Give the --admin-token login hook access "
                 "(`admin:repo_hook`, or classic `repo`) and re-run")
+    for line in _foreign_lines(loop, foreign):
+        print(f"  info: {line}")
     if not hooks:
         return ""
     ids = sorted(hook["id"] for hook in hooks)
@@ -2213,7 +2236,13 @@ def cmd_uninstall(args) -> int:
             shutil.rmtree(target)
             print(f"state removed: {target}")
     elif not args.keep_config:
-        print(f"state kept: {loop['state_dir']} (pass --purge to remove it)")
+        _, why = _purge_target(loop)
+        raw = pathlib.Path(str(loop.get("state_dir") or "")).expanduser()
+        if why:
+            print(f"state kept: {raw} — not the default location or not a plain directory, so "
+                  f"--purge would not remove it; check it, then: rm -rf -- {shlex.quote(str(raw))}")
+        else:
+            print(f"state kept: {raw} (pass --purge to remove it)")
     return 0
 
 

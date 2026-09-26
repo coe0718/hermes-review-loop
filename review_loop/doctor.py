@@ -879,8 +879,15 @@ def check_hook(loop: dict, hooks: list, seat: str, name: str, url: str) -> Check
     # left behind: GitHub never returns a secret, but a leftover signs with the secret the old
     # route held, so at most one of them can authenticate — and "hook N active" says nothing
     # about which one that is.
+    def origin(value: str) -> str:
+        parts = urlsplit(value)
+        return f"{parts.scheme}://{parts.netloc}".lower()
+
+    # Only this gateway's hooks can be duplicates: the same route name on another origin is
+    # another install (or an old gateway) and never receives this route's deliveries.
     named = [hook for hook in hooks if hook in exact or
-             urlsplit(posted_url(hook)).path.rstrip("/").endswith("/webhooks/" + name)]
+             (urlsplit(posted_url(hook)).path.rstrip("/").endswith("/webhooks/" + name)
+              and origin(posted_url(hook)) == origin(url))]
     if len(named) > 1:
         ids = sorted(hook.get("id") for hook in named if isinstance(hook.get("id"), int))
         active = sum(1 for hook in named if hook.get("active"))
@@ -920,12 +927,53 @@ def check_hook(loop: dict, hooks: list, seat: str, name: str, url: str) -> Check
                      f"hook {hook_id} has content_type {content_type!r}, expected 'json'",
                      f"re-run init --hooks, or set hook {hook_id}'s content_type to json: "
                      "the gate reads a JSON payload, not form-encoded data")
+    delivery = check_deliveries(loop, hook_id, name)
+    if isinstance(delivery, Check):
+        return delivery
     if not match.get("active"):
         return Check(f"hook:{name}", VERIFIED,
                      f"hook {hook_id} → [webhook URL redacted] ({event}, PAUSED — nothing fires "
-                     f"until `hermes review-loop arm --loop {loop['id']}`)", paused=True)
+                     f"until `hermes review-loop arm --loop {loop['id']}`; {delivery})", paused=True)
     return Check(f"hook:{name}", VERIFIED,
-                 f"hook {hook_id} → [webhook URL redacted] ({event}, active)")
+                 f"hook {hook_id} → [webhook URL redacted] ({event}, active; {delivery})")
+
+
+# The gateway's answers to a delivery whose signature it would not accept: 401 is "Invalid
+# signature", 403 a route that is disabled or has no HMAC secret to check against.
+REJECTED = {401: "signature rejected — the hook's secret does not match the route's",
+            403: "refused — the route is disabled or holds no secret"}
+
+
+def check_deliveries(loop: dict, hook_id, name: str) -> "Check | str":
+    """How the gateway answered this hook's most recent delivery — GitHub's only secret evidence.
+
+    GitHub never returns a hook's secret, but it keeps each recent delivery with the status code
+    the gateway answered. A latest delivery answered 401/403 is a hook signing with a secret the
+    route does not hold (a previous install's, say): it looks armed and wakes nothing. Returns a
+    failing/unknown ``Check``, or a short phrase for the verified line.
+    """
+    path = f"/repos/{loop['repo']}/hooks/{hook_id}/deliveries?per_page=30"
+    data, error = gh.fetch(loop, path)
+    if error or not isinstance(data, list) or not all(isinstance(d, dict) for d in data):
+        reason = error or "no delivery list returned"
+        return Check(f"hook:{name}", UNKNOWN,
+                     f"hook {hook_id} found, but its recent deliveries could not be read ({reason}) "
+                     "— whether its secret matches the route is unproven",
+                     f"give the read token hook read access (`read:repo_hook`, or `repo`), or look "
+                     f"by hand: `gh api repos/{loop['repo']}/hooks/{hook_id}/deliveries`")
+    stamped = [d for d in data if isinstance(d.get("delivered_at"), str)]
+    if not stamped:
+        return "no deliveries yet — the secret is unproven until the first one arrives"
+    latest = max(stamped, key=lambda d: d["delivered_at"])
+    code = latest.get("status_code")
+    if code in REJECTED:
+        return Check(f"hook:{name}", MISMATCH,
+                     f"hook {hook_id}'s latest delivery ({latest['delivered_at']}) got HTTP {code}: "
+                     f"{REJECTED[code]}, so the hook wakes nothing",
+                     f"`hermes review-loop uninstall --loop {shlex.quote(loop['id'])}` (deletes the "
+                     f"hook), then re-run init --hooks so the new hook and route share one fresh "
+                     f"secret; then `hermes review-loop arm --loop {shlex.quote(loop['id'])}`")
+    return f"latest delivery {code}"
 
 
 # -- the report ------------------------------------------------------------------
