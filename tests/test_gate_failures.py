@@ -200,20 +200,83 @@ class GateFailureTest(unittest.TestCase):
         self.assertIsNone(timeout)
         self.assertIn("no YAML reader", why)
 
-    def test_doctor_flags_a_too_low_gateway_timeout_and_passes_a_fine_one(self):
+    def profile_config(self, name: str, data: dict) -> pathlib.Path:
+        """A profile home's config.yaml (JSON is valid YAML), restored after the test."""
+        home = t.HOME / "profiles" / name
+        home.mkdir(parents=True, exist_ok=True)
+        path = home / "config.yaml"
+        before = path.read_text() if path.exists() else None
+        path.write_text(json.dumps({"model": {"default": "test-model"}, **data}))
+        self.addCleanup(lambda: path.write_text(before) if before is not None
+                        else path.unlink(missing_ok=True))
+        return home
+
+    def doctor_lines(self):
         from review_loop import doctor
-        self.gateway_config({"platforms": {"webhook": {"script_timeout_seconds": 10}}})
-        low = doctor.check_gate_timeout()
+        return {c.name: c for c in doctor.check_gate_timeouts(config.load_id("widgets"))}
+
+    def test_doctor_checks_every_profile_gateway_hosting_a_loop_route(self):
+        from review_loop import doctor
+        # Root (host) gateway: 30s by default. The reviewer's profile runs its own standalone
+        # gateway at 10s; the fixer's profile is multiplexed by the host but sets 60s itself.
+        self.gateway_config(None)
+        rev = self.profile_config("reviewer-profile", {
+            "gateway": {"standalone": True},
+            "platforms": {"webhook": {"script_timeout_seconds": 10}}})
+        self.profile_config("fixer-profile", {
+            "platforms": {"webhook": {"script_timeout_seconds": 60}}})
+        checks = self.doctor_lines()
+        self.assertEqual(sorted(checks), ["gate:timeout:default", "gate:timeout:fixer-profile",
+                                          "gate:timeout:reviewer-profile"])
+        low = checks["gate:timeout:reviewer-profile"]
         self.assertEqual(low.status, doctor.MISMATCH)
-        self.assertIn("script_timeout_seconds: 30", low.fix)
-        self.assertIn("only 4s", low.detail)
-        for fine in (None, {"platforms": {"webhook": {"script_timeout_seconds": 30}}}):
-            self.gateway_config(fine)
-            check = doctor.check_gate_timeout()
-            self.assertEqual(check.status, doctor.VERIFIED, check.detail)
-            self.assertIn("gate budget 20s + 3s backstop fits", check.detail)
+        self.assertIn("serves reviewer", low.detail)
+        self.assertIn("profile reviewer-profile's standalone gateway: 10s", low.detail)
+        self.assertIn(f"in {rev / 'config.yaml'} for the profile reviewer-profile's standalone "
+                      f"gateway", low.fix)
+        fixer = checks["gate:timeout:fixer-profile"]
+        self.assertEqual(fixer.status, doctor.VERIFIED, fixer.detail)
+        self.assertIn("own gateway (if it runs one): 60s", fixer.detail)
+        self.assertIn("host gateway multiplexing profile fixer-profile: 30s", fixer.detail)
+        self.assertEqual(checks["gate:timeout:default"].status, doctor.VERIFIED)
+        self.assertIn("serves adjudicator", checks["gate:timeout:default"].detail)
+
+        # Now the host gateway drops to 20s: the multiplexed fixer profile and the default
+        # profile are flagged against the ROOT file; the standalone reviewer is unaffected by it.
+        self.gateway_config({"platforms": {"webhook": {"script_timeout_seconds": 20}}})
+        checks = self.doctor_lines()
+        fixer = checks["gate:timeout:fixer-profile"]
+        self.assertEqual(fixer.status, doctor.MISMATCH)
+        self.assertIn(f"in {t.HOME / 'config.yaml'} for the host gateway", fixer.fix)
+        self.assertNotIn("fixer-profile/config.yaml", fixer.fix)
+        self.assertEqual(checks["gate:timeout:default"].status, doctor.MISMATCH)
+        self.assertNotIn(str(t.HOME / "config.yaml") + " ",
+                         checks["gate:timeout:reviewer-profile"].fix)
+        self.assertIn("reviewer-profile/config.yaml", checks["gate:timeout:reviewer-profile"].fix)
+
         self.gateway_config({"platforms": {"webhook": {"script_timeout_seconds": "x"}}})
-        self.assertEqual(doctor.check_gate_timeout().status, doctor.UNKNOWN)
+        self.assertEqual(self.doctor_lines()["gate:timeout:default"].status, doctor.UNKNOWN)
+
+    def test_gate_reads_the_gateway_it_runs_under(self):
+        self.gateway_config({"platforms": {"webhook": {"script_timeout_seconds": 45}}})
+        solo = self.profile_config("solo", {"gateway": {"standalone": True},
+                                            "platforms": {"webhook": {"script_timeout_seconds": 12}}})
+        muxed = self.profile_config("muxed", {"platforms": {"webhook": {"script_timeout_seconds": 90}}})
+        self.assertEqual(gate_failures.effective_timeout(t.HOME)[0], 45)       # root gateway
+        self.assertEqual(gate_failures.effective_timeout(solo)[0], 12)         # its own only
+        self.assertEqual(gate_failures.effective_timeout(muxed)[0], 45)        # host is lower
+        self.gateway_config({"platforms": {"webhook": {"script_timeout_seconds": 200}}})
+        self.assertEqual(gate_failures.effective_timeout(muxed)[0], 90)        # own is lower
+        # The real gate, run as a standalone profile gateway runs it: HERMES_HOME = the profile.
+        hang = t.TMP / "hang_stub.py"
+        hang.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(60)\n")
+        hang.chmod(0o755)
+        proc, elapsed = gateway_run("gate_reviewer.py", t.pr_payload(7),
+                                    {"REVIEW_LOOP_GH_STUB": str(hang), "HERMES_HOME": str(solo)})
+        self.assertEqual(proc.returncode, 3)
+        self.assertLess(elapsed, 12)
+        (entry,) = loop_entries().values()
+        self.assertAlmostEqual(entry["budget_s"], 4.8)                         # 12 * 0.4
 
     def test_gate_shrinks_its_budget_to_a_low_gateway_timeout(self):
         self.gateway_config({"platforms": {"webhook": {"script_timeout_seconds": 10}}})

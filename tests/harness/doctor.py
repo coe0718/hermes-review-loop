@@ -236,7 +236,7 @@ def group_doctor() -> None:
     before_posts = len(RECEIVED)
     rc, out = run_doctor("--loop", "widgets")
     check("a correct install passes", rc, 0)
-    check("  every check verified", "widgets: 26 verified, 0 failed, 0 unknown (of 26 checks)" in out,
+    check("  every check verified", "widgets: 28 verified, 0 failed, 0 unknown (of 28 checks)" in out,
           True)
     check("  nothing is marked failed", "❌" in out, False)
     check("  the header says it is read-only",

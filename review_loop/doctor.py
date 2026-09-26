@@ -575,32 +575,63 @@ def check_scripts() -> Check:
     return Check("scripts", VERIFIED, f"{scripts_dir()} (watchdog, three gates, cleanup)")
 
 
-def check_gate_timeout() -> Check:
-    """Does a gate's time budget fit inside the gateway's route-script timeout (#75)?
+def gate_timeout_profiles(loop: dict) -> dict[str, list[str]]:
+    """Every profile whose gateway runs one of this loop's route scripts → the routes it hosts."""
+    hosted: dict[str, list[str]] = {}
+    for role in ("reviewer", "fixer", "adjudicator"):
+        if role == "adjudicator" and not str((loop.get("adjudicator") or {}).get("route") or ""):
+            continue
+        profile = config.seat_profile(loop, role)
+        if profile:
+            hosted.setdefault(profile, []).append(role)
+    observer = loop.get("observer") if isinstance(loop.get("observer"), dict) else {}
+    if observer.get("route"):
+        hosted.setdefault(str(observer.get("profile") or "default"), []).append("observer")
+    return hosted
 
-    The gateway kills a route script at its webhook ``script_timeout_seconds`` and answers the
-    delivery 200 "ignored" either way. Gates read the same setting and shrink their budget to
-    fit, so a low value is safe but starves them of time for GitHub reads.
+
+def check_gate_timeouts(loop: dict) -> list[Check]:
+    """Does a route script's time budget fit inside its gateway's script timeout (#75)?
+
+    One line per profile that hosts a loop route. The gateway kills a route script at its webhook
+    ``script_timeout_seconds`` and answers the delivery 200 "ignored" either way. Gates read the
+    same setting (the smaller one, when either the host or the profile's own gateway may serve
+    the route) and shrink their budget to fit, so a low value is safe but starves them of time.
     """
     from . import gate_failures as gf
-    timeout, where = gf.gateway_script_timeout()
-    if timeout is None:
-        return Check("gate:timeout", UNKNOWN,
-                     f"cannot read the gateway's script timeout: {where}; gates assume "
-                     f"{gf.GATEWAY_DEFAULT_TIMEOUT_S}s")
-    budget, backstop = gf.plan(timeout, gf.DEFAULT_BUDGET_S)
-    if timeout < gf.MIN_TIMEOUT_S:
-        return Check("gate:timeout", MISMATCH,
-                     f"gateway {gf.KEY}={timeout}s ({where}) leaves gates only {budget:g}s for "
-                     f"GitHub reads (they need {gf.DEFAULT_BUDGET_S:g}s, plus a "
-                     f"{gf.BACKSTOP_S:g}s backstop and time to record a failure)",
-                     f"set platforms.webhook.{gf.KEY}: {gf.GATEWAY_DEFAULT_TIMEOUT_S} (at least "
-                     f"{gf.MIN_TIMEOUT_S}) in {gf.gateway_home() / 'config.yaml'} and restart "
-                     f"the gateway; until then an overrun is recorded as a gate timeout and "
-                     f"re-driven by the watchdog")
-    return Check("gate:timeout", VERIFIED,
-                 f"gateway {gf.KEY}={timeout}s ({where}); gate budget {budget:g}s + "
-                 f"{backstop:g}s backstop fits")
+    checks = []
+    for profile, roles in gate_timeout_profiles(loop).items():
+        name = f"gate:timeout:{profile}"
+        home = config.profile_dir(profile)
+        limit, rows = gf.effective_timeout(home)
+        hosts = "; ".join(f"{label}: {f'{sec}s' if sec is not None else 'unreadable'} ({where})"
+                          for label, _host, sec, where in rows)
+        serves = f"serves {', '.join(roles)}"
+        unread = [row for row in rows if row[2] is None]
+        if unread:
+            checks.append(Check(name, UNKNOWN,
+                                f"{serves}; cannot read every gateway's script timeout — {hosts}; "
+                                f"gates fit the readable ones (or assume "
+                                f"{gf.GATEWAY_DEFAULT_TIMEOUT_S}s)"))
+            continue
+        budget, backstop = gf.plan(limit, gf.DEFAULT_BUDGET_S)
+        low = [row for row in rows if row[2] < gf.MIN_TIMEOUT_S]
+        if low:
+            fixes = "; ".join(
+                f"set platforms.webhook.{gf.KEY}: {gf.GATEWAY_DEFAULT_TIMEOUT_S} (at least "
+                f"{gf.MIN_TIMEOUT_S}) in {host / 'config.yaml'} for the {label}"
+                for label, host, _sec, _where in low)
+            checks.append(Check(name, MISMATCH,
+                                f"{serves}; {hosts} — gates get only {budget:g}s for GitHub reads "
+                                f"(they need {gf.DEFAULT_BUDGET_S:g}s, plus a {gf.BACKSTOP_S:g}s "
+                                f"backstop and time to record a failure)",
+                                f"{fixes}; then restart that gateway. Until then an overrun is "
+                                f"recorded as a gate timeout and re-driven by the watchdog"))
+            continue
+        checks.append(Check(name, VERIFIED,
+                            f"{serves}; {hosts}; gate budget {budget:g}s + {backstop:g}s "
+                            f"backstop fits"))
+    return checks
 
 
 _WATCHDOG_LINE = re.compile(r"WATCHDOG\s*=\s*pathlib\.Path\((['\"])(?P<path>.+?)\1\)")
@@ -956,7 +987,7 @@ def check_loop(loop: dict, offline: bool = False) -> list[Check]:
     checks.append(check_read_token(loop))
     checks.extend(check_routes(loop))
     checks.append(check_scripts())
-    checks.append(check_gate_timeout())
+    checks.extend(check_gate_timeouts(loop))
     checks.append(check_shim(loop))
     checks.append(check_cron_job(loop))
     checks.append(check_clone(loop))

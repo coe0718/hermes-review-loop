@@ -462,11 +462,20 @@ the gate is killed. A crash, a timeout, empty output and `[SILENT]` all get the 
 deliveries by itself, so a non-2xx "retry me" is neither available nor useful. The loop keeps its
 own record instead:
 
-* **Budget.** Each gate has 20s (`REVIEW_LOOP_GATE_BUDGET_S`). It also reads the gateway's
-  `script_timeout_seconds` from the same files the gateway does and shrinks that budget to fit.
-  Every GitHub call is clipped to what is left, a timer 3s later interrupts anything else that
-  hangs, and a gate-triggered queue drain gets at most half of the time remaining. `doctor`
-  flags a gateway timeout below 28s (`gate:timeout`) and prints the setting to fix.
+* **Budget.** Each gate has 20s (`REVIEW_LOOP_GATE_BUDGET_S`) and shrinks it to fit the
+  `script_timeout_seconds` of the gateway running it. The gateway reads `gateway.json` and
+  `config.yaml` from its own home, so the gate reads those same files.
+  - A `/p/<profile>/` route on the multiplexing host gateway (the default setup) runs under the
+    root home's limit. The script's `HERMES_HOME` is still the profile's home.
+  - A profile with `gateway.standalone: true` runs its own gateway and uses its own limit.
+
+  From inside the script these two cases look the same. So for a profile that isn't marked
+  standalone, the gate uses the lower of the host's and the profile's limits. Every GitHub call
+  is clipped to the time left, a timer 3s later interrupts anything else that hangs, and a
+  gate-triggered queue drain gets at most half the remaining time. `doctor` prints one
+  `gate:timeout:<profile>` line for each profile hosting a loop route (reviewer, fixer,
+  adjudicator, observer). Each line names the gateway and file, flags any limit below 28s, and
+  says which file to fix.
 * **Seats.** Gates enqueue isolated turns and do not hold seat locks. Still, a gate that
   crashes or times out releases any seat claim its own process made, so a failed delivery never
   keeps a seat until `ttl_min`.

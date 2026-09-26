@@ -90,16 +90,67 @@ def budget_s() -> float:
 # The gateway reads ``script_timeout_seconds`` from its webhook platform block (default 30) and
 # kills a route script when it runs out. The gate cannot be told the value, so it reads the
 # same files the gateway does and fits its own budget inside it; ``doctor`` reports the fit.
+#
+# *Which* gateway runs a loop route (read from hermes-agent, never run):
+#
+# * A ``/p/<profile>/webhooks/<route>`` URL on the **host** gateway (``multiplex_profiles``, the
+#   default topology) is served by the default home's webhook adapter, so the timeout is the
+#   host's; ``_profile_scope`` then sets the routed profile as the context's home override and
+#   ``build_subprocess_env`` → ``_apply_profile_home`` hands the script
+#   ``HERMES_HOME=<root>/profiles/<profile>``.
+# * A profile that opts out of the multiplexer (``gateway.standalone: true`` in its own
+#   config.yaml), or any profile on a host that is not multiplexing, runs its own gateway
+#   (``hermes -p <profile> gateway`` sets ``HERMES_HOME`` to the profile home), whose adapter reads
+#   the *profile's* config — and the script inherits that same ``HERMES_HOME``.
+#
+# From inside the script those two look identical (both hand over the profile home). A standalone
+# profile is known from its own config; otherwise either gateway may be the one, and the gate
+# fits the *smaller* of the two limits — never a budget the actual gateway would cut short.
 
 GATEWAY_DEFAULT_TIMEOUT_S = 30   # gateway/platforms/webhook_filters.py DEFAULT_SCRIPT_TIMEOUT_SECONDS
 KEY = "script_timeout_seconds"
 
 
-def gateway_home() -> pathlib.Path:
-    """The home the gateway process read its config from: a routed script's HERMES_HOME may be
-    a profile's (``<root>/profiles/<name>``), but the webhook platform is configured at launch."""
-    home = config.home()
-    return home.parent.parent if home.parent.name == "profiles" else home
+def _profile_standalone(home: pathlib.Path) -> bool | None:
+    """``gateway.standalone: true`` in a profile's own config.yaml; ``None`` when unreadable."""
+    path = home / "config.yaml"
+    try:
+        text = path.read_text(encoding="utf-8-sig") if path.is_file() else ""
+    except OSError:
+        return None
+    if "standalone" not in text:
+        return False
+    try:
+        data = _read_yaml(text)
+    except Exception:  # noqa: BLE001
+        return None
+    gw = data.get("gateway") if isinstance(data, dict) else None
+    return isinstance(gw, dict) and gw.get("standalone") is True
+
+
+def gateway_hosts(home: pathlib.Path | None = None) -> list[tuple[str, pathlib.Path]]:
+    """``(label, home)`` of every gateway that may be running a route script under ``home``
+    (default: the ``HERMES_HOME`` this process inherited from its gateway)."""
+    home = pathlib.Path(home) if home is not None else config.home()
+    if home.parent.name != "profiles":
+        return [("default gateway", home)]
+    name, root = home.name, home.parent.parent
+    standalone = _profile_standalone(home)
+    if standalone:
+        return [(f"profile {name}'s standalone gateway", home)]
+    return [(f"profile {name}'s own gateway (if it runs one)", home),
+            (f"host gateway multiplexing profile {name}", root)]
+
+
+def effective_timeout(home: pathlib.Path | None = None) -> tuple[int | None, list[tuple]]:
+    """The limit to fit: the smallest readable one among the possible hosts, plus every
+    host's ``(label, home, seconds|None, where)``. ``None`` when no host could be read."""
+    rows = []
+    for label, host in gateway_hosts(home):
+        seconds, where = gateway_script_timeout(host)
+        rows.append((label, host, seconds, where))
+    known = [row[2] for row in rows if row[2] is not None]
+    return (min(known) if known else None), rows
 
 
 def _read_yaml(raw: str):
@@ -124,7 +175,7 @@ def gateway_script_timeout(home: pathlib.Path | None = None) -> tuple[int | None
     top-level one (``PlatformConfig.from_dict``). ``(None, reason)`` when a file names the key
     but cannot be read here.
     """
-    home = home or gateway_home()
+    home = pathlib.Path(home) if home is not None else config.home()
     blocks: list[tuple[str, object]] = []
     legacy = home / "gateway.json"
     try:
@@ -367,7 +418,7 @@ def run(gate: str, main: Callable[[], None]) -> None:
     sys.stdin = io.StringIO(raw)
     started = time.monotonic()
     try:
-        limit, _where = gateway_script_timeout()
+        limit, _rows = effective_timeout()
     except Exception:  # noqa: BLE001 - never let the fit check stop the gate
         limit = None
     budget, backstop = plan(limit or GATEWAY_DEFAULT_TIMEOUT_S)
