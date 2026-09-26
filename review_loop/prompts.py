@@ -189,7 +189,8 @@ What to do:
    The host pushes it to the PR branch only if the branch is still at {head}; you cannot push
    any other way.
 4. Write your answers to a file: for each finding, fixed (with `file:line`), or why it is not a
-   defect (with evidence), and what you deliberately did not change and why. At most 8 KiB.
+   defect (with evidence), and what you deliberately did not change and why. At most 8 KiB. They
+   are posted as a **public** PR comment: write for anyone who can read the PR.
 5. **Then ask for the next review through the broker, with those answers** (command below) —
    GitHub clears a pending review request the moment a verdict lands, so the loop only continues
    because you re-request it. The host posts your answers as one PR comment from the fixer's

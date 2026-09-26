@@ -139,6 +139,7 @@ def _export_committed_source(source_fd: int, destination: Path) -> None:
     client.mkdir(exist_ok=True)
     (client / '__init__.py').touch()
     shutil.copyfile(Path(__file__).with_name('broker_client.py'), client / 'broker_client.py')
+    shutil.copyfile(Path(__file__).with_name('wire.py'), client / 'wire.py')
     shutil.copyfile(Path(__file__).with_name('inference_proxy.py'), client / 'inference_proxy.py')
 
 
@@ -171,7 +172,8 @@ TOOLS = {
               f'{broker_client.MAX_ANSWERS // 1024} KiB) and run `python -m review_loop.broker_client '
               'request_review --answers-file /tmp/answers.md`: the host posts the answers once as a '
               'PR comment by the fixer account, where the next reviewer and the adjudicator read '
-              'them, then requests the review. It is the only way your answers leave the sandbox. '
+              'them, then requests the review. It is the only way your answers leave the sandbox, '
+              'and the comment is public to everyone who can see the PR. '
               'A fixer gets one push followed by one review request. '
               '(`--manifest-file` still takes a hand-built manifest: '
               '{"base_head", "message", "files": [{"path", "content_b64", "sha256"}]}.) '),
@@ -268,6 +270,7 @@ def run_turn(loop: dict, scope: broker_ipc.RunScope, *, source: Path, venv: Path
         client.mkdir(mode=0o700, parents=True)
         (client / '__init__.py').touch()
         shutil.copyfile(Path(__file__).with_name('broker_client.py'), client / 'broker_client.py')
+        shutil.copyfile(Path(__file__).with_name('wire.py'), client / 'wire.py')
         if scope.role == 'fixer':
             # Host-written and mounted read-only at /opt/client: the push helper's base_head.
             # A convenience, not an authority — the broker compares it with scope.head itself.

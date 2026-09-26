@@ -84,6 +84,8 @@ operator and no fixer turn starts. Your one publish is a push followed by the re
    is unknown is not retried. The broker's `ok` answer says how the comment went (`answers`:
    `posted`, `uncertain` or `denied`); report that. If a write is refused, stop and say so plainly;
    never describe a fix as published without an `ok`.
+   The comment is **public** to everyone who can see the PR: write it for that audience, and never
+   include secrets, credentials or anything from outside this repository.
 
 **Never merge, never mark your own work verified.** The push is exact-head: if the branch moved
 while you worked, it is refused rather than overwriting someone else's commits.

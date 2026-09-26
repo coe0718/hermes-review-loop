@@ -15,6 +15,7 @@ import re
 import time
 
 from . import gh
+from .wire import ANSWERS_MARKER  # one home, shared with the sandbox client
 
 _SHA = re.compile(r"[0-9a-f]{40}\Z")
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
@@ -166,8 +167,7 @@ def _audit(loop: dict, repo: str, number: int, head: str, branch: str,
 # any other comment: it is only trusted on a comment authored by the fixer seat's own login, and
 # even then the text is the fixer model's words — data for the next seat, never instructions.
 ANSWERS_MAX = 8 * 1024
-ANSWERS_MARKER = "<!-- review-loop:fixer-answers"
-_ANSWERS_MARKER = re.compile(r"<!-- review-loop:fixer-answers run=([A-Za-z0-9_.:-]{1,80}) "
+_ANSWERS_MARKER = re.compile(re.escape(ANSWERS_MARKER) + r" run=([A-Za-z0-9_.:-]{1,80}) "
                              r"head=([0-9a-f]{40}) base=([0-9a-f]{40}) -->\n")
 
 

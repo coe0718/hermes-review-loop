@@ -47,7 +47,7 @@ MAX_MESSAGE = 240
 # review_loop.broker.ANSWERS_MAX, and the broker's request line limit the answers travel in.
 MAX_ANSWERS = 8 * 1024
 MAX_REQUEST = 16 * 1024
-ANSWERS_MARKER = '<!-- review-loop:fixer-answers'
+from review_loop.wire import ANSWERS_MARKER  # copied into the sandbox with this client
 _SHA = re.compile(r'[0-9a-f]{40}\Z')
 _SEGMENT = re.compile(r'[A-Za-z0-9_.-]{1,128}\Z')
 _CONTROL_FILES = {'.gitmodules', '.gitattributes'}
