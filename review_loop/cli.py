@@ -867,6 +867,11 @@ def cmd_init(args) -> int:
     print("\nNext: give each seat's profile the token it needs ("
           "GH_TOKEN in the profile .env for git push, plus the token file named here), then "
           "`hermes review-loop status`.")
+    if not config.unattended_fixer_push_enabled(loop):
+        print("Then decide the fix leg: unattended fixer pushes are off, so a changes-requested "
+              "verdict is held for you and no fixer turn starts. To let the fixer answer "
+              f"verdicts, run `{config.fixer_push_enable_command(loop)}` "
+              "(read docs/operations.md on the PR-metadata race first).")
     return 0
 
 
@@ -1629,6 +1634,17 @@ def _cmd_fixer_push_locked(args) -> int:
     print(f"[{loop['id']}] {loop['repo']}: host-operator unattended fixer push "
           f"{'enabled (not GitHub owner consent; residual PR-metadata/ref race acknowledged)' if enabled else 'disabled'} "
           f"in {path}")
+    if enabled:
+        try:
+            from . import state as state_mod
+            held = [key for key, entry in state_mod.state_for(actual).queue_items("fixer").items()
+                    if config.is_fixer_push_hold(entry)]
+        except Exception:
+            held = []
+        if held:
+            print(f"  {len(held)} held verdict(s) ({', '.join(sorted(held))}) start on the next "
+                  f"watchdog sweep, or now: `hermes review-loop drain --loop {loop['id']} "
+                  "--seat fixer`")
     return 0
 
 

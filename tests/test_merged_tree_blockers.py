@@ -19,7 +19,7 @@ HEAD = "a" * 40
 LOOP = {"id": "widgets", "repo": "acme/widgets", "base": "main", "cap": 5,
         "fixers": ["fixer"], "reviewers": ["reviewer"], "reviewer_seat": "reviewer",
         "grace_min": 1, "marker_grace_min": 1, "cooldown_h": 1,
-        "ttl_min": 30, "inflight_ttl_min": 30, "seats": {"reviewer": {"route": "widgets-review"},
+        "ttl_min": 30, "inflight_ttl_min": 30, "unattended_fixer_push": True, "seats": {"reviewer": {"route": "widgets-review"},
         "fixer": {"route": "widgets-fix"}}}
 PR = {"number": 7, "state": "open", "head": {"sha": HEAD},
       "base": {"ref": "main"}, "user": {"login": "fixer"}, "draft": False,
