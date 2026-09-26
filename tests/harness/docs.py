@@ -68,7 +68,12 @@ def _invocations(path: pathlib.Path):
             continue
         if not in_fence or "hermes review-loop" not in line:
             continue
-        command = line[line.index("hermes review-loop"):]
+        start = line.index("hermes review-loop")
+        command = line[start:]
+        # Inside sample output a command is often quoted inline: `hermes review-loop …` — prose
+        # follows the closing backtick, and it is not part of the command.
+        if line[:start].endswith("`"):
+            command = command.split("`", 1)[0]
         following = index
         while command.rstrip().endswith("\\") and following + 1 < len(lines):
             following += 1
@@ -128,6 +133,17 @@ def group_docs() -> None:
           _rejects(parser, ["pause", "--loop", "widgets"]) is not None, True)
     check("  and accepts the one that replaced it",
           _rejects(parser, ["arm", "--loop", "widgets", "--pause"]), None)
+
+    # A command quoted inline in sample output ends at its closing backtick: the prose after it is
+    # not arguments, and a bad command quoted that way must still be caught.
+    sample = TMP / "inline-sample.md"
+    sample.write_text("```\n  next: run `hermes review-loop arm --loop widgets --pause` — then wait\n"
+                      "  next: run `hermes review-loop pause --loop widgets` — then wait\n```\n")
+    inline = [_argv(command) for _, command in _invocations(sample)]
+    check("an inline-quoted command stops at its closing backtick",
+          inline[0], ["arm", "--loop", "widgets", "--pause"])
+    check("  and a bad one quoted that way is still rejected",
+          _rejects(parser, inline[1]) is not None, True)
 
     found: list[tuple[pathlib.Path, int, list[str]]] = []
     for path in _doc_files():

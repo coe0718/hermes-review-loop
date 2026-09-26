@@ -203,6 +203,7 @@ class Base(unittest.TestCase):
                       {"DEEPSEEK_API_KEY": KEYS["adj"]})
         write_profile(self.home, "default", {"default": "claude-x", "provider": "bedrock"})
         self.loop = {"id": "demo", "repo": "acme/widgets", "base": "main", "state_dir": str(self.root / "state"),
+                     "unattended_fixer_push": True,
                      "read_token": "reader", "tokens": {},
                      "seats": {"reviewer": {"profile": "rev", "login": "reviewer"},
                                "fixer": {"profile": "fix", "login": "fixer"}},
@@ -324,8 +325,9 @@ class Worker(Base):
         with mock.patch.object(sup, "_spawn"):
             sup.enqueue(f"d-{seat}", "acme/widgets", 7, HEAD, seat)
         with sqlite3.connect(sup.db) as con:
-            con.execute("UPDATE runs SET state='launching', owner='w', generation='g' "
-                        "WHERE delivery=?", (f"d-{seat}",))
+            # A fixer row is launched only when admitted with pushes on (the gate holds it otherwise).
+            con.execute("UPDATE runs SET state='launching', owner='w', generation='g', "
+                        "push_admitted=1 WHERE delivery=?", (f"d-{seat}",))
             run_id = con.execute("SELECT id FROM runs WHERE delivery=?", (f"d-{seat}",)).fetchone()[0]
         seen = {}
 

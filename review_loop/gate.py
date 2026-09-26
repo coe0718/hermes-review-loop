@@ -102,30 +102,62 @@ def enqueue_isolated(loop: dict, seat: str, number: int, head: str, *, turn_key:
     supervisor.recover()
     delivery = f"{loop['repo']}:{number}:{head}:{seat}"
     supervisor.enqueue(delivery + (f':{turn_key}' if turn_key else ''),
-                       loop["repo"], number, head, seat, turn_key=turn_key)
+                       loop["repo"], number, head, seat, turn_key=turn_key,
+                       require_push_admission=seat == "fixer")
+
+
+def hold_fixer_push_off(loop: dict, st: state_mod.LoopState, number: int, head: str) -> bool:
+    """Hold a changes-requested verdict for the operator: unattended fixer pushes are off.
+
+    No ledger row, no worker, no model turn. The seat queue carries the reason with the exact
+    enable command, so explain, the watchdog and ``status`` show it; the watchdog re-evaluates
+    the held head once the loop opts in. Returns ``True`` only when this call recorded the hold
+    (an identical hold for this head is left as it was, so its age stays honest).
+    """
+    key = seat_key(loop, number)
+    queued = st.queue_items("fixer").get(key)
+    if config.is_fixer_push_hold(queued) and queued.get("head") == head:
+        return False
+    return st.queue_replace_if("fixer", key, queued, head, pr_url(loop, number),
+                               config.fixer_push_hold_reason(loop))
 
 
 def block_pr_agent(loop: dict, st: state_mod.LoopState, seat: str,
-                   number: int, head: str, on_queued=None, *, turn_key: str = '') -> None:
+                   number: int, head: str, on_queued=None, *, turn_key: str = '',
+                   on_push_off=None) -> None:
     """Durably enqueue an isolated turn; NEVER return a gateway-dispatch payload.
 
     An absent/invalid private runtime configuration is a visible fail-closed hold.
     The ledger's unique repo/PR/head/seat/turn index deduplicates webhook redelivery
     before launching a detached worker. No checkout or agent runs in this script.
+    A fixer turn on a loop without unattended pushes is held instead (``hold_fixer_push_off``),
+    and ``on_push_off`` (when given) is the notice sent in place of ``on_queued``.
     """
+    from .run_supervisor import FixerPushDisabled
+
     key = seat_key(loop, number)
     queued = st.queue_items(seat).get(key)
-    try:
-        enqueue_isolated(loop, seat, number, head, turn_key=turn_key)
-        st.queue_pop_if(seat, key, queued)
-        log(f"#{number} @ {head[:7]} {seat} enqueued for isolated worker")
-    except Exception as exc:
-        reason = f"isolated worker unavailable: {type(exc).__name__}: {exc}"
-        st.queue_replace_if(seat, key, queued, head, pr_url(loop, number), reason)
-        log(f"#{number} @ {head[:7]} {seat} held: {reason}")
-    if on_queued is not None:
+    push_off = seat == "fixer" and not config.unattended_fixer_push_enabled(loop)
+    if not push_off:
         try:
-            on_queued()
+            enqueue_isolated(loop, seat, number, head, turn_key=turn_key)
+            st.queue_pop_if(seat, key, queued)
+            log(f"#{number} @ {head[:7]} {seat} enqueued for isolated worker")
+        except FixerPushDisabled:
+            push_off = True  # the policy changed under the admission lock: same hold
+        except Exception as exc:
+            reason = f"isolated worker unavailable: {type(exc).__name__}: {exc}"
+            st.queue_replace_if(seat, key, queued, head, pr_url(loop, number), reason)
+            log(f"#{number} @ {head[:7]} {seat} held: {reason}")
+    if push_off:
+        # Checked before the runtime: a turn that could never publish is not worth a worker,
+        # and "pushes are off" is the reason the operator can act on.
+        hold_fixer_push_off(loop, st, number, head)
+        log(f"#{number} @ {head[:7]} fixer held: {config.fixer_push_hold_reason(loop)}")
+    notice = on_push_off if push_off and on_push_off is not None else on_queued
+    if notice is not None:
+        try:
+            notice()
         except Exception as exc:
             log(f"#{number} @ {head[:7]} observer notice failed: {type(exc).__name__}: {exc}")
     silence()
@@ -580,6 +612,11 @@ def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> di
     full_seat = bool(needed_seat and used >= limit and needed_seat not in held
                      and not (inflight_fix if needed_seat == "fixer" else inflight_review))
     hooks_line = _explain_hooks(armed, armed_error)
+    # The fixer gate holds a changes-requested verdict while the loop has not opted in to
+    # unattended pushes: no fixer turn can start, so the next event is the operator's.
+    push_off = bool(at_head) and not config.unattended_fixer_push_enabled(loop)
+    push_off_held = push_off and "fixer" not in held and not inflight_fix
+    fixer_queue_hold = queued_seat == "fixer" and queued_reason.startswith(config.FIXER_PUSH_HOLD)
 
     # -- every guard, in the gates' order, reported instead of silencing ----------------------
     if pr is None:
@@ -633,7 +670,14 @@ def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> di
                 blockers.append(f"{spent}/{cap} verdicts spent with no approval and no escalation "
                                 f"marker — the cap may not have fired (the watchdog reports this "
                                 f"shape too)")
-            if queued_seat:
+            if push_off_held and not parked and not pending_delivery and not (
+                    spent is not None and spent >= cap):
+                blockers.append(f"{config.FIXER_PUSH_HOLD}: the changes-requested verdict at head "
+                                f"{short} starts no fixer turn until the loop opts in — "
+                                f"`{config.fixer_push_enable_command(loop)}`")
+            if fixer_queue_hold:
+                pass  # the push-off blocker above is this queue entry's whole story
+            elif queued_seat:
                 blockers.append(f"no capacity: queued with the {queued_seat} seat — {queued_reason}")
             elif full_seat:
                 blockers.append(f"no capacity: {needed_seat} seat at capacity {used}/{limit} "
@@ -645,7 +689,8 @@ def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> di
             if head_states and not reviewed:
                 blockers.append(f"non-verdict review at head {short} ({'/'.join(head_states)}) "
                                 "does not suppress a fresh reviewer request")
-            if at_head and "fixer" not in held and not inflight_fix and not queued_seat:
+            if (at_head and "fixer" not in held and not inflight_fix and not queued_seat
+                    and not push_off):
                 blockers.append(f"the changes-requested verdict at head {short} has no fix run out "
                                 f"— the fixer gate did not start one for that delivery")
             if request_pending and not held and not inflight_review and not at_head and not approved:
@@ -738,6 +783,14 @@ def explain(loop: dict, st: state_mod.LoopState, number: int, facts: dict) -> di
             action = (f"re-deliver the {'changes-requested review' if at_head else 'review request'} "
                       f"event for head {short} to the {'fixer' if at_head else 'reviewer'} gate "
                       "to create and deliver the missing breach marker — no ruling is underway yet")
+    elif push_off_held:
+        kind = "operator"
+        action = (f"operator decision: unattended fixer pushes are off for this loop, so the "
+                  f"changes-requested verdict at head {short} starts no fixer turn. To let the "
+                  f"fixer answer it, run `{config.fixer_push_enable_command(loop)}` — the next "
+                  f"watchdog sweep (or `hermes review-loop drain --loop {loop['id']} --seat fixer`) "
+                  "then starts the fix run for this head; or fix it by hand, push, and re-request "
+                  "review")
     elif stale_held == {"reviewer"} and at_head:
         kind = "fixer-retry"
         action = (f"re-deliver the changes-requested review event for head {short} to the fixer gate "

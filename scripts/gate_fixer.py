@@ -9,7 +9,9 @@ when a verdict it must answer lands:
   GitHub says *now*, with this review still the latest effective verdict there;
 * ``commented`` and ``approved`` end here — approval is where the loop stops being useful;
 * the verdict that reaches the cap is **not** a work order. Handing the fixer a fourth fix
-  no reviewer will read is how a loop burns a night; the PR goes to adjudication instead.
+  no reviewer will read is how a loop burns a night; the PR goes to adjudication instead;
+* a loop without unattended fixer pushes (the default) starts no fixer turn: the verdict is
+  held for the operator with the enable command, and the watchdog re-evaluates it after opt-in.
 
 stdin : a GitHub webhook payload
 stdout: ``[SILENT]`` (eligible runs queue; whole-agent isolation not available)
@@ -208,12 +210,22 @@ def main() -> None:
                     f"({loop['cap']} reviews / {loop['cap'] - 1} fixes)")
         silence(f"cap reached on #{number} — handed to adjudication instead of a fix")
 
-    gate.block_pr_agent(
-        loop, st, seat, number, pr_head,
-        on_queued=lambda: observer.notify(
+    # A loop that has not opted in to unattended fixer pushes gets no fixer turn: it could not
+    # publish, so it would spend a model conversation and fail. block_pr_agent holds the verdict
+    # for the operator instead (no ledger row), and the same notice says what to run. Its key is
+    # the review id, so a redelivered verdict — or the drain after an opt-in — is not a second one.
+    def verdict_notice(next_turn: str):
+        return lambda: observer.notify(
             loop, st, "verdict", number, pr_head, identity=review.get("id"),
             outcome="changes requested", actor=gate.reviewer_login(review),
-            next_turn="fixer queued", round_no=prior + 1))
+            next_turn=next_turn, round_no=prior + 1)
+
+    gate.block_pr_agent(
+        loop, st, seat, number, pr_head,
+        on_queued=verdict_notice("fixer queued"),
+        on_push_off=verdict_notice(
+            "you — fixer held: unattended fixer pushes are off; to let the fixer answer, run "
+            f"`{config.fixer_push_enable_command(loop)}`"))
 
 
 if __name__ == "__main__":
