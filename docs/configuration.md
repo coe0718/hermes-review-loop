@@ -276,19 +276,60 @@ dummy key. Changing a seat's model = `hermes -p <profile> model`.
 `hermes review-loop models --profile NAME` (or `--seat reviewer --loop ID`) lists, read-only, what
 that profile's provider offers in the Hermes model catalog.
 
-**Supported providers.** Anything Hermes resolves to an **OpenAI chat-completions** endpoint over
-HTTPS with an API key: `custom:<name>` / named `custom_providers`, `openrouter`, `deepseek`, and any
-other API-key provider whose Hermes `api_mode` is `chat_completions`. The inference proxy forwards
-only that wire shape (`Bearer` key, fixed `…/chat/completions` URL). **Not supported**, refused by
-name before any credential is read or refreshed: OAuth/subscription providers (`openai-codex`,
-`nous`, `xai-oauth`, `qwen-oauth`, `minimax-oauth`, Copilot), Anthropic Messages, Bedrock, Vertex,
-Azure Foundry and MoA; a profile with no `model.provider` (auto-detect) is refused too.
+**Supported providers, by wire format.** What decides support is the `api_mode` Hermes resolves
+the profile to; the inference proxy has one fixed contract per mode (sandbox path, host-chosen
+upstream path and headers, forced model, output-token cap in that mode's own field, quota,
+streamed answers relayed as they arrive — see `review_loop/inference_proxy.py`):
+
+| `api_mode` | providers (examples) | credential | upstream (host-fixed) | sandbox speaks |
+|---|---|---|---|---|
+| `chat_completions` | `custom:<name>`, `openrouter`, `deepseek`, other API-key providers | API key (`Bearer`) | `…/chat/completions` | `provider: custom` → `/v1/chat/completions` |
+| `chat_completions` | `qwen-oauth`, `nous` (non-`anthropic/*` models) | OAuth (host-refreshed) | `…/chat/completions` | same |
+| `codex_responses` | `openai-codex` (ChatGPT subscription), `xai-oauth` | OAuth (host-refreshed) | `…/backend-api/codex/responses`, `…/v1/responses` | named provider `review-loop-seat`, `api_mode: codex_responses` → `/v1/responses` |
+| `codex_responses` | API-key providers Hermes routes to Responses (OpenAI, xAI keys) | API key | `…/responses` | same |
+| `anthropic_messages` | `anthropic` with a Claude Pro/Max **subscription** token | OAuth (host-refreshed), `Bearer` + Claude Code identity | `https://api.anthropic.com/v1/messages` | `provider: anthropic` at the bridge with a dummy OAuth-shaped token, so Hermes applies the Claude Code system prefix and `mcp__` tool names the subscription requires |
+| `anthropic_messages` | `anthropic` with a Console key, `minimax-oauth`, other Messages endpoints | API key (`x-api-key`) or `Bearer`, as Hermes decides | `…/v1/messages` | named provider `review-loop-seat`, `api_mode: anthropic_messages` → `/anthropic/v1/messages` |
+
+Host-chosen headers come from Hermes's own client code, resolved on the host: the Codex
+`ChatGPT-Account-ID`/`originator`/`User-Agent` set, Anthropic `anthropic-version`,
+`anthropic-beta` (plus `oauth-2025-04-20`, `claude-code/<version>` user agent and `x-app` for a
+subscription), the Qwen portal and OpenRouter headers. The sandbox's own `Authorization`,
+`x-api-key`, beta, account and user-agent headers are always dropped; only the Responses
+session-affinity headers `session_id`/`x-client-request-id` pass through. Caps: 4096 output tokens
+per chat completion (over-cap requests refused, as before); 16384 for Responses (refused over
+cap; on the ChatGPT Codex backend the field is validated and then **dropped**, because that backend
+rejects it — Hermes's own Codex client omits it too — so there the per-turn call quota and the
+subscription's own limits bound output); 16384 for Messages, **clamped** (Hermes always asks for the
+model's native ceiling, e.g. 64000) with any extended-thinking budget kept below it.
+
+**Not supported**, refused before any credential is read or refreshed: Copilot (token exchange
+with its own client headers), Bedrock, Vertex, Azure Foundry and MoA (by name); a profile with
+`model.openai_runtime: codex_app_server` (the turn would be a codex subprocess with its own login)
+or `model.api_mode: bedrock_converse`; any other provider whose Hermes `auth_type` is not an API
+key; and a profile with no `model.provider` (auto-detect). Any other `api_mode` Hermes resolves to
+is refused after resolution, before the turn.
+
+**OAuth seats are refreshed on the host, never in the sandbox.** Hermes keeps the refresh token in
+the profile's `auth.json` (or Claude Code's / the Codex CLI's own store) under its own `auth.lock`;
+review-loop only ever receives the short-lived access token, over the resolver process's pipe,
+into the turn's proxy. The proxy re-runs the same isolated resolution when the token is within
+60 s of the expiry Hermes states (or, when Hermes states none, the token's own JWT `exp`), and once
+after an upstream 401 — asking Hermes to rotate exactly that rejected token — then retries the
+request once. Resolutions of one profile are serialized (thread lock + `flock` under
+`$HERMES_HOME/state/review-loop-seat-locks/`), so two seats sharing a profile never refresh in
+parallel; the second simply reads the token the first refreshed. The sandbox sees only a dummy key.
+
+> **A subscription seat shares its rate limits with you.** A seat on `openai-codex`, a Claude
+> subscription, `xai-oauth`, `qwen-oauth` or `nous` draws on the same plan and usage window as your
+> own use of that account (and any other seat on the same profile). A busy loop can exhaust it — and
+> your own session can starve the loop. A 429 in `selftest` says so.
 
 **Precedence, per seat:**
 
 1. `seats.<seat>` in the runtime file — `{"model", "upstream", "key_file"}` — an explicit
    per-seat override (testing, or a profile whose provider the proxy cannot speak). `upstream` is the
-   full HTTPS `…/chat/completions` URL; `key_file` is a private one-line key file.
+   full HTTPS `…/chat/completions` URL; `key_file` is a private one-line key file. Overrides are
+   always chat-completions with a static key; OAuth seats come from profiles.
 2. the seat's Hermes profile — the default.
 3. the legacy top-level `model` / `upstream` / `key_file` (the pre-#32 seven-key file) — used
    **only** for a seat whose profile cannot be resolved, so existing runtime files keep working.
@@ -296,10 +337,11 @@ Azure Foundry and MoA; a profile with no `model.provider` (auto-detect) is refus
    it shares one model and one key.
 
 Otherwise the turn is **held**: the run is marked `failed` before any GitHub read, with the reason
-in the ledger (`seat model unresolved: profile default (openai-codex): …`), and it never falls back
-to another seat's model or key. `doctor` shows each seat's profile → provider / model (read-only,
-no credential lookup); `selftest` resolves the credential and makes one tiny completion per
-distinct seat resolution.
+in the ledger (`seat model unresolved: profile default (bedrock): …`), and it never falls back
+to another seat's model or key. `doctor` shows each seat's profile → provider / model with the
+expected `[api_mode, API key | OAuth (host-refreshed)]` (read-only, no credential lookup);
+`selftest` resolves the credential, shows the resolved `[api_mode, auth]`, and makes one tiny
+request in that wire format per distinct seat resolution.
 
 ## Environment overrides
 

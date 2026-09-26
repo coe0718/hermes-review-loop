@@ -72,9 +72,9 @@ FAKE_HERMES = {
             if provider == "deepseek":
                 return {"provider": "deepseek", "api_mode": "chat_completions",
                         "base_url": cfg.get("base_url", ""), "api_key": os.environ.get("DEEPSEEK_API_KEY", "")}
-            if provider == "anthropicish":
-                return {"provider": "anthropicish", "api_mode": "anthropic_messages",
-                        "base_url": "https://anthropic.test", "api_key": "A-KEY-0000"}
+            if provider == "geminiish":
+                return {"provider": "geminiish", "api_mode": "gemini_native",
+                        "base_url": "https://gemini.test", "api_key": "G-KEY-0000"}
             if provider.startswith("custom:"):
                 name = provider.split(":", 1)[1]
                 for entry in load_config().get("custom_providers") or []:
@@ -130,7 +130,7 @@ class Base(unittest.TestCase):
         write_profile(self.home, "adj", {"default": "deepseek-chat", "provider": "deepseek",
                                          "base_url": "https://api.deepseek.test/v1"},
                       {"DEEPSEEK_API_KEY": KEYS["adj"]})
-        write_profile(self.home, "default", {"default": "gpt-x", "provider": "openai-codex"})
+        write_profile(self.home, "default", {"default": "claude-x", "provider": "bedrock"})
         self.loop = {"id": "demo", "repo": "acme/widgets", "base": "main", "state_dir": str(self.root / "state"),
                      "read_token": "reader", "tokens": {},
                      "seats": {"reviewer": {"profile": "rev", "login": "reviewer"},
@@ -177,16 +177,16 @@ class ProfileResolution(Base):
         self.assertNotIn("PARENT-PROCESS-LEAK", str(caught.exception))
 
     def test_unsupported_providers_are_refused_before_credentials_are_touched(self):
-        for provider in ("openai-codex", "someoauth", "auto"):
+        for provider in ("bedrock", "copilot", "someoauth", "auto"):
             with self.subTest(provider=provider):
                 path = write_profile(self.home, "rev", {"default": "m", "provider": provider})
                 with self.assertRaisesRegex(seat_model.SeatModelError, "rev"):
                     seat_model.resolve_seat(self.loop, "reviewer", self.settings)
                 self.assertFalse((path / "resolved.marker").exists())
 
-    def test_non_chat_completions_api_is_refused(self):
-        write_profile(self.home, "rev", {"default": "m", "provider": "anthropicish"})
-        with self.assertRaisesRegex(seat_model.SeatModelError, "anthropic_messages.*chat-completions"):
+    def test_unknown_api_mode_is_refused(self):
+        write_profile(self.home, "rev", {"default": "m", "provider": "geminiish"})
+        with self.assertRaisesRegex(seat_model.SeatModelError, "gemini_native.*cannot speak"):
             seat_model.resolve_seat(self.loop, "reviewer", self.settings)
 
     def test_plain_http_provider_is_refused(self):
@@ -227,7 +227,7 @@ class Precedence(Base):
         loop = {**self.loop, "adjudicator": {"route": "breach", "profile": "default"}}
         adj = seat_model.resolve_seat(loop, "adjudicator", settings)
         self.assertEqual((adj.origin, adj.model), ("legacy", "legacy-model"))
-        self.assertIn("openai-codex", adj.warning)
+        self.assertIn("bedrock", adj.warning)
 
     def test_runtime_file_shapes(self):
         base = {k: "/x" for k in seat_model.HOST_KEYS}
@@ -300,7 +300,7 @@ class Worker(Base):
         self.assertEqual(seen, {})
         self.assertFalse(called_github)
         self.assertEqual(row[0], "failed")
-        self.assertRegex(row[1], r"^seat model unresolved: profile default \(openai-codex\).*OAuth")
+        self.assertRegex(row[1], r"^seat model unresolved: profile default \(bedrock\).*cloud signing")
 
     def test_legacy_seven_key_runtime_still_runs(self):
         settings = {**self.settings, "model": "legacy-model",
