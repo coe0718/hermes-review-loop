@@ -285,5 +285,199 @@ class Surfaces(Base):
         self.assertIn("fixer-push --loop", (ROOT / "docs" / "operations.md").read_text())
 
 
+
+# -- Gap 2: the fixer is told, and helped to build, the push manifest ----------------------------
+
+
+class PushHelper(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.work = self.root / "work"
+        (self.work / "src").mkdir(parents=True)
+        (self.work / "src" / "a.py").write_text("print('fixed')\n")
+        (self.work / "README.md").write_text("docs\n")
+        self.turn = self.root / "turn.json"
+        self.turn.write_text(json.dumps({"head": HEAD}))
+        (self.root / "msg.txt").write_text("Fix the widget off-by-one\n")
+        from review_loop import broker_client
+        self.client = broker_client
+        for name, value in (("WORK", str(self.work)), ("TURN_FILE", str(self.turn))):
+            patcher = mock.patch.object(broker_client, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def main(self, *argv: str):
+        """Run the in-sandbox CLI; any socket use at all fails the test."""
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", ["broker_client", *argv]), \
+             mock.patch.object(self.client.socket, "socket",
+                               side_effect=AssertionError("socket opened")) as sock, \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                self.client.main()
+                code = 0
+            except SystemExit as exc:
+                code = exc.code
+        return code, out.getvalue(), err.getvalue(), sock
+
+    def test_helper_builds_a_manifest_the_broker_accepts(self):
+        from review_loop import safe_push
+        manifest = self.client.build_manifest(["src/a.py", str(self.work / "README.md")],
+                                              "Fix the widget")
+        self.assertEqual(set(manifest), {"base_head", "message", "files"})
+        base, files = safe_push._manifest(manifest)
+        self.assertEqual(base, HEAD)
+        self.assertEqual(files, [("src/a.py", b"print('fixed')\n"), ("README.md", b"docs\n")])
+
+    def test_limits_mirror_the_broker(self):
+        from review_loop import safe_push
+        self.assertEqual((self.client.MAX_FILES, self.client.MAX_FILE, self.client.MAX_CONTENT,
+                          self.client.MAX_MESSAGE),
+                         (safe_push.MAX_FILES, safe_push.MAX_FILE, safe_push.MAX_CONTENT,
+                          safe_push.MAX_MESSAGE))
+        self.assertEqual(self.client._CONTROL_FILES, safe_push.CONTROL_FILES)
+        self.assertEqual(self.client._CONTROL_PATHS, safe_push.CONTROL_PATHS)
+
+    def test_dry_run_sends_nothing(self):
+        code, out, _, sock = self.main("push", "--files", "src/a.py", "--message-file",
+                                       str(self.root / "msg.txt"), "--dry-run")
+        self.assertEqual(code, 0)
+        result = json.loads(out)
+        self.assertEqual((result["dry_run"], result["base_head"], result["message"]),
+                         (True, HEAD, "Fix the widget off-by-one"))
+        sock.assert_not_called()
+
+    def test_refusals_happen_before_any_socket_call(self):
+        (self.work / "big.py").write_bytes(b"x" * (64 * 1024 + 1))
+        (self.work / ".github" / "workflows").mkdir(parents=True)
+        (self.work / ".github" / "workflows" / "ci.yml").write_text("on: push\n")
+        (self.work / "CODEOWNERS").write_text("* @me\n")
+        (self.work / "link.py").symlink_to(self.work / "src" / "a.py")
+        many = []
+        for i in range(25):
+            (self.work / f"f{i}.py").write_text(str(i))
+            many.append(f"f{i}.py")
+        cases = {
+            "file too large": (["big.py"], "fix", "at most 65536"),
+            "too many files": (many, "fix", "1 to 24"),
+            "message too long": (["src/a.py"], "x" * 241, "at most 240"),
+            "empty message": (["src/a.py"], "  ", "non-empty"),
+            "workflow": ([".github/workflows/ci.yml"], "fix", "control file"),
+            "codeowners": (["CODEOWNERS"], "fix", "control file"),
+            "missing file": (["gone.py"], "fix", "cannot delete"),
+            "symlink": (["link.py"], "fix", "symlink"),
+            "outside work": (["/etc/hostname"], "fix", "not a file under"),
+            "duplicate": (["src/a.py", "src/a.py"], "fix", "named twice"),
+        }
+        for name, (files, message, expect) in cases.items():
+            with self.subTest(name):
+                code, _, err, sock = self.main("push", "--files", *files, "--message", message)
+                self.assertEqual(code, 2)
+                self.assertIn("unspent", err)
+                self.assertIn(expect, err)
+                sock.assert_not_called()
+
+    def test_base_head_comes_from_the_host_turn_file(self):
+        self.turn.unlink()
+        code, _, err, sock = self.main("push", "--files", "src/a.py", "--message", "fix")
+        self.assertEqual(code, 2)
+        self.assertIn("head is unavailable", err)
+        sock.assert_not_called()
+
+    def test_tampered_base_head_is_still_refused_by_the_broker(self):
+        from review_loop import broker, safe_push
+        self.turn.write_text(json.dumps({"head": "c" * 40}))
+        manifest = self.client.build_manifest(["src/a.py"], "fix")
+        loop = {"repo": REPO, "unattended_fixer_push": True}
+        with mock.patch.object(broker, "authorize", side_effect=AssertionError("authorized")):
+            with self.assertRaisesRegex(broker.BrokerDenied, "base differs"):
+                safe_push.push(loop, repo=REPO, number=7, head=HEAD, role="fixer",
+                               branch="fix-7", manifest=manifest)
+
+    def test_manifest_file_still_works(self):
+        manifest = self.client.build_manifest(["src/a.py"], "fix")
+        (self.root / "m.json").write_text(json.dumps(manifest))
+        with mock.patch.object(self.client, "call", return_value={"ok": True}) as call, \
+             mock.patch.object(sys, "argv", ["broker_client", "push", "--manifest-file",
+                                             str(self.root / "m.json")]), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.client.main()
+        call.assert_called_once_with("push", manifest=manifest)
+
+
+class FixerInstructions(unittest.TestCase):
+    def test_fixer_is_told_the_helper_limits_and_what_a_push_cannot_do(self):
+        from review_loop import prompts, trusted_turn
+        text = trusted_turn.tool_instructions("fixer")
+        for needle in ("broker_client push --files", "--message-file", "--dry-run",
+                       "24 files", "64 KiB", "128 KiB", "240 bytes", "cannot delete or rename",
+                       ".github/", "CODEOWNERS", "request_review", "--manifest-file",
+                       "content_b64", "no `.git`"):
+            self.assertIn(needle, text)
+        self.assertIn("cannot delete or rename", prompts.ISOLATED_FIXER)
+        self.assertIn("--dry-run", prompts.ISOLATED_FIXER)
+        # Other seats are not offered the helper.
+        for role in ("reviewer", "adjudicator"):
+            self.assertNotIn("--files", trusted_turn.tool_instructions(role))
+
+    def test_run_turn_writes_the_head_read_only_for_the_fixer_only(self):
+        import subprocess
+        from review_loop import broker_client, broker_ipc, contained, trusted_turn
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        root.chmod(0o700)
+        for name in ("venv", "runtime", "rust"):
+            (root / name).mkdir()
+        loop = {"id": "one", "repo": REPO, "state_dir": str(root / "state")}
+
+        class Inference:
+            def __init__(self, directory, *a, **k):
+                self.directory = directory
+
+            def __enter__(self):
+                self.directory.mkdir()
+                (self.directory / "model.sock").touch()
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def stage(_loop, **kw):
+            kw["sandbox_root"].mkdir()
+            return kw["sandbox_root"]
+
+        for role in ("fixer", "reviewer"):
+            seen = {}
+
+            def run(**kw):
+                turn = Path(kw["client_code"]) / Path(broker_client.TURN_FILE).name
+                seen["turn"] = json.loads(turn.read_text()) if turn.exists() else None
+                seen["mode"] = turn.stat().st_mode & 0o777 if turn.exists() else None
+                seen["query"] = Path(kw["query"]).read_text()
+                return subprocess.CompletedProcess([], 1, "", "")
+
+            scope = broker_ipc.RunScope(REPO, 7, HEAD, role, "fix-7", "rid", str(root / "db"))
+            with self.subTest(role), \
+                 mock.patch.object(trusted_turn, "_safe_code_snapshot",
+                                   side_effect=lambda src, dst: dst.mkdir()), \
+                 mock.patch.object(trusted_turn.trusted_fetch, "stage", side_effect=stage), \
+                 mock.patch.object(trusted_turn.inference_proxy, "InferenceCapability", Inference), \
+                 mock.patch.object(contained.Path, "is_socket", return_value=True), \
+                 mock.patch.object(contained, "run", side_effect=run):
+                trusted_turn.run_turn(loop, scope, source=root, venv=root / "venv",
+                                      runtime=root / "runtime", rust=root / "rust",
+                                      upstream="https://model.invalid", key="k", model="m",
+                                      prompt="FIX", timeout=5, work_root=root / "work")
+                if role == "fixer":
+                    self.assertEqual(seen["turn"], {"head": HEAD})
+                    self.assertEqual(seen["mode"], 0o444)
+                    self.assertIn("push --files", seen["query"])
+                else:
+                    self.assertIsNone(seen["turn"])
+
+
 if __name__ == "__main__":
     unittest.main()
