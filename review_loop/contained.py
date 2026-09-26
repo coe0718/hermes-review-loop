@@ -52,6 +52,11 @@ MAX_CAPTURE = 256 * 1024
 # workspaces' are 3.3 GiB and 3.9 GiB, all of which land in ``/work`` because ``CARGO_TARGET_DIR``
 # points there. A cap below a real target does not fail loudly — the seat reports "could not
 # verify" and every review requests changes, which is the failure the crate cache exists to fix.
+# Overrides this resolver refused, so `doctor` can report them: a bound nobody can parse must not
+# vanish into an unattended turn's stderr.
+IGNORED_SIZE_OVERRIDES: list[tuple[str, str, str]] = []
+
+
 def _size_from_env(name: str, gib: int) -> int:
     """A mount bound, overridable with ``REVIEW_LOOP_<NAME>_GIB``.
 
@@ -64,11 +69,12 @@ def _size_from_env(name: str, gib: int) -> int:
     try:
         value = int(raw) if raw else gib
         if not 1 <= value <= 1024:
-            raise ValueError(f"outside 1..1024")
+            raise ValueError("outside 1..1024")
     except ValueError as exc:
         if raw:
             print(f"contained: ignoring REVIEW_LOOP_{name}_GIB={raw!r} ({exc}); using {gib} GiB",
                   file=sys.stderr)
+            IGNORED_SIZE_OVERRIDES.append((name, raw, str(exc)))
         value = gib
     return value * 1024 ** 3
 

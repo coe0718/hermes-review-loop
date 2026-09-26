@@ -131,6 +131,25 @@ class SnapshotSecretTests(GitTree):
         self.assertFalse((destination / 'pkg/keys/prod.json').exists())
         self.assertFalse((destination / 'pkg/credentials/notes.md').exists())
 
+    def test_a_plugin_manifest_is_configuration_not_a_credential(self):
+        # `plugins/model-providers/nebius-token-factory/plugin.yaml` configures a token provider:
+        # the word is in the directory, and what the file *is* is a manifest.
+        manifest = 'plugins/model-providers/nebius-token-factory/plugin.yaml'
+        self.write({manifest: 'name: nebius\nkind: provider\n'})
+        self.git('add', '.')
+        self.commit('plugin manifest')
+        destination = self.export()
+        self.assertTrue((destination / manifest).exists())
+
+    def test_a_credential_inside_a_plugin_manifest_is_still_dropped(self):
+        # The exemption is about the file's *name*: the content filter still reads it.
+        manifest = 'plugins/token-factory/plugin.yaml'
+        self.write({manifest: 'api_key: %s\n' % SENTINEL})
+        self.git('add', '.')
+        self.commit('manifest carrying a key')
+        destination = self.export()
+        self.assertFalse((destination / manifest).exists())
+
     def test_importable_modules_are_exported_whatever_their_name(self):
         # The snapshot is on PYTHONPATH: `hermes_cli.main` imports
         # `hermes_cli.subcommands.secrets` at module level, and `agent/secret_sources` is a package

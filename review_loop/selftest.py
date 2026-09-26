@@ -35,6 +35,7 @@ from contextlib import contextmanager
 import http.client
 import json
 import os
+import pathlib
 from pathlib import Path
 import re
 import shutil
@@ -778,6 +779,59 @@ _DENIAL_FIX = {
 }
 
 
+def _gib(count: int) -> str:
+    return f"{count / 1024 ** 3:.1f} GiB"
+
+
+def _du(path: pathlib.Path) -> int:
+    """Bytes under ``path``, counted the way ``du`` counts them (no symlink following)."""
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += (pathlib.Path(root) / name).lstat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def check_build_fits(report: Report, loop: dict, number: int | None) -> None:
+    """The seat's cap against a build it will actually have to hold.
+
+    ``/work`` is a tmpfs the seat builds in, and a cap below a real target does not fail loudly:
+    the seat reports that it cannot verify and every review requests changes. So measure the
+    closest real build available — the isolation clone's own ``target`` — and say whether it fits.
+    """
+    from . import contained
+    step = "sandbox"
+    caps = (f"/work {_gib(contained.CHECKOUT_SIZE)}, /tmp {_gib(contained.SCRATCH_SIZE)}")
+    for name, raw, why in contained.IGNORED_SIZE_OVERRIDES:
+        report.add(step, f"sandbox:override:{name}", FAIL,
+                   f"REVIEW_LOOP_{name}_GIB={raw!r} was refused ({why}); the default is in force",
+                   "fix the value: an integer 1..1024 GiB")
+    if number is None:
+        report.add(step, "sandbox:build-fits", SKIP, f"caps are {caps}",
+                   "pass --pr N to measure a build against them")
+        return
+    clone = str(loop.get("clone") or "")
+    target = (pathlib.Path(clone).expanduser() / "target") if clone else None
+    if target is None or not target.is_dir():
+        report.add(step, "sandbox:build-fits", SKIP,
+                   f"no build output to measure (looked for {'<clone>/target' if target else 'a clone'}); "
+                   f"caps are {caps}",
+                   "point `set --clone` at the working clone, or raise "
+                   "REVIEW_LOOP_CHECKOUT_SIZE_GIB if a real target outgrows the cap")
+        return
+    size = _du(target)
+    if size <= contained.CHECKOUT_SIZE:
+        report.add(step, "sandbox:build-fits", PASS, f"{_gib(size)} in {target.name} fits {caps}")
+        return
+    report.add(step, "sandbox:build-fits", FAIL,
+               f"{_gib(size)} in {target} does not fit /work ({_gib(contained.CHECKOUT_SIZE)})",
+               "raise REVIEW_LOOP_CHECKOUT_SIZE_GIB in the environment the gateway runs in, "
+               "restart it, and confirm with `doctor`")
+
+
 def check_authorization(report: Report, loop: dict, number: int | None) -> dict | None:
     """Step 5: ``broker.authorize`` for a reviewer write — it only reads. Returns the live PR."""
     from . import broker, review_receipt
@@ -955,6 +1009,7 @@ def run(loop: dict, *, pr: int | None = None, model: bool = True, live_turn: boo
         check_identities(report, loop)
         report.step("5. Broker authorization (dry run)")
         live_pr = check_authorization(report, loop, pr)
+        check_build_fits(report, loop, pr)
         report.step("6. Supervisor ledger, watchdog, observer")
         check_ledger(report, loop, runtime_file, settings)
         report.step("7. Live isolated reviewer turn (no-write)")

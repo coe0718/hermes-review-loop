@@ -314,6 +314,42 @@ class BrokerClaimTests(unittest.TestCase):
         # refusal to connect.
         self.assertEqual(answer, {"ok": False, "error": "operation out of scope"})
 
+    def test_a_refused_override_is_recorded_for_doctor(self):
+        """A bound nobody can parse must not vanish into an unattended turn's stderr."""
+        self.addCleanup(contained.IGNORED_SIZE_OVERRIDES.clear)
+        with mock.patch.dict("os.environ", {"REVIEW_LOOP_CHECKOUT_SIZE_GIB": "sixteen"}):
+            self.assertEqual(contained._size_from_env("CHECKOUT_SIZE", 8), 8 * 1024 ** 3)
+        self.assertTrue(any(name == "CHECKOUT_SIZE" and raw == "sixteen" and why
+                            for name, raw, why in contained.IGNORED_SIZE_OVERRIDES))
+
+    def test_doctor_reports_the_caps_and_the_worst_case(self):
+        """The caps are tmpfs, so they are a memory budget, not a disk one."""
+        from review_loop import doctor
+        # This loop names no seats: one turn each, plus the adjudicator.
+        # A refused override is its own check, so it must not colour the ordinary lines here:
+        # the list is filled once at import, from this process's environment.
+        with mock.patch.object(contained, "IGNORED_SIZE_OVERRIDES", []), \
+                mock.patch.object(doctor, "_host_memory",
+                                  return_value=(64 * 1024 ** 3, 64 * 1024 ** 3)):
+            check = doctor.check_sandbox_caps({"id": "t"})
+        self.assertEqual(check.name, "sandbox:caps")
+        self.assertEqual(check.status, "verified")
+        self.assertIn("8.0 GiB", check.detail)
+        self.assertIn("3 concurrent turns", check.detail)
+        with mock.patch.object(contained, "IGNORED_SIZE_OVERRIDES", []), \
+                mock.patch.object(doctor, "_host_memory",
+                                  return_value=(4 * 1024 ** 3, 8 * 1024 ** 3)):
+            small = doctor.check_sandbox_caps({"id": "t"})
+        self.assertEqual(small.status, "mismatch")
+        self.assertIn("more than the 4.0 GiB available", small.detail)
+        self.assertIn("one at a time", small.fix)
+        with mock.patch.object(contained, "IGNORED_SIZE_OVERRIDES",
+                               [("CHECKOUT_SIZE", "sixteen", "not an integer")]):
+            refused = doctor.check_sandbox_caps({"id": "t"})
+        self.assertEqual(refused.status, "mismatch")
+        self.assertIn("REVIEW_LOOP_CHECKOUT_SIZE_GIB", refused.detail)
+        self.assertIn("fix the value", refused.fix)
+
 
 if __name__ == "__main__":
     unittest.main()

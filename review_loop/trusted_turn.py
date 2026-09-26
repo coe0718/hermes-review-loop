@@ -61,6 +61,10 @@ def _safe_code_snapshot(source: Path, destination: Path) -> None:
 _ALLOWED_SUFFIXES = frozenset({'.py', '.json', '.yaml', '.yml', '.toml', '.md', '.txt',
                                '.jinja2', '.j2', '.html'})
 _CODE_SUFFIXES = frozenset({'.py', '.jinja2', '.j2', '.html'})
+# A plugin's manifest is configuration, not a credential, whatever directory holds it:
+# `plugins/model-providers/nebius-token-factory/plugin.yaml` configures a token provider. The
+# content filter below still applies to it, so a key written inside one is still dropped.
+_PLUGIN_MANIFESTS = frozenset({'plugin.yaml', 'plugin.json'})
 _CONTENT_SUFFIXES = frozenset({'.md', '.txt', '.json', '.yaml', '.yml', '.toml'})
 _EXCLUDED_COMPONENTS = frozenset({'.git', '.venv', 'venv', '__pycache__', 'tests', 'docs',
                                   'website', 'node_modules', '.hermes', '.pytest_cache'})
@@ -116,6 +120,8 @@ def _credential_shaped_path(parts: list[str]) -> bool:
            for part in parts):
         return True
     if Path(parts[-1]).suffix.casefold() in _CODE_SUFFIXES:
+        return False
+    if parts[-1].casefold() in _PLUGIN_MANIFESTS:
         return False
     return any(_credential_shaped_name(part) for part in parts)
 
