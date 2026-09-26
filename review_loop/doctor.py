@@ -41,6 +41,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import socket
 from datetime import datetime
 from urllib.parse import urlsplit
@@ -874,6 +875,26 @@ def check_hook(loop: dict, hooks: list, seat: str, name: str, url: str) -> Check
     candidates = exact or [hook for hook in hooks if
                            urlsplit(posted_url(hook)).path.rstrip("/").endswith(
                                "/webhooks/" + name)]
+    # Every hook posting to this route name, on any origin. More than one is a previous install
+    # left behind: GitHub never returns a secret, but a leftover signs with the secret the old
+    # route held, so at most one of them can authenticate — and "hook N active" says nothing
+    # about which one that is.
+    named = [hook for hook in hooks if hook in exact or
+             urlsplit(posted_url(hook)).path.rstrip("/").endswith("/webhooks/" + name)]
+    if len(named) > 1:
+        ids = sorted(hook.get("id") for hook in named if isinstance(hook.get("id"), int))
+        active = sum(1 for hook in named if hook.get("active"))
+        repo = loop["repo"]
+        deletes = "; ".join(f"`gh api -X DELETE {shlex.quote(f'repos/{repo}/hooks/{i}')}`"
+                            for i in ids)
+        return Check(f"hook:{name}", MISMATCH,
+                     f"{len(named)} repo hooks post to this route (ids "
+                     f"{', '.join(str(i) for i in ids)}; {active} active) — duplicates from a "
+                     "previous install sign with a secret this route no longer holds, so their "
+                     "deliveries are refused",
+                     f"`hermes review-loop uninstall --loop {shlex.quote(loop['id'])}` deletes "
+                     "them all, then re-run init --hooks; or delete every hook but the one the "
+                     f"latest init created: {deletes}")
     match = next((hook for hook in candidates if hook.get("active") and
                   event in (hook.get("events") or [])), None) or (candidates[0] if candidates else None)
     if match is None:

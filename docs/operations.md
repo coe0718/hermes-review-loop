@@ -101,7 +101,8 @@ hermes review-loop arm --loop name --pause
 hermes review-loop drain --loop name --seat reviewer
 hermes review-loop fixer-push --loop name --enable --acknowledge-pr-race   # let the fixer publish (off by default)
 hermes review-loop cleanup --loop name --dry-run   # every closed PR; --pr N for one
-hermes review-loop uninstall --loop name
+hermes review-loop uninstall --loop name   # deletes its repo hooks and cron job first, then routes and config
+hermes review-loop uninstall --loop name --admin-token LOGIN --purge   # hook-admin token; also the default state dir
 ```
 
 `arm` and `arm --pause` never report what they asked for — after each PATCH they read the hook back
@@ -113,6 +114,14 @@ repo, and **2** when the loop is unknown or none is configured. Without `--admin
 goes out as the loop's `read_token`; the `fix:` line names the scope that login's file needs
 (`repository_hooks: write`, `admin:repo_hook` or classic `repo`) and, when it is the reader, the
 owner case above.
+
+`uninstall` deletes the loop's repo hooks and its watchdog job *before* it removes the routes and
+the config, and reads both back. If it cannot (a token without `admin:repo_hook`/`repo`, an API
+failure, a job the scheduler will not remove) it refuses, changes nothing else, and prints the
+exact `gh api -X DELETE …` / `hermes cron remove …` commands; `--keep-hooks` is the explicit
+opt-out. `init --hooks` refuses when hooks from a previous install still post to the loop's
+routes (they sign with a secret the new routes will not hold), and `doctor` fails a route with
+more than one hook.
 
 `set` is how you change the knobs after install — `--reviewer-concurrency`, `--fixer-concurrency`,
 `--concurrency` (the default for both seats), `--cap`, `--clone`, `--base`, `--grace-min`,

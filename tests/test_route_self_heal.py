@@ -168,7 +168,7 @@ class SelfHealTest(Fixture):
 class OperatorIntentTest(Fixture):
     def test_uninstall_through_the_plugin_is_not_undone(self):
         self.install()
-        args = SimpleNamespace(loop="widgets", keep_config=True)
+        args = SimpleNamespace(loop="widgets", keep_config=True, keep_hooks=True)
         with mock.patch.object(cli.config, "load_id", return_value=self.loop), \
                 contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(cli.cmd_uninstall(args), 0)

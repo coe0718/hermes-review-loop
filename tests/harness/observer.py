@@ -581,7 +581,10 @@ def group_observer_cli() -> None:
     observer_route()
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        cli.cmd_uninstall(ns(loop="widgets", keep_config=True))
+        # --keep-hooks: this checks the routes; hook and cron removal have their own suite
+        # (tests/test_uninstall_hooks.py).
+        rc = cli.cmd_uninstall(ns(loop="widgets", keep_config=True, keep_hooks=True))
+    check("uninstall with --keep-config succeeds", rc, 0)
     check("uninstall removes the observer route",
           "route removed: widgets-observe" in buf.getvalue(), True)
     check("  and it is gone from the registry", "widgets-observe" in SUBS.read_text(), False)
