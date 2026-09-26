@@ -228,8 +228,11 @@ The "is this loop armed at all?" question is answered by `gate.hooks_read`, whic
 `explain` share: both seat routes must exist as active repo hooks. An unreadable hook list is
 **not** "paused" — a token without hook read access (classic `repo`, or the narrower
 `read:repo_hook`) cannot see hooks that may well be active — so
-the watchdog stays silent there and `explain` prints "unknown" rather than guessing in either
-direction.
+the watchdog neither drains nor scans there, but alerts with the read token's login and the HTTP
+status (a 401/403 at once, a 5xx or no answer after three failed sweeps in a row, re-raised every
+`cooldown_h`), and `explain` prints "unknown" rather than guessing in either direction. A gate that
+cannot read the current PR still answers `[SILENT]`, but leaves the failed call in
+`github-reads.json`: the next sweep reports it once, and `explain` shows it on its `github:` line.
 
 ## Explain — why is this PR not moving?
 

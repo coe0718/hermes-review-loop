@@ -180,8 +180,11 @@ What each step proves, and how to read a failure, is in
   conclusion through the *same* predicates the gates run, and writes nothing at all — no queue
   entry, no claim, no drain, no webhook POST, no token. Run it twice and the loop is byte-for-byte
   as it was.
-- **Paused means silent.** With the repo hooks off, the watchdog says nothing and drains nothing: a
-  parked loop must never spend a run.
+- **Paused means silent; blind does not.** With the repo hooks off, the watchdog says nothing and
+  drains nothing: a parked loop must never spend a run. When it cannot read GitHub at all (a dead
+  or revoked token, a 5xx, no network) it still drains nothing, but says so — "cannot read GitHub as
+  <login>: HTTP 401 — token expired or revoked?" — every cooldown until reads work, and it warns a
+  week before the read token's `github-authentication-token-expiration` date.
 - **A seat is who the config says it is — or the loop refuses to run.** The profile it runs as, the
   login it acts as and the route that wakes it are validated together before a config, a route or a
   hook is written, and `status` prints the installed route next to the configured seat so a

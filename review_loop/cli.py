@@ -1463,6 +1463,7 @@ def cmd_explain(args) -> int:
         print(f"  {'escalation:':<12}{report['escalation']}")
         print(f"  {'hooks:':<12}{report['hooks']}")
         print(f"  {'sweep:':<12}{report['sweep']}")
+        print(f"  {'github:':<12}{report['github']}")
         for text in report["blockers"]:
             print(f"  {'blocked:':<12}{text}")
         if not report["blockers"]:

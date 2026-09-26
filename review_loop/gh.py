@@ -11,7 +11,8 @@ Two deliberate choices:
 
 Test hook: set ``REVIEW_LOOP_GH_STUB`` to an executable that takes the API path as argv[1]
 and prints a JSON response. That is how the test suite exercises the gates without a
-network or a real repository.
+network or a real repository. To answer with an HTTP status or response headers, the stub
+prints ``{"__gh_stub_response__": {"status": 401, "headers": {...}, "body": ...}}``.
 """
 
 from __future__ import annotations
@@ -19,10 +20,14 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
+import sys
+import time
 import urllib.error
 import urllib.request
+from typing import NamedTuple
 
 from .util import log
 
@@ -36,6 +41,18 @@ MAX_PR_PAGES = 100
 
 class GitHubError(Exception):
     pass
+
+
+class Response(NamedTuple):
+    """One REST call, whole: ``status`` is None when no HTTP answer arrived at all."""
+    data: object | None
+    error: str
+    status: int | None = None
+    headers: dict | None = None
+
+# The header GitHub sets on answers to fine-grained and expiring classic tokens.
+TOKEN_EXPIRY_HEADER = "github-authentication-token-expiration"
+STUB_ENVELOPE = "__gh_stub_response__"
 
 
 def token_path(loop: dict, login: str | None = None) -> pathlib.Path | None:
@@ -52,31 +69,73 @@ def token(loop: dict, login: str | None = None) -> str:
     return path.read_text().strip()
 
 
-def _stub(path: str, method: str, body) -> tuple[object | None, str]:
-    """``(payload, error)`` answered by the stub executable.
+def _stub(path: str, method: str, body) -> Response:
+    """The stub executable's answer, shaped like a real one.
 
     ``(None, "")`` means the stub answered "no such resource" — the same shape ``api`` gives a
     real 404. An empty error and a non-empty one are therefore different facts, which is the
-    whole reason this returns a pair instead of ``None`` for both.
+    whole reason this returns the error apart from the payload instead of ``None`` for both.
     """
     stub = os.environ.get("REVIEW_LOOP_GH_STUB")
     if not stub:
-        return None, ""
+        return Response(None, "")
     argv = [stub, path] if not body else [stub, path, json.dumps(body)]
     env = {**os.environ, "GH_METHOD": method}
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=30, env=env)
     except Exception as exc:
-        return None, f"gh stub failed: {exc}"
+        return Response(None, f"gh stub failed: {exc}")
     if proc.returncode != 0:
-        return None, f"gh stub rc={proc.returncode}: {proc.stderr.strip()[:120]}"
+        return Response(None, f"gh stub rc={proc.returncode}: {proc.stderr.strip()[:120]}")
     out = proc.stdout.strip()
     if not out:
-        return None, "gh stub printed nothing"
+        return Response(None, "gh stub printed nothing")
     try:
-        return json.loads(out), ""
+        data = json.loads(out)
     except Exception:
-        return None, "gh stub printed invalid JSON"
+        return Response(None, "gh stub printed invalid JSON")
+    envelope = data.get(STUB_ENVELOPE) if isinstance(data, dict) else None
+    if not isinstance(envelope, dict):
+        return Response(data, "", 200 if data is not None else None, {})
+    status = envelope.get("status") if type(envelope.get("status")) is int else 200
+    headers = {str(k).lower(): str(v) for k, v in (envelope.get("headers") or {}).items()}
+    payload = envelope.get("body")
+    if status >= 400:
+        detail = json.dumps(payload)[:120] if payload is not None else ""
+        return Response(None, f"HTTP {status}{f' {detail}' if detail else ''}", status, headers)
+    return Response(payload, "", status, headers)
+
+
+def request(loop: dict, path: str, method: str = "GET", body=None,
+            login: str | None = None) -> Response:
+    """One REST call with its HTTP status and response headers. No logging, no interpretation.
+
+    ``fetch`` is this without the status: most callers only need "did it work". The watchdog's
+    health check needs the rest — a 401 (the token is dead) and a 502 (GitHub is) ask different
+    things of the operator, and the token's expiry arrives only as a response header.
+    """
+    if os.environ.get("REVIEW_LOOP_GH_STUB"):
+        return _stub(path, method, body)
+    try:
+        tok = token(loop, login)
+    except GitHubError as exc:
+        return Response(None, str(exc))
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        f"{API}{path}", data=data, method=method,
+        headers={"Accept": "application/vnd.github+json", "Authorization": f"token {tok}",
+                 "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "hermes-review-loop"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode() or "null"
+            headers = {k.lower(): v for k, v in resp.headers.items()}
+            return Response(json.loads(raw), "", resp.status, headers)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode()[:120].strip()
+        headers = {k.lower(): v for k, v in (exc.headers or {}).items()}
+        return Response(None, f"HTTP {exc.code}{f' {detail}' if detail else ''}", exc.code, headers)
+    except Exception as exc:
+        return Response(None, f"{type(exc).__name__}: {exc}")
 
 
 def fetch(loop: dict, path: str, method: str = "GET", body=None,
@@ -88,26 +147,65 @@ def fetch(loop: dict, path: str, method: str = "GET", body=None,
     not there), a timeout is a fact about the network — and "check the number" and "retry the
     read" are not interchangeable answers to an operator at 2am.
     """
-    if os.environ.get("REVIEW_LOOP_GH_STUB"):
-        return _stub(path, method, body)
+    response = request(loop, path, method, body, login)
+    return response.data, response.error
+
+
+def status_of(error: str) -> int | None:
+    """The HTTP status an error string names (``fetch``'s ``HTTP 401 …``), or None."""
+    match = re.search(r"\bHTTP (\d{3})\b", error or "")
+    return int(match.group(1)) if match else None
+
+
+def failure_hint(status: int | None) -> str:
+    """What a failed read most likely means, for the one line an operator gets."""
+    if status == 401:
+        return "token expired or revoked?"
+    if status == 403:
+        return "token lacks access (scope, SSO) or is rate-limited?"
+    if status == 404:
+        return "token cannot see this resource (scope or repo access)?"
+    if status is not None and status >= 500:
+        return "GitHub is failing — outage?"
+    if status is None:
+        return "no HTTP answer — network, DNS, or the token file?"
+    return ""
+
+
+def auth_probe(loop: dict) -> Response:
+    """``GET /user`` as the read token: who it is, and (in the headers) when it expires."""
+    return request(loop, "/user")
+
+
+_RECORD_FAILURES = False
+
+
+def record_failures() -> None:
+    """Opt this process in to ``record_failure``. The gates do (``gate.context``); ``explain`` and
+    ``doctor`` never do, because they promise to write nothing."""
+    global _RECORD_FAILURES
+    _RECORD_FAILURES = True
+
+
+def record_failure(loop: dict, method: str, path: str, error: str,
+                   login: str | None = None) -> None:
+    """Leave a failed call where the watchdog and ``explain`` can find it. Never raises.
+
+    A gate that cannot read the current PR answers ``[SILENT]`` — correctly, since unknown is not
+    permission — but the gateway's stderr is the only other witness. This keeps the last one on
+    disk, in the loop's state directory, so "the event was dropped because GitHub was unreadable"
+    is something the next sweep can say out loud.
+    """
+    if not _RECORD_FAILURES or not loop.get("state_dir") or status_of(error) == 404:
+        return
     try:
-        tok = token(loop, login)
-    except GitHubError as exc:
-        return None, str(exc)
-    data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(
-        f"{API}{path}", data=data, method=method,
-        headers={"Accept": "application/vnd.github+json", "Authorization": f"token {tok}",
-                 "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "hermes-review-loop"})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            raw = resp.read().decode() or "null"
-            return json.loads(raw), ""
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode()[:120].strip()
-        return None, f"HTTP {exc.code}{f' {detail}' if detail else ''}"
-    except Exception as exc:
-        return None, f"{type(exc).__name__}: {exc}"
+        from . import state as state_mod
+        state_mod.state_for(loop).github_failure_record({
+            "at": time.time(), "where": pathlib.Path(sys.argv[0] or "review-loop").name,
+            "method": method, "path": path.split("?", 1)[0], "error": error[:200],
+            "status": status_of(error), "login": login or loop.get("read_token") or ""})
+    except Exception:
+        pass
 
 
 def api(loop: dict, path: str, method: str = "GET", body=None, login: str | None = None):
@@ -119,6 +217,7 @@ def api(loop: dict, path: str, method: str = "GET", body=None, login: str | None
     data, error = fetch(loop, path, method, body, login)
     if error:
         log(f"gh {method} {path} failed: {error}")
+        record_failure(loop, method, path, error, login)
     return data
 
 
@@ -188,6 +287,7 @@ def reviews(loop: dict, number: int):
     result, error = reviews_read(loop, number)
     if error:
         log(f"gh GET {reviews_path(loop, number)} failed: {error}")
+        record_failure(loop, "GET", reviews_path(loop, number), error)
     return result
 
 

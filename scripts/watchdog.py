@@ -17,7 +17,11 @@ is re-checked against GitHub before it fires, so a stale queue entry dies instea
 starting a run against a head that has moved on.
 
 Runs from cron (no agent, no tokens). Silent when the loop is paused: a parked loop must
-never spend a run, and a watchdog that cries wolf on a deliberate pause gets ignored.
+never spend a run, and a watchdog that cries wolf on a deliberate pause gets ignored. *Not*
+silent when it cannot tell: a hook list or ``/user`` it cannot read (a dead token, a 5xx, no
+network) is an alert naming the login and status, re-raised every cooldown, while the parts
+that need no GitHub read (route self-heal, ledger notices, observer retries) keep running. Each
+sweep also warns before the read token's expiry date.
 
     watchdog.py                       # every configured loop
     watchdog.py --loop attest         # one loop
@@ -33,6 +37,7 @@ import json
 import math
 import os
 import pathlib
+import re
 import sys
 import time
 
@@ -44,6 +49,11 @@ from review_loop.util import age_min, epoch, log, now_iso  # noqa: E402
 TEST = bool(os.environ.get("REVIEW_LOOP_TEST"))
 PUSH_OFF_KIND = "fixer held — unattended fixer pushes are off"
 HEAD_RETENTION_SEC = 30 * 86400  # retain absent PRs long enough for transient listing/state changes
+# A 401/403 is a verdict about the token and alerts at once; a 5xx or no answer at all can be a
+# blip, so it alerts once reads have failed this many sweeps in a row.
+READ_FAILURE_SWEEPS = 3
+EXPIRY_WARN_DAYS = 7
+EXPIRY_WARN_EVERY_SEC = 86400
 
 
 def valid_clock(value: object, now: float) -> float | None:
@@ -52,6 +62,117 @@ def valid_clock(value: object, now: float) -> float | None:
         return None
     clock = float(value)
     return clock if math.isfinite(clock) and 0 < clock <= now else None
+
+
+def alert_due(watch: dict, key: str, now: float, cooldown: float) -> bool:
+    """True at most once per ``cooldown`` for ``key``, and again after each cooldown passes.
+
+    Stamped only when it fires: a condition that persists re-alerts every cooldown instead of
+    refreshing its own clock on every sweep and never speaking again (the stall map's #77).
+    """
+    marks = watch.get("github_alerts")
+    if not isinstance(marks, dict):
+        marks = watch["github_alerts"] = {}
+    last = valid_clock(marks.get(key), now)
+    if last is not None and now - last < cooldown:
+        return False
+    marks[key] = now
+    return True
+
+
+def parse_expiry(value: str) -> float | None:
+    """GitHub's expiry header (``2026-10-01 12:00:00 UTC``, or a numeric offset) as epoch."""
+    from datetime import datetime, timezone
+    text = str(value or "").strip().replace(" UTC", " +0000")
+    try:
+        return datetime.strptime(text, "%Y-%m-%d %H:%M:%S %z").astimezone(timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def github_health(loop: dict, st: state_mod.LoopState, watch: dict, now: float,
+                  armed: bool | None, armed_error: str) -> list[str]:
+    """Can this sweep read GitHub at all, as whom, and for how much longer?
+
+    Runs every armed-or-unknown sweep, before anything that needs GitHub. Blindness is said out
+    loud (with the login and HTTP status), re-raised every cooldown until reads work, and its
+    end is said once. Also surfaces a gate's last failed read, which otherwise reached only the
+    gateway's stderr while the event it could not verify was dropped as "unavailable".
+    """
+    lines: list[str] = []
+    header = f"[{loop['id']}] {loop['repo']}"
+    cooldown = 0.0 if TEST else float(loop.get("cooldown_h", 6)) * 3600
+    configured = str(loop.get("read_token") or "the read token")
+    probe = gh.auth_probe(loop)
+    who = (probe.data.get("login") if isinstance(probe.data, dict) else None) or configured
+
+    error, status = "", None
+    if probe.error:
+        error, status = probe.error, probe.status if probe.status is not None else gh.status_of(probe.error)
+    elif armed is None:
+        error, status = f"hook list: {armed_error or 'unreadable'}", gh.status_of(armed_error)
+
+    record = watch.get("github_read") if isinstance(watch.get("github_read"), dict) else {}
+    if error:
+        sweeps = record["sweeps"] + 1 if type(record.get("sweeps")) is int else 1
+        since = valid_clock(record.get("since"), now) or now
+        record = {**record, "sweeps": sweeps, "since": since, "error": error[:200],
+                  "status": status, "login": who}
+        if status in (401, 403) or sweeps >= READ_FAILURE_SWEEPS:
+            if alert_due(watch, f"read:{status or 'none'}", now, cooldown):
+                record["alerted"] = True
+                hint = gh.failure_hint(status)
+                lines.append(
+                    f"⚠️ Review loop {header}: cannot read GitHub as {who}: {error}"
+                    f"{f' — {hint}' if hint else ''} ({sweeps} sweep(s) since "
+                    f"{time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(since))}). "
+                    + ("Hook state unknown: stall scan and queue drain are skipped; "
+                       if armed is None else "")
+                    + "route self-heal and notices continue.")
+        watch["github_read"] = record
+    else:
+        if record.get("alerted"):
+            lines.append(f"✅ Review loop {header}: GitHub reads work again as {who} "
+                         f"(after {record.get('sweeps', '?')} failed sweep(s))")
+        watch.pop("github_read", None)
+        marks = watch.get("github_alerts")
+        if isinstance(marks, dict):
+            for key in [k for k in marks if k.startswith("read:")]:
+                marks.pop(key)
+
+    expiry = (probe.headers or {}).get(gh.TOKEN_EXPIRY_HEADER) if not probe.error else None
+    expires = parse_expiry(expiry) if expiry else None
+    if expires is not None and expires - now < EXPIRY_WARN_DAYS * 86400:
+        if alert_due(watch, f"expiry:{int(expires)}", now,
+                     0.0 if TEST else EXPIRY_WARN_EVERY_SEC):
+            days = (expires - now) / 86400
+            when = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(expires))
+            named = who if who == configured else f"{who} ({configured})"
+            lines.append(f"⚠️ Review loop {header}: the read token for {named} "
+                         + (f"expires {when} — in {days:.1f} day(s); rotate it before then or "
+                            "this loop goes blind" if days > 0 else
+                            f"expired {when}; rotate it now"))
+
+    failure = st.github_failure()
+    at = valid_clock(failure.get("at"), now)
+    seen = valid_clock(watch.get("gate_failure_seen"), now) or 0.0
+    if at is not None and at > seen:
+        watch["gate_failure_seen"] = at
+        status = failure.get("status") if type(failure.get("status")) is int else None
+        if alert_due(watch, f"gate:{failure.get('where')}:{status or 'none'}", now, cooldown):
+            hint = gh.failure_hint(status)
+            number = re.search(r"/pulls/(\d+)", str(failure.get("path") or ""))
+            lines.append(
+                f"⚠️ Review loop {header}: {failure.get('where') or 'a gate'} could not "
+                f"{failure.get('method') or 'GET'} {failure.get('path') or '?'} as "
+                f"{failure.get('login') or configured} at "
+                f"{time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(at))}: "
+                f"{failure.get('error') or 'unknown error'}{f' — {hint}' if hint else ''}; "
+                + ("it treated the PR as unavailable and started nothing"
+                   if (failure.get("method") or "GET") == "GET" else "that call did not take effect")
+                + (f" — `hermes review-loop explain --loop {loop['id']} --pr {number.group(1)}`"
+                   " shows it" if number else ""))
+    return lines
 
 
 # -- draining ------------------------------------------------------------------
@@ -387,8 +508,12 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
     watch = st.watch()
     now = time.time()
 
-    if not TEST and not gate.hooks_armed(loop):
+    armed, armed_error = (True, "") if TEST else gate.hooks_read(loop)
+    if armed is False:
         return lines                              # parked on purpose: say nothing, ever
+    # Armed, or unknown because the hook list could not be read. Unknown is not paused: say so.
+    if not TEST:
+        lines.extend(github_health(loop, st, watch, now, armed, armed_error))
 
     # Self-heal first, and independent of GitHub listing: a route another registry writer erased
     # or rewrote (issue #1) is a loop that cannot wake a seat, whatever the PRs look like.
@@ -401,11 +526,23 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
         lines.extend(healed)
         st.note("route self-heal: " + " | ".join(line.strip() for line in healed))
 
+    if armed is None:
+        # Blind: hooks unconfirmed, so nothing is drained or scanned (fail closed), but the
+        # observer's retries need no GitHub read and the alert above already said why.
+        if observer.retry(loop, st):
+            log("observer: retried an undelivered notice")
+        observer.flush(loop, st, wait_s=0 if TEST else observer.digest_wait(loop))
+        watch["last_run"] = now_iso()
+        st.watch_save(watch)
+        st.note(f"run: blind — hook list unreadable ({armed_error or 'no reason given'})")
+        return lines
+
     prs = gh.open_prs(loop)
     if not isinstance(prs, list):
         # Without a complete listing, even individually readable PRs cannot establish
         # that the sweep's scheduling view is current. Explicit --drain still rechecks.
         lines.append(f"⚠️ {loop['id']}: could not list open PRs — stall scan and queue drain skipped this run")
+        st.watch_save(watch)
         return lines
 
     reconcile_stacked(loop, st, watch, prs, lines)
@@ -625,9 +762,11 @@ def main() -> None:
     if args.drain:
         for loop in loops:
             st = state_mod.state_for(loop)
-            if not TEST and not gate.hooks_armed(loop):
+            armed, armed_error = (True, "") if TEST else gate.hooks_read(loop)
+            if not armed:
                 if args.loop:
-                    print(f"{loop['id']}: hooks are paused — nothing drained")
+                    print(f"{loop['id']}: hooks are paused — nothing drained" if armed is False
+                          else f"{loop['id']}: hook list unreadable ({armed_error}) — nothing drained")
                 continue
             fired = drain(loop, st, args.seat)
             if not fired and not st.queue_items(args.seat) and args.loop:

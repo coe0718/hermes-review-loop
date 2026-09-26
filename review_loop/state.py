@@ -76,6 +76,8 @@ class LoopState:
         # A review's commit_id identifies a head, not the base it reviewed. This ledger
         # has no webhook writer: an external review event cannot create an association.
         self.review_situations = self.dir / "review-situations.json"
+        # The last GitHub call a gate (or anything else) could not make: last writer wins.
+        self.github_reads = self.dir / "github-reads.json"
         self.log = self.dir / "watchdog.log"
 
     # -- raw ----------------------------------------------------------------
@@ -480,6 +482,15 @@ class LoopState:
 
     def watch_save(self, data: dict) -> None:
         self._save(self.watch_file, data)
+
+    def github_failure_record(self, entry: dict) -> None:
+        """Keep the most recent failed GitHub call (see ``gh.record_failure``)."""
+        self._save(self.github_reads, {"last_failure": entry})
+
+    def github_failure(self) -> dict:
+        data = self._load(self.github_reads, {})
+        entry = data.get("last_failure") if isinstance(data, dict) else None
+        return entry if isinstance(entry, dict) else {}
 
     def transition_get(self, number: int) -> dict:
         return (self._load(self.transitions_file, {}) or {}).get(str(number)) or {}
