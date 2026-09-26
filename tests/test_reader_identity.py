@@ -271,11 +271,21 @@ class HookWriteTests(_Loop):
                 created.append(login)
                 return {"id": len(created)}
             return None
-        with patch("review_loop.gh.api", side_effect=api):
+        listed = []
+
+        def fetch(loop, path, method="GET", body=None, login=None):
+            # init's stale-hook preflight (#57) reads the complete listing before writing
+            # anything; any other call would reach the real API, so it fails the test instead.
+            self.assertEqual((method, path), ("GET", "/repos/acme/widgets/hooks?per_page=100"))
+            listed.append(login)
+            return [], ""
+        with patch("review_loop.gh.api", side_effect=api), \
+                patch("review_loop.gh.fetch", side_effect=fetch):
             rc, out = self.run_cli(self.init_argv("--hooks", "--admin-token", "owner",
                                                   "--token", f"owner={self.keys / 'owner-pat'}"))
         self.assertEqual(rc, 0, out)
         self.assertEqual(created, ["owner", "owner"])
+        self.assertEqual(listed, ["owner"])  # the preflight reads as the hook admin too
         self.assertIn("hermes review-loop arm --loop widgets --admin-token owner", out)
 
     def test_a_refused_arm_as_the_reader_names_the_scope_and_the_owner_case(self):

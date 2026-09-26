@@ -63,7 +63,7 @@ class Base(unittest.TestCase):
                         "--reviewer-profile", "reviewer-profile",
                         "--fixer-profile", "fixer-profile",
                         "--token", f"{t.REVIEWER}={t.SEAT_PATS[0]}",
-                        "--token", f"{t.FIXER}={t.SEAT_PATS[1]}", *extra)
+                        "--token", f"{t.FIXER}={t.SEAT_PATS[1]}", *t.READER_ARGS, *extra)
 
     def fresh_install(self) -> None:
         """A clean `init --hooks` of the widgets loop (the fixture's hand-written one removed)."""
@@ -169,7 +169,7 @@ class UninstallRefusalTest(Base):
     def test_a_token_github_refuses_leaves_everything_and_prints_pasteable_commands(self):
         self.fresh_install()
         ids = sorted(hook["id"] for hook in self.hooks())
-        self.world(hook_write_denied=[t.REVIEWER])
+        self.world(hook_write_denied=[t.READ_LOGIN])
         subs_before = t.SUBS.read_text()
         rc, out = self.cli("uninstall", "--loop", "widgets")
         self.assertEqual(rc, 2, out)
