@@ -12,6 +12,7 @@ import argparse
 import json
 import os
 import pathlib
+import shlex
 import shutil
 import subprocess
 import sys
@@ -484,25 +485,78 @@ def _hook_listing(loop: dict, token_login: str | None = None) -> list[dict]:
     return hooks
 
 
-def _set_hooks(loop: dict, active: bool, token_login: str | None) -> list[str]:
+def _hook_write_fix(token_login: str | None, transient: bool = False) -> str:
+    """What to do when a hook read or write failed with the token ``arm`` used.
+
+    ``transient`` is for failures that were neither a refusal nor a write that did not stick (a
+    timeout, a 5xx): those are worth a retry before blaming the token.
+    """
+    if transient:
+        return ("retry `arm`; if it fails again, check the repo's webhooks on GitHub — "
+                + _hook_write_fix(token_login))
+    if token_login:
+        return (f"the token for {token_login!r} needs hook access on the repo (classic `repo`, "
+                "or `admin:repo_hook`) — check that login's token file")
+    return ("the loop's read token cannot manage repo hooks (by design it is read-only): re-run "
+            "with --admin-token <owner login>, a login whose token file has `admin:repo_hook`")
+
+
+def _set_hooks(loop: dict, active: bool, token_login: str | None) -> tuple[list[str], bool]:
+    """Flip this loop's repo hooks, then read each one back and report what GitHub now shows.
+
+    Returns ``(lines, ok)``. ``ok`` is true only when every loop hook was observed in the asked-for
+    state: a refused PATCH, a read-back that disagrees or cannot be made, an unreadable listing,
+    and a repo with no loop hooks all make it false — ``arm`` must never say "paused" about a hook
+    GitHub still delivers to.
+    """
     names = _routes_of(loop)
-    wanted = tuple(name for role, name in names.items() if role in ("reviewer", "fixer"))
+    wanted = tuple(name for role, name in names.items() if role in ("reviewer", "fixer") and name)
+    word = "active" if active else "paused"
+    login = token_login or loop.get("read_token")
     try:
         hooks = _hook_listing(loop, token_login)
     except config.ConfigError as exc:
-        return [f"could not read the repo's hooks: {exc}"]
-    out = []
+        return [f"could not read the repo's hooks: {exc}", f"  fix: {_hook_write_fix(token_login)}"], False
+    out, ok, errors = [], True, []
+    found = False
     for hook in hooks:
         url = (hook.get("config") or {}).get("url", "")
         if not any(name in url for name in wanted):
             continue
+        found = True
         if bool(hook.get("active")) == active:
-            out.append(f"hook {hook['id']} already {'active' if active else 'paused'}")
+            out.append(f"hook {hook['id']} already {word}")
             continue
-        gh.api(loop, f"/repos/{loop['repo']}/hooks/{hook['id']}", method="PATCH",
-               body={"active": active}, login=token_login or loop.get("read_token"))
-        out.append(f"hook {hook['id']} → {'active' if active else 'paused'}")
-    return out or ["no loop hooks found — run init --hooks first"]
+        path = f"/repos/{loop['repo']}/hooks/{hook['id']}"
+        _, error = gh.fetch(loop, path, method="PATCH", body={"active": active}, login=login)
+        # A lost response is ambiguous and a stub or proxy can answer 200 without writing, so the
+        # hook's state is whatever a fresh read says — never what was asked for.
+        actual, read_error = gh.fetch(loop, path, login=login)
+        if not isinstance(actual, dict) or not isinstance(actual.get("active"), bool):
+            ok = False
+            out.append(f"hook {hook['id']} NOT CONFIRMED {word}: "
+                       + (f"PATCH failed ({error}); " if error else "")
+                       + f"read-back failed ({read_error or 'no hook in the answer'})")
+            errors += [e for e in (error, read_error) if e]  # the codes decide the fix
+            continue
+        seen = "active" if actual["active"] else "paused"
+        if actual["active"] == active:
+            out.append(f"hook {hook['id']} → {seen} (read back)")
+            continue
+        ok = False
+        out.append(f"hook {hook['id']} is still {seen}, not {word}"
+                   + (f": PATCH failed ({error})" if error else ": GitHub accepted the PATCH "
+                      "but the read-back disagrees"))
+        errors.append("refused")
+    if not found:
+        return ["no loop hooks found — run init --hooks first "
+                f"(looked for hooks whose URL names {', '.join(wanted) or 'a loop route'})"], False
+    if not ok:
+        # GitHub answers 404 to a token that may not see hooks, so 404 counts as a refusal too.
+        refused = any(e == "refused" or any(f"HTTP {code}" in e for code in (401, 403, 404))
+                      for e in errors)
+        out.append(f"fix: {_hook_write_fix(token_login, transient=not refused)}")
+    return out, ok
 
 
 def _hook_moves(before: dict, after: dict, binds: dict) -> list[tuple[int, str, str]]:
@@ -569,8 +623,12 @@ def _patch_hook_url(loop: dict, hook_id: int, url: str) -> None:
         raise config.ConfigError(f"hook {hook_id} URL update not confirmed as {url!r}")
 
 
-def _install_schedule(loop: dict, schedule: str, deliver: str) -> list[str]:
-    """A cron shim plus the job itself, through the scheduler's own CLI."""
+def _install_schedule(loop: dict, schedule: str, deliver: str) -> tuple[list[str], bool]:
+    """A cron shim plus the job itself, through the scheduler's own CLI.
+
+    Returns ``(lines, ok)``; ``ok`` is false when no job was created. The fallback command is
+    shell-quoted — the job name has spaces and parentheses — so it can be pasted as printed.
+    """
     scripts = config.home() / "scripts"
     scripts.mkdir(parents=True, exist_ok=True)
     watchdog = pathlib.Path(__file__).resolve().parents[1] / "scripts" / "watchdog.py"
@@ -583,11 +641,11 @@ def _install_schedule(loop: dict, schedule: str, deliver: str) -> list[str]:
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     except Exception as exc:
-        return [f"could not create the cron job: {exc}", f"run it yourself: {' '.join(cmd)}"]
+        return [f"could not create the cron job: {exc}", f"run it yourself: {shlex.join(cmd)}"], False
     if proc.returncode != 0:
         return [f"cron create failed: {(proc.stderr or proc.stdout).strip()[:200]}",
-                f"run it yourself: {' '.join(cmd)}"]
-    return [f"scheduled the watchdog ({schedule}, deliver={deliver})", f"shim: {shim}"]
+                f"run it yourself: {shlex.join(cmd)}"], False
+    return [f"scheduled the watchdog ({schedule}, deliver={deliver})", f"shim: {shim}"], True
 
 
 # -- verbs ----------------------------------------------------------------------
@@ -870,8 +928,16 @@ def cmd_init(args) -> int:
         print(f"  {line}")
     if not args.hooks:
         print("  (repo hooks not created — pass --hooks, or add them by hand with the route URLs)")
-    for line in _install_schedule(loop, args.schedule, args.watchdog_deliver) if args.schedule else []:
+    schedule_lines, scheduled = (_install_schedule(loop, args.schedule, args.watchdog_deliver)
+                                 if args.schedule else ([], True))
+    for line in schedule_lines:
         print(f"  {line}")
+    if not scheduled:
+        # Config, routes and hooks are in place; only the job is missing. Say so and fail, so an
+        # install script's `init && ...` does not read a missing watchdog as success.
+        print("\ninit INCOMPLETE: the watchdog job was not scheduled — run the command above, "
+              f"then `hermes review-loop doctor --loop {loop['id']}`")
+        return 1
     # The seats never hold a GitHub token: every write goes through the host broker with the token
     # files mapped above, so a GH_TOKEN in a seat profile's .env is only an extra copy to leak.
     lid = loop["id"]
@@ -1586,9 +1652,27 @@ def cmd_models(args) -> int:
 
 
 def cmd_arm(args) -> int:
-    for loop in ([config.load_id(args.loop)] if args.loop else config.all_loops()):
-        for line in _set_hooks(loop, not args.pause, args.admin_token):
+    """Arm or pause loops by flipping their repo hooks; exit 1 unless GitHub confirms every one."""
+    try:
+        loops = [config.load_id(args.loop)] if args.loop else config.all_loops()
+    except config.ConfigError as exc:
+        print(f"cannot {'pause' if args.pause else 'arm'}: {exc}")
+        return 2
+    if not loops:
+        print(f"no loops configured in {config.config_dir()} — nothing to "
+              f"{'pause' if args.pause else 'arm'}")
+        return 2
+    failed = []
+    for loop in loops:
+        lines, ok = _set_hooks(loop, not args.pause, args.admin_token)
+        for line in lines:
             print(f"[{loop['id']}] {line}")
+        if not ok:
+            failed.append(loop["id"])
+    if failed:
+        print(f"{'pause' if args.pause else 'arm'} NOT confirmed for: {', '.join(failed)} "
+              "— the lines above show what GitHub reports now")
+        return 1
     return 0
 
 def cmd_fixer_push(args) -> int:
