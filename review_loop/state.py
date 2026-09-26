@@ -62,6 +62,25 @@ def _atomic_write(path: pathlib.Path, data) -> None:
             os.unlink(name)
 
 
+def _mark_live(entry, now: float, ttl: float) -> bool:
+    """Is this lock mark one we can age, and is it still inside ``ttl``?
+
+    Every reader of the ledger comes through here — the gate's capacity check, ``explain`` and the
+    watchdog's drain — so a mark that cannot be aged answers "expired" instead of raising the
+    ``TypeError`` a bare subtraction would: one unreadable entry (a hand edit, an ISO string from
+    an older writer, ``null``, a bool, a list) otherwise stops ``--drain`` for *every* loop and
+    makes ``explain`` raise instead of reporting. Only a plain number is aged, because the readers
+    that take a live set do their own arithmetic on ``at`` — a numeric string is expired, never
+    guessed at. ``active`` then writes the drop, so the next read sees a ledger it can read.
+    """
+    if not isinstance(entry, dict):
+        return False
+    at = entry.get("at")
+    if isinstance(at, bool) or not isinstance(at, (int, float)):
+        return False
+    return now - at <= ttl
+
+
 class LoopState:
     def __init__(self, loop: dict):
         self.loop = loop
@@ -142,29 +161,63 @@ class LoopState:
         ``locks.json`` on every question the operator asks, which is a mutation nobody asked for
         and exactly what the acceptance test for a read-only command looks at.
         """
-        entries = (self._load(self.locks, {}) or {}).get(seat) or {}
-        ttl = self.loop["ttl_min"] * 60
-        now = time.time()
-        return {k: v for k, v in entries.items()
-                if isinstance(v, dict) and now - v.get("at", 0) <= ttl}
+        entries = self._lock_ledger().get(seat)
+        if not isinstance(entries, dict):
+            return {}
+        now, ttl = time.time(), self._seat_ttl()
+        return {k: v for k, v in entries.items() if _mark_live(v, now, ttl)}
 
     def active(self, seat: str) -> dict:
         """This seat's live runs, ``{key: entry}``, expired ones dropped and persisted away.
 
         The ledger is per *seat* and keyed by PR, because isolation is per *PR*: two PRs may run
         at once when ``concurrency`` allows it, but the same PR never runs twice.
+
+        This is also the one place a mark is dropped from disk, so a ledger entry nothing can read
+        is healed here rather than left for the next reader to trip over.
         """
         with self.locked():
-            data = self._load(self.locks, {}) or {}
-            entries = data.get(seat) or {}
+            raw = self._load(self.locks, {}) or {}
+            data = raw if isinstance(raw, dict) else {}
+            stored = data.get(seat)
+            entries = stored if isinstance(stored, dict) else {}
             live = self.live_locks(seat)
-            if live != entries:
+            # A file or a seat value that is not a mapping holds no runs — an unreadable one is
+            # dropped here the same way an expired mark is, so the file heals for every reader.
+            unreadable = raw is not data or (stored is not None and not isinstance(stored, dict))
+            if unreadable or live != entries:
                 if live:
                     data[seat] = live
                 else:
                     data.pop(seat, None)
                 self._save(self.locks, data)
             return live
+
+    def _lock_ledger(self) -> dict:
+        """The lock ledger as a mapping, whatever the file holds.
+
+        ``_load`` already falls back to a default on a file that will not parse; this is the same
+        rule for a file that parses into the wrong shape. A ledger that is not a mapping holds no
+        runs, and reading it as empty is what keeps one bad file from stopping every reader.
+        """
+        data = self._load(self.locks, {}) or {}
+        return data if isinstance(data, dict) else {}
+
+    def _seat_ttl(self) -> float:
+        """The seat ledger's TTL in seconds.
+
+        A missing or wrong-typed ``ttl_min`` falls back to the schema default rather than
+        propagating a string into the age arithmetic — ``config.settings_defaults``' rule, kept
+        here because a hand-edited loop file must not stop the readers either.
+        """
+        default = float(config.SETTINGS_SCHEMA["ttl_min"]["default"])
+        raw = self.loop.get("ttl_min")
+        if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
+            raw = default
+        try:
+            return float(raw) * 60
+        except (TypeError, ValueError):
+            return default * 60
 
     def active_count(self, seat: str) -> int:
         return len(self.active(seat))

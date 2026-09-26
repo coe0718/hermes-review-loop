@@ -218,7 +218,12 @@ class Worker(Base):
             with sqlite3.connect(sup.db) as con:
                 state = con.execute("SELECT state, error FROM runs").fetchone()
         run_turn.assert_not_called()
-        self.assertEqual(state, ("failed", "isolated turn failed: ValueError"))
+        # The turn is held before launch, and the reason survives into the operator-visible state:
+        # assert the prefix and the detail rather than the whole literal, because pinning the tail
+        # is what made this test break the moment the message grew a reason.
+        self.assertEqual(state[0], "failed")
+        self.assertTrue(state[1].startswith("isolated turn failed: ValueError"), state[1])
+        self.assertIn("PR files unreadable", state[1])
 
 
 class Sandbox(unittest.TestCase):
@@ -261,7 +266,15 @@ class Sandbox(unittest.TestCase):
                 self.skipTest(f"bubblewrap cannot run here: {result.stderr.strip()[:120]}")
             self.assertIn("diff --git a/x b/x\n+new\nDENIED\nW", result.stdout)
             self.assertEqual((p["review"] / "pr.diff").read_text(), "diff --git a/x b/x\n+new\n")
-            self.assertEqual(os.listdir(p["checkout"]), ["ok"])  # nothing of it lands in /work
+            # #89 changed what a writable /work *is*: a tmpfs of CHECKOUT_SIZE that the launcher
+            # fills in-namespace from a read-only bind of the staged export, instead of a
+            # read-write bind of the host's copy. The seat's edits and build output used to land
+            # on the host filesystem (unbounded, and the same filesystem as the loop's ledger);
+            # now they are charged to the cap and the host's staged checkout stays empty. Nothing
+            # host-side reads it afterwards: a fixer's push carries file contents through the
+            # broker, and safe_push never opens the checkout.
+            self.assertEqual(os.listdir(p["checkout"]), [],  # the host's staged copy is untouched
+                             "a seat's writes must not reach the host's checkout")
 
 
 if __name__ == "__main__":

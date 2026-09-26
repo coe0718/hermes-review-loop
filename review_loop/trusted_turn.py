@@ -2,6 +2,14 @@
 
 Only a trusted supervisor may call this. Config and provider secrets stay on the
 host; the agent sees an exported PR tree, disposable HOME, and two scoped sockets.
+
+The exported tree is not a secret filter you can rely on. It drops documentation
+and data whose *name* or *content* is shaped like a credential, and it exports the
+code and templates the sandboxed Hermes has to import byte for byte. Nothing here
+can tell a live credential from a fixture, so a source tree mounted this way must
+carry no secrets at all: anything committed in it is readable inside the sandbox,
+and a seat that runs untrusted PR content can publish what it read through its one
+authorized write.
 """
 from __future__ import annotations
 
@@ -35,12 +43,165 @@ def _safe_code_snapshot(source: Path, destination: Path) -> None:
         os.close(source_fd)
 
 
+# -- what a snapshot may export ------------------------------------------------------------------
+# Every exported file is readable inside the sandbox (mounted at /opt/code, and on PYTHONPATH), so
+# a *committed* secret is a leak: a seat can put those bytes in the review body it publishes. Two
+# rules keep a snapshot to a code tree:
+#
+#  * a name that *names* a credential is dropped on whole words -- `monkey.py` and `keyboard.py`
+#    are source, `keys.json` and `prod-secrets.toml` are not;
+#  * documentation and data whose *content* is credential-shaped is dropped too, because one
+#    ordinary `notes.md` holding a token defeats any name rule.
+#
+# Code and templates are never dropped by shape: the sandbox imports this tree (dropping
+# `hermes_cli/subcommands/secrets.py` is a ModuleNotFoundError at start, and `agent/secret_sources`
+# is a package about credentials rather than a credential), and no shape rule can tell a module
+# *about* credentials from a file *holding* one. That limit is exactly why the source tree itself
+# must carry no secrets -- this filter is a containment aid, not a scanner.
+_ALLOWED_SUFFIXES = frozenset({'.py', '.json', '.yaml', '.yml', '.toml', '.md', '.txt',
+                               '.jinja2', '.j2', '.html'})
+_CODE_SUFFIXES = frozenset({'.py', '.jinja2', '.j2', '.html'})
+# A plugin's manifest is configuration, not a credential, whatever directory holds it:
+# `plugins/model-providers/nebius-token-factory/plugin.yaml` configures a token provider. The
+# content filter below still applies to it, so a key written inside one is still dropped.
+_PLUGIN_MANIFESTS = frozenset({'plugin.yaml', 'plugin.json'})
+_CONTENT_SUFFIXES = frozenset({'.md', '.txt', '.json', '.yaml', '.yml', '.toml'})
+_EXCLUDED_COMPONENTS = frozenset({'.git', '.venv', 'venv', '__pycache__', 'tests', 'docs',
+                                  'website', 'node_modules', '.hermes', '.pytest_cache'})
+# Names that are a credential whatever else they are: the exact components the first, shape-blind
+# filter carried, kept because they catch a credential container a shape rule cannot.
+_CREDENTIAL_NAMES = frozenset({'.env', 'auth.json', 'config.yaml', 'credentials', 'id_rsa',
+                               'id_ed25519'})
+# A whole word that names a credential. `key`/`keys` match only as one, so `monkey.py`,
+# `keyboard.py` and `keyring.py` stay source while `keys.json` and `api-key.yaml` do not.
+_CREDENTIAL_WORDS = frozenset({'credential', 'secret', 'token', 'apikey', 'accesskey', 'secretkey',
+                               'password', 'passwd', 'passphrase'})
+_KEY_WORDS = frozenset({'key', 'keys'})
+_CREDENTIAL_SUFFIXES = frozenset({'.pem', '.pat', '.p12', '.pfx', '.key', '.jks', '.keystore'})
+_PRIVATE_KEY_NAME = re.compile(r'(?:^|[^a-z0-9])id_(?:rsa|ed25519|ecdsa|dsa)(?:$|[^a-z0-9])')
+_WORD = re.compile(r'[A-Za-z0-9]+')
+_CAMEL = re.compile(r'(?<=[a-z0-9])(?=[A-Z])')
+_MAX_BLOB = 2 * 1024 * 1024
+
+
+def _words(part: str) -> list[str]:
+    """The casefolded words of one path component: separators and camelCase both split."""
+    return [word.casefold() for word in _WORD.findall(_CAMEL.sub(' ', part))]
+
+
+def _credential_shaped_name(part: str) -> bool:
+    """True when a component *names* a credential rather than ordinary source."""
+    folded = part.casefold()
+    if folded in _CREDENTIAL_NAMES or _PRIVATE_KEY_NAME.search(folded):
+        return True
+    if os.path.splitext(folded)[1] in _CREDENTIAL_SUFFIXES:
+        return True
+    for word in _words(part):
+        if word in _KEY_WORDS or word in _CREDENTIAL_WORDS or word.rstrip('s') in _CREDENTIAL_WORDS:
+            return True
+    return False
+
+
+def _credential_shaped_path(parts: list[str]) -> bool:
+    """True when a tree entry's names say credential rather than source.
+
+    The sandbox *imports* this tree, so the shape rules read a path only where dropping it cannot
+    break a turn:
+
+    * the exact names of the first filter (``credentials``, ``.env``, ``id_rsa``, ...) always say
+      credential, container or not -- that is what makes ``pkg/credentials/key.py`` unsafe;
+    * a module or template is exported whatever else it is called: ``hermes_cli/subcommands/
+      secrets.py`` is imported by ``hermes_cli.main``, and ``agent/secret_sources/`` is a package
+      *about* credentials, not a credential;
+    * for the documentation and data the sandbox does not import -- and the directories holding
+      them -- a credential-shaped word anywhere in the path is enough.
+    """
+    if any(part.casefold() in _CREDENTIAL_NAMES or _PRIVATE_KEY_NAME.search(part.casefold())
+           for part in parts):
+        return True
+    if Path(parts[-1]).suffix.casefold() in _CODE_SUFFIXES:
+        return False
+    if parts[-1].casefold() in _PLUGIN_MANIFESTS:
+        return False
+    return any(_credential_shaped_name(part) for part in parts)
+
+
+# Values that are unambiguous wherever they appear: a provider's own token prefix.
+_CREDENTIAL_TEXT = (
+    re.compile(r'(?<![A-Za-z0-9])(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}'),
+    re.compile(r'(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{20,}'),
+    re.compile(r'(?<![A-Za-z0-9])xox[abposr]-[A-Za-z0-9-]{10,}'),
+    re.compile(r'(?<![A-Za-z0-9])AKIA[0-9A-Z]{16}'),
+    re.compile(r'(?<![A-Za-z0-9])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}'),
+    re.compile(r'-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----'),
+)
+# `DEPLOY_TOKEN=<value>`, `"api-key": "<value>"` or a bulleted `- token: <value>`: the name is
+# checked with the same word rule as a filename, and the value has to be long, alphanumeric, and
+# neither a URL path nor a flag.
+_ASSIGNMENT = re.compile(r'(?m)^[\s{,<>*\[\]\-]*["\']?(?P<name>[A-Za-z0-9_.\-]{1,64})["\']?'
+                         r'\s*[:=]\s*["\']?(?P<value>[A-Za-z0-9+/=_.\-]{24,})')
+
+
+def _credential_shaped_text(data: bytes) -> bool:
+    """True when a blob's *content* carries a credential-shaped value."""
+    if not data or len(data) > _MAX_BLOB:
+        return False
+    text = data.decode('utf-8', 'replace')
+    if any(pattern.search(text) for pattern in _CREDENTIAL_TEXT):
+        return True
+    for match in _ASSIGNMENT.finditer(text):
+        value = match.group('value')
+        if (not value.startswith(('/', '-'))
+                and any(char.isdigit() for char in value)
+                and any(char.isalpha() for char in value)
+                and _credential_shaped_name(match.group('name'))):
+            return True
+    return False
+
+
+def exported_secrets(root: Path) -> tuple[list[str], list[str]]:
+    """(violations, advisories) in an already exported snapshot tree.
+
+    The selftest runs this over the snapshot it just staged, so containment notices a secret that
+    reached the sandbox instead of trusting the filter that built it:
+
+    * violations -- what the export rules say must not be there (a credential-shaped name on a
+      file the filter can drop, or documentation/data carrying a credential-shaped value);
+    * advisories -- code carrying credential-shaped *text*. The sandbox imports that code, so the
+      filter never drops it, and only a human can say whether the text is a live secret.
+    """
+    violations: list[str] = []
+    advisories: list[str] = []
+    base = Path(root)
+    for directory, subdirectories, names in os.walk(base, followlinks=False):
+        subdirectories[:] = sorted(name for name in subdirectories
+                                   if not (Path(directory) / name).is_symlink())
+        for name in sorted(names):
+            path = Path(directory) / name
+            if path.is_symlink() or not path.is_file():
+                continue
+            relative = path.relative_to(base).as_posix()
+            suffix = path.suffix.casefold()
+            if _credential_shaped_path(relative.split('/')):
+                violations.append(f'{relative}: credential-shaped name')
+                continue
+            try:
+                if path.stat().st_size > _MAX_BLOB:
+                    continue
+                data = path.read_bytes()
+            except OSError:
+                continue
+            if suffix in _CONTENT_SUFFIXES and _credential_shaped_text(data):
+                violations.append(f'{relative}: credential-shaped content')
+            elif suffix in _CODE_SUFFIXES and any(
+                    pattern.search(data.decode('utf-8', 'replace'))
+                    for pattern in _CREDENTIAL_TEXT):
+                advisories.append(f'{relative}: credential-shaped text in imported code')
+    return violations, advisories
+
+
 def _export_committed_source(source_fd: int, destination: Path) -> None:
     """Keep the repository directory pinned while Git reads the committed tree."""
-    allowed = {'.py', '.json', '.yaml', '.yml', '.toml', '.md', '.txt', '.jinja2', '.j2', '.html'}
-    forbidden = {'.env', 'auth.json', 'config.yaml', 'credentials', 'id_rsa', 'id_ed25519'}
-    excluded = {'.git', '.venv', 'venv', '__pycache__', 'tests', 'docs',
-                'website', 'node_modules', '.hermes', '.pytest_cache'}
     env = {'PATH': '/usr/bin:/bin', 'HOME': '/dev/null', 'GIT_CONFIG_NOSYSTEM': '1',
            'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_NO_REPLACE_OBJECTS': '1',
            'GIT_OPTIONAL_LOCKS': '0'}
@@ -98,10 +259,12 @@ def _export_committed_source(source_fd: int, destination: Path) -> None:
                 any(ord(char) < 32 or ord(char) == 127 for char in part)
                 for part in parts) or len(name_bytes) > 4096):
             raise TurnDenied('unsafe source path')
-        if any(part.startswith('.') or part.casefold() in excluded or
-               part.casefold() in forbidden for part in parts):
+        if any(part.startswith('.') or part.casefold() in _EXCLUDED_COMPONENTS for part in parts):
             continue
-        if Path(parts[-1]).suffix.casefold() not in allowed:
+        suffix = Path(parts[-1]).suffix.casefold()
+        if suffix not in _ALLOWED_SUFFIXES:
+            continue
+        if _credential_shaped_path(parts):
             continue
         if mode not in (b'100644', b'100755') or kind != b'blob':
             raise TurnDenied('source contains nonregular file')
@@ -115,6 +278,10 @@ def _export_committed_source(source_fd: int, destination: Path) -> None:
         if (len(data) != length or
                 digest(b'blob ' + str(length).encode() + b'\0' + data).hexdigest().encode() != blob):
             raise TurnDenied('source blob hash mismatch')
+        # A committed `notes.md` holding a token passes every name rule there is, so the content of
+        # documentation and data is checked too (never of code or templates -- see above).
+        if suffix in _CONTENT_SUFFIXES and _credential_shaped_text(data):
+            continue
         # Resolve each destination component relative to pinned directory fds.
         # A swapped symlink can never redirect a write outside this snapshot.
         with ExitStack() as stack:

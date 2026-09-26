@@ -1,4 +1,33 @@
-"""Fail-closed whole-process bubblewrap launcher with per-run IPC capabilities."""
+"""Fail-closed whole-process bubblewrap launcher with per-run IPC capabilities and size bounds.
+
+``MAX_CAPTURE`` bounds what the parent retains and the caller bounds wall-clock time; neither
+bounds memory or disk, because bubblewrap's tmpfs default is half of RAM and a bind mount has no
+size at all. A seat that spent its whole turn writing could therefore fill the same host
+filesystem that holds the loop's ledger and state (issue #89). Every write surface the seat can
+grow is now a named size instead of an inherited default — and the two that have to stay the
+host's are named too, below:
+
+* ``/tmp`` is a tmpfs of ``SCRATCH_SIZE``: TMPDIR, ``CARGO_HOME``/``RUSTUP_HOME`` and an
+  unwritable checkout's build target.
+* A writable ``/work`` is a tmpfs of ``CHECKOUT_SIZE``, which this launcher fills in-namespace
+  from a read-only bind of the staged export before the seat starts. The seat needs to write
+  there — the reviewer and the fixer build, test and edit in ``/work`` — and no host process
+  reads it afterwards: a fixer's push carries file contents through the broker, and
+  ``safe_push`` never opens the checkout. The host's export is mounted read-only, so a seat's
+  edits cannot reach even the staged copy. An unwritable ``/work`` stays a plain read-only bind
+  of that export: an adjudicator's ruling is judgement, not a change.
+* The namespace root bubblewrap creates implicitly, and ``--dev``, are remounted read-only: both
+  are tmpfs mounts of nobody's chosen size.
+
+Two things stay the host's, and they are the honest limit of an in-namespace fix:
+
+* ``/home/agent`` is a read-write bind of the per-turn host directory, because the host reads what
+  the seat wrote there (Hermes state, fixture request logs). A bind mount has no size option.
+* ``size=`` bounds tmpfs *data*, not inode metadata (an 8 MiB tmpfs accepts hundreds of thousands
+  of empty files), and neither bound covers the host filesystem behind the ``/home/agent`` bind.
+  The outer half of this bound belongs on the worker's unit — ``MemoryMax=`` for the RAM-backed
+  tmpfs, ``IOWeight=`` or a disk quota for the host bind — not in a user namespace.
+"""
 from __future__ import annotations
 
 import os
@@ -6,9 +35,91 @@ from pathlib import Path
 import selectors
 import signal
 import subprocess
+import sys
 import time
 
 MAX_CAPTURE = 256 * 1024
+
+# Named size bounds for the writable mounts above. tmpfs is charged page by page, so these are
+# caps and not reservations: a seat that writes nothing costs nothing. ``SCRATCH_SIZE`` holds
+# TMPDIR, the cargo and rustup homes and a scratch build target; ``CHECKOUT_SIZE`` holds the
+# exported head (at most 100 MiB — ``trusted_fetch._MAX_BYTES``) plus the build output of a turn
+# whose wall-clock bound is minutes. Both are orders of magnitude below the host filesystem free
+# space they used to be able to consume.
+#
+# The defaults are sized against what this loop actually builds, not against what a test writes:
+# a Rust debug target for the repos it watches is 2.2 GiB (patchhive/attest) and two other real
+# workspaces' are 3.3 GiB and 3.9 GiB, all of which land in ``/work`` because ``CARGO_TARGET_DIR``
+# points there. A cap below a real target does not fail loudly — the seat reports "could not
+# verify" and every review requests changes, which is the failure the crate cache exists to fix.
+# Overrides this resolver refused, so `doctor` can report them: a bound nobody can parse must not
+# vanish into an unattended turn's stderr.
+IGNORED_SIZE_OVERRIDES: list[tuple[str, str, str]] = []
+
+
+def _note_ignored_override(name: str, raw: str, why: str) -> None:
+    """Record a refusal for ``name``, replacing any earlier one.
+
+    One entry per name, not an ever-growing log: a name that is still broken must not be reported
+    twice, and a long-lived supervisor must not accumulate entries for the life of the process.
+    """
+    IGNORED_SIZE_OVERRIDES[:] = [o for o in IGNORED_SIZE_OVERRIDES if o[0] != name]
+    IGNORED_SIZE_OVERRIDES.append((name, raw, why))
+
+
+def live_ignored_overrides() -> list[tuple[str, str, str]]:
+    """The refusals that are still true in *this* environment.
+
+    A refusal matters while the bad value is still set, and stops mattering the moment it is gone:
+    a caller that provoked one (a test, a probe, an operator who has since fixed the value) must
+    not inherit a permanent failure, and a green install must not stay red for a value that was
+    corrected — this record is process-wide and the resolution is read once per process.
+    """
+    return [o for o in IGNORED_SIZE_OVERRIDES
+            if os.environ.get(f"REVIEW_LOOP_{o[0]}_GIB", "").strip() == o[1]]
+
+
+def _size_from_env(name: str, gib: int) -> int:
+    """A mount bound, overridable with ``REVIEW_LOOP_<NAME>_GIB``.
+
+    These are environment settings rather than config keys because the number that matters is a
+    property of the *host* — its RAM, and how large a build in the repos it watches grows — not of
+    one loop. A value nobody can parse is reported and ignored rather than fatal: a bound that
+    cannot be read must not take an unattended loop down.
+    """
+    raw = os.environ.get(f"REVIEW_LOOP_{name}_GIB", "").strip()
+    try:
+        value = int(raw) if raw else gib
+        if not 1 <= value <= 1024:
+            raise ValueError("outside 1..1024")
+    except ValueError as exc:
+        if raw:
+            print(f"contained: ignoring REVIEW_LOOP_{name}_GIB={raw!r} ({exc}); using {gib} GiB",
+                  file=sys.stderr)
+            _note_ignored_override(name, raw, str(exc))
+        value = gib
+    return value * 1024 ** 3
+
+
+SCRATCH_SIZE = _size_from_env("SCRATCH_SIZE", 2)
+CHECKOUT_SIZE = _size_from_env("CHECKOUT_SIZE", 8)
+
+# Where a writable checkout's read-only source export is mounted, and the loader that stages it
+# into the sized tmpfs at /work before the seat runs. bubblewrap has no "copy this tree" mount, so
+# the copy happens inside the namespace, where it is also charged to the budget it fills. Its
+# failure is the shell's: the entry never runs against a half-staged tree.
+EXPORT_DIR = "/opt/export"
+LOAD_CHECKOUT = f'cp -a {EXPORT_DIR}/. /work/ && exec "$@"'
+
+
+def _sized_tmpfs(destination: str, size: int) -> list[str]:
+    """``--size`` applies to the *next* ``--tmpfs``, so the two options must stay adjacent.
+
+    The ``--tmpfs DEST,size=N`` spelling is not accepted by every bubblewrap build, and one that
+    does not know it takes the whole string as the mount point — silently creating a directory
+    named ``tmp,size=N`` and no ``/tmp`` at all. The adjacent form fails loudly instead.
+    """
+    return ["--size", str(size), "--tmpfs", destination]
 
 class OutputLimitExceeded(RuntimeError):
     """The sandbox produced more output than the control plane will retain."""
@@ -26,6 +137,10 @@ def command(*, code: Path, venv: Path, runtime: Path, home: Path,
     code must be a separately staged, audited, credentialless source snapshot;
     none of these directories may be the user's actual home or source checkout.
     There is deliberately no caller-selectable arbitrary host bind.
+
+    A writable ``checkout`` is never bound into the namespace directly: it is staged into a sized
+    tmpfs that the seat cannot grow past, and the old, unbounded ``--bind`` of the host filesystem
+    is gone. See the module docstring for what that costs and what it does not cover.
     """
     if network:
         raise ValueError("host networking is forbidden")
@@ -56,20 +171,28 @@ def command(*, code: Path, venv: Path, runtime: Path, home: Path,
     # runtime is mounted at that same path; its ancestors are empty directories.
     runtime_parents = [arg for parent in reversed(Path(runtime).parents[:-1])
                        for arg in ("--dir", str(parent))]
+    if checkout_writable:
+        # The seat's tree is a tmpfs it cannot outgrow, filled by LOAD_CHECKOUT from a read-only
+        # bind of the staged export: edits and build output are charged to CHECKOUT_SIZE and reach
+        # neither the host filesystem nor the export the host staged.
+        checkout_mount = [*_sized_tmpfs("/work", CHECKOUT_SIZE),
+                          "--ro-bind", str(checkout), EXPORT_DIR]
+    else:
+        checkout_mount = ["--ro-bind", str(checkout), "/work"]
     mounts = ["bwrap", "--unshare-all", "--die-with-parent", "--new-session",
             "--ro-bind", "/usr", "/usr", "--ro-bind", "/bin", "/bin",
             "--ro-bind", "/lib", "/lib", "--ro-bind-try", "/lib64", "/lib64",
             # Debian/Ubuntu resolve cc, c++ and friends through /etc/alternatives;
             # without it Rust cannot link. It holds only symlinks.
             "--ro-bind-try", "/etc/alternatives", "/etc/alternatives",
-            "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+            "--proc", "/proc", "--dev", "/dev", *_sized_tmpfs("/tmp", SCRATCH_SIZE),
             "--dir", "/opt", *runtime_parents,
             "--ro-bind", str(runtime), str(runtime),
             "--ro-bind", str(venv), "/opt/venv",
             "--ro-bind", str(code), "/opt/code",
             "--ro-bind", str(rust), "/opt/rust",
             "--bind", str(home), "/home/agent",
-            "--bind" if checkout_writable else "--ro-bind", str(checkout), "/work",
+            *checkout_mount,
             "--ro-bind", str(query), "/opt/query"]
     if inference_socket_dir is not None:
         mounts += ["--dir", "/opt/inference", "--ro-bind", str(Path(inference_socket_dir)), "/opt/inference"]
@@ -80,14 +203,20 @@ def command(*, code: Path, venv: Path, runtime: Path, home: Path,
         mounts += ["--ro-bind", str(Path(client_code)), "/opt/client"]
     if review_dir is not None:
         # Read-only and outside /work: the diff is something to read, never something to push.
+        # Mounted before the remount-ro below, which seals the root and /dev.
         mounts += ["--ro-bind", str(Path(review_dir)), "/opt/review"]
+    # Last, after every mount point above exists: the root and /dev are tmpfs mounts of no chosen
+    # size, and the seat has no business writing to either (its scratch lives in /tmp, /work and
+    # /home/agent). Nothing after this creates a directory.
+    mounts += ["--remount-ro", "/", "--remount-ro", "/dev"]
+    launch = ["/bin/sh", "-c", LOAD_CHECKOUT, "sh", *entry] if checkout_writable else list(entry)
     return mounts + [
             "--setenv", "HOME", "/home/agent", "--setenv", "HERMES_HOME", "/home/agent",
             "--setenv", "PYTHONPATH", "/opt/code:/opt/client" if client_code else "/opt/code", "--setenv", "CARGO_HOME", "/tmp/cargo",
             "--setenv", "RUSTUP_HOME", "/tmp/rustup", "--setenv", "CARGO_TARGET_DIR", "/work/target" if checkout_writable else "/tmp/target",
             "--setenv", "TMPDIR", "/tmp", "--setenv", "PATH", "/opt/venv/bin:/opt/rust/bin:/usr/bin:/bin",
             "--setenv", "GIT_CONFIG_GLOBAL", "/dev/null", "--setenv", "GIT_CONFIG_SYSTEM", "/dev/null",
-            "--setenv", "GIT_TERMINAL_PROMPT", "0", "--chdir", "/work", "--", *entry]
+            "--setenv", "GIT_TERMINAL_PROMPT", "0", "--chdir", "/work", "--", *launch]
 
 
 def run(*, timeout: int = 180, **kwargs) -> subprocess.CompletedProcess:

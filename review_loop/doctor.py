@@ -728,6 +728,63 @@ def check_clone(loop: dict) -> Check:
     return Check("clone", VERIFIED, f"{path} (git checkout){note}")
 
 
+def _gib(count: int) -> str:
+    return f"{count / 1024 ** 3:.1f} GiB"
+
+
+def _host_memory() -> tuple[int, int] | None:
+    """(available, total) bytes from /proc/meminfo, or None where there is no /proc.
+
+    Available is what a new allocation can take: reclaimable memory plus free swap. Total is what
+    the machine has at all, for the operator's context when the two are far apart.
+    """
+    fields: dict[str, int] = {}
+    try:
+        for line in pathlib.Path("/proc/meminfo").read_text().splitlines():
+            name, _, rest = line.partition(":")
+            fields[name] = int(rest.split()[0]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    total = fields.get("MemTotal")
+    if total is None:
+        return None
+    return fields.get("MemAvailable", 0) + fields.get("SwapFree", 0), total + fields.get("SwapTotal", 0)
+
+
+def check_sandbox_caps(loop: dict) -> Check:
+    """What the seats' writable mounts can reach, against the memory that has to back them.
+
+    Both mounts are tmpfs, so they are charged against RAM and swap rather than disk: a cap sized
+    for one turn can still take a small host down when several seats run at once. This reports the
+    worst case at *this* loop's concurrency beside what the host has available.
+    """
+    from . import contained
+    per_turn = contained.CHECKOUT_SIZE + contained.SCRATCH_SIZE
+    turns = (config.seat_concurrency(loop, "reviewer")
+             + config.seat_concurrency(loop, "fixer") + 1)
+    worst = per_turn * turns
+    detail = (f"/work {_gib(contained.CHECKOUT_SIZE)} + /tmp {_gib(contained.SCRATCH_SIZE)}"
+              f" = {_gib(per_turn)} per turn, {_gib(worst)} at {turns} concurrent turns")
+    refused_overrides = contained.live_ignored_overrides()
+    if refused_overrides:
+        refused = ", ".join(f"REVIEW_LOOP_{name}_GIB={raw!r} ({why})"
+                            for name, raw, why in refused_overrides)
+        return Check("sandbox:caps", MISMATCH, f"{detail} — with an override refused: {refused}",
+                     "fix the value (an integer 1..1024 GiB) and restart the gateway: the launcher "
+                     "reads it once, when the supervisor imports it")
+    memory = _host_memory()
+    if memory is None:
+        return Check("sandbox:caps", VERIFIED, f"{detail} (host memory unreadable here)")
+    available, total = memory
+    if worst > available:
+        return Check("sandbox:caps", MISMATCH,
+                     f"{detail} — more than the {_gib(available)} available of {_gib(total)}",
+                     "lower the caps (REVIEW_LOOP_CHECKOUT_SIZE_GIB / "
+                     "REVIEW_LOOP_SCRATCH_SIZE_GIB), add memory, or let the seats run one at a "
+                     "time: tmpfs is charged against RAM and swap")
+    return Check("sandbox:caps", VERIFIED, f"{detail} — {_gib(available)} available of {_gib(total)}")
+
+
 def check_fixer_push(loop: dict) -> Check:
     """Whether the fix leg can run at all. Off is the safe default, not a fault — but it means
     every changes-requested verdict is held for the operator instead of starting a fixer turn."""
@@ -921,6 +978,7 @@ def check_loop(loop: dict, offline: bool = False) -> list[Check]:
         checks.append(check_adjudicator_profile(loop))
     checks.extend(check_seat_models(loop))
     checks.append(check_fixer_push(loop))
+    checks.append(check_sandbox_caps(loop))
     identity = check_adjudicator_identity(loop)
     if identity:
         checks.append(identity)

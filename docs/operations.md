@@ -374,6 +374,46 @@ raises no operator notice; confirming alerts still needs a real enqueued turn an
 The no-write guarantees and what the selftest does not prove are in
 [Issue #16: live verification](issue-16-boundary.md#live-verification-hermes-review-loop-selftest).
 
+## Sandbox size caps: the two writable mounts
+
+Every surface a seat can grow is a named tmpfs, because bubblewrap's own default is half of RAM and
+a bind mount has no size at all — a seat that spent its turn writing could fill the host filesystem
+that holds the loop's ledger.
+
+| Mount | Holds | Default | Override |
+| --- | --- | --- | --- |
+| `/work` | the checkout the seat builds and edits in (`CARGO_TARGET_DIR` points here) | 8 GiB | `REVIEW_LOOP_CHECKOUT_SIZE_GIB` |
+| `/tmp` | `TMPDIR`, `CARGO_HOME`/`RUSTUP_HOME`, an unwritable checkout's build target | 2 GiB | `REVIEW_LOOP_SCRATCH_SIZE_GIB` |
+
+Both are sized against what real Rust workspaces build — a `patchhive/attest` debug target is
+2.2 GiB, two others 3.3 and 3.9 GiB — because a cap below a real target does not fail loudly: the
+seat reports that it could not verify and every review requests changes.
+
+Are these caps or reservations? Caps: tmpfs is charged page by page, so a seat that writes nothing
+costs nothing. But they are charged against **RAM and swap**, not disk, so at this loop's
+concurrency they are also a memory budget. `doctor`'s `sandbox:caps` line prints the two caps, the
+worst case at the loop's own concurrency, and the host's available memory beside them, and fails
+when the worst case is larger than what is available.
+
+### Where to set an override
+
+In the environment of **the process that runs the supervisor** — normally the gateway, since every
+sweep, webhook route and `arm` runs inside its process tree. The launcher reads these once, when
+the supervisor imports it, so a change needs a restart of that unit (or, for a hand-run `arm`, an
+export in that shell first):
+
+```ini
+[Service]
+Environment=REVIEW_LOOP_CHECKOUT_SIZE_GIB=16
+Environment=REVIEW_LOOP_SCRATCH_SIZE_GIB=4
+```
+
+Values are integers in GiB, 1 to 1024. A value that cannot be parsed is reported on stderr and the
+default stays in force rather than taking an unattended loop down — but it is not silent: `doctor`
+and `selftest` both name an override they refused. Confirm what took effect with
+`hermes review-loop doctor --loop <id>`; `selftest --pr N` adds
+`sandbox:build-fits`, which measures the isolation clone's own `target` against the cap.
+
 ## Why isn't this PR moving?
 
 `status` shows the loop's shape; `explain` answers the question you actually have at 2am, for one

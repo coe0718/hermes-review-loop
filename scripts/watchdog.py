@@ -59,11 +59,15 @@ def valid_clock(value: object, now: float) -> float | None:
 
 def drain(loop: dict, st: state_mod.LoopState, seat: str, quiet: bool = False) -> int:
     """Start whatever queued while a seat was at capacity. Up to the free slots; the claim holds it."""
+    # Prune *before* the empty-queue return: an expired claim is dead whether or not anything
+    # is queued behind it, and this is the sweep's one chance to drop it from locks.json. Left
+    # pruning to the queue path, a dead mark would be reported as stuck by every later sweep
+    # and never leave the file.
+    live = st.active(seat)
     items = st.queue_items(seat)
     if not items:
         return 0
     capacity = config.seat_concurrency(loop, seat)
-    live = st.active(seat)
     free = capacity - len(live)
     if free <= 0:
         if not quiet:
@@ -555,31 +559,41 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
             if now - watch.get("alerts", {}).get(f"{number}:{head[:7]}:{kind[:24]}", 0) > cooldown:
                 alerts.append((number, kind, (pr.get("title") or "")[:60]))
 
-    stuck: list[str] = []
+    stuck: list[tuple[str, str]] = []
     for seat, entries in (st._load(st.locks, {}) or {}).items():
         for key, entry in (entries or {}).items():
             age = (now - entry.get("at", now)) / 60
             if age > loop["ttl_min"] * 2:
-                stuck.append(f"  {seat} slot held {age:.0f}m on {key} — that run died; the slot "
-                             f"frees itself at {loop['ttl_min']}m")
+                stuck.append((f"lock:{seat}:{key}",
+                              f"  {seat} slot held {age:.0f}m on {key} — that run died; the "
+                              f"mark is pruned on the next sweep"))
     for seat, items in st.queue_all().items():
         for key, entry in (items or {}).items():
             if config.is_fixer_push_hold(entry):
                 continue  # reported once per head as a stall above, not on every sweep
             age = (now - entry.get("at", now)) / 60
             if age > loop["grace_min"]:
-                stuck.append(f"  {seat} queue: {key} waiting {age:.0f}m — {entry.get('reason')}")
+                stuck.append((f"queue:{seat}:{key}",
+                              f"  {seat} queue: {key} waiting {age:.0f}m — {entry.get('reason')}"))
 
-    if alerts or stuck:
+    # The same cooldown the stall alerts use, on a stable key per stuck mark: an unrepaired
+    # mark is worth one warning per window, not the identical two lines every 15 minutes.
+    reported: list[str] = []
+    for key, line in stuck:
+        seen[key] = now
+        if now - watch.get("alerts", {}).get(key, 0) > cooldown:
+            reported.append(line)
+
+    if alerts or reported:
         header = f"[{loop['id']}] {loop['repo']}"
         if alerts:
             lines.append(f"⚠️ Review loop {header} — {len(alerts)} silent stall(s):")
             for number, kind, title in alerts:
                 lines.append(f"  #{number}  {kind}")
                 lines.append(f"        {title}")
-        if stuck:
-            lines.append(f"⚠️ Review loop {header} — {len(stuck)} stuck state(s):")
-            lines.extend(stuck)
+        if reported:
+            lines.append(f"⚠️ Review loop {header} — {len(reported)} stuck state(s):")
+            lines.extend(reported)
         lines.append("Pending adjudicator delivery retries on the next sweep; other stalls "
                      "need investigation. Check the gateway log before re-driving a route.")
 
@@ -606,7 +620,7 @@ def sweep_loop(loop: dict, st: state_mod.LoopState) -> list[str]:
     watch["alerts"] = {k: v for k, v in history.items() if now - v < 30 * 86400}
     watch["last_run"] = now_iso()
     st.watch_save(watch)
-    st.note(f"run: {len(alerts)} alert(s), {len(stuck)} stuck, {len(prs)} open PRs")
+    st.note(f"run: {len(alerts)} alert(s), {len(reported)} stuck, {len(prs)} open PRs")
     return lines
 
 

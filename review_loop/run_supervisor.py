@@ -1235,7 +1235,10 @@ class Supervisor:
                   timeout=int(self.child_timeout),
                   work_root=Path(loop["state_dir"]) / "isolated-runs")
         except Exception as exc:
-            error = f"isolated turn failed: {type(exc).__name__}"
+            # The type alone does not diagnose anything: an operator (and the next person reading
+            # this ledger) needs to know *why* the turn failed. Truncated, because an exception
+            # message can quote a path or a header and this lands in operator-visible state.
+            error = f"isolated turn failed: {type(exc).__name__}: {str(exc)[:200]}"
         finally:
             self.complete_uncertain(run_id, owner, rc, error)
             self.recover()

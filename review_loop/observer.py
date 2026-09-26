@@ -16,6 +16,13 @@ deterministic code that just changed the loop's durable state — the moment a s
 the moment a breach marker is written, the moment the watchdog read a stall out of GitHub — so a
 notice can never describe something the loop did not do. Agent text is never an input here.
 
+**What a notice claims is checked against the loop's own record.** A transition hands the feed
+*what to say* (``next_turn``), and the same call site runs on a gate's success path and on its
+fail-closed hold path, so the claim is a claim — not evidence. Before it reaches a phone, the
+claim that a turn was queued is put to the queue the gate itself wrote: a turn that could not be
+handed to the isolated worker reads as *held*, with the reason recorded there, because telling an
+operator a run is queued while nothing is armed is the one thing this feed must never do.
+
 **One transition, one notice.** Every ledger entry is keyed by loop + PR + head + event and an
 identity for the fact itself (a review id, an action, a stall kind), so a redelivered webhook, a
 re-armed hook, or a sweep that runs twice cannot produce a second ping for the same fact.
@@ -68,6 +75,19 @@ MAX_ATTEMPTS = 3
 RETENTION_S = 30 * 86400
 
 DIGEST_LIMIT = 25
+
+# The reason ``gate.block_pr_agent`` writes into the queue when a turn could *not* be handed to
+# the isolated worker — no valid private runtime, a ledger failure, a refused spawn — instead of
+# the queue entry a successful handoff pops. That entry is the loop's only durable record of the
+# hold (the operator sees it in ``pending.json``; the harness reads it as ``held()``), so the feed
+# repeats it rather than a claim about a run that is not there. The wording is the gate's, not
+# ours: keep it in step with ``review_loop/gate.py``.
+HOLD_PREFIX = "isolated worker unavailable"
+
+# What a gate's claim about a turn looks like: "<seat> queued" — the seat it just tried to arm
+# ("reviewer queued", "fixer queued", and the watchdog's "reviewer queued (fresh review)"). A
+# clause in any other shape is not a queued-turn claim and is passed through untouched.
+QUEUED_CLAIM = re.compile(r"^(\w+) queued\b")
 
 
 # -- configuration -------------------------------------------------------------
@@ -267,6 +287,56 @@ def key_for(loop: dict, number, head: str, event: str, identity: object = "") ->
                      head or "nohead", event, str(identity or "-")])
 
 
+def claimed_seat(claim: str) -> str:
+    """The seat a next-turn clause says was queued, or ``""`` for any other clause.
+
+    The gate scripts word their claim after the turn they tried to arm — "reviewer queued",
+    "fixer queued" — because that is what a person needs to know. The name is the seat whose own
+    state has to back the claim; without it there is nothing to check, so anything else (``you
+    merge``, ``nothing — cleanup attempted``, an adjudicator handoff) reads unchanged.
+    """
+    match = QUEUED_CLAIM.match(str(claim or ""))
+    return match.group(1) if match else ""
+
+
+def hold_reason(loop: dict, st, seat: str, number, head: str) -> str:
+    """Why the loop's own queue says this seat's turn for this PR is held, or ``""``.
+
+    ``gate.block_pr_agent`` *pops* the queue entry when the turn really was committed to the host
+    run ledger and *replaces* it with the failure reason when it was not, so for one seat, one
+    PR and one head this entry is the single place the two outcomes differ — and reading it is
+    read-only and local (no lock, no network, no gh). Only this head counts: a hold recorded for
+    an older head is not this turn's, and a queue entry for another reason (waiting for capacity,
+    the other seat working this PR) is a real queue, not a hold.
+
+    What it does not prove: a queue that cannot be read at all (a corrupt file — the writers
+    publish atomically, so this is the one way an entry goes missing) reads as empty here, as it
+    does to every other reader of ``pending.json``. The claim is then left exactly as the
+    transition worded it rather than reworded from a guess.
+    """
+    from . import gate            # lazy: gate imports this module at import time
+    if seat not in (loop.get("seats") or {}):
+        return ""
+    entry = st.queue_items(seat).get(gate.seat_key(loop, number))
+    if not isinstance(entry, dict) or entry.get("head") != head:
+        return ""
+    reason = str(entry.get("reason") or "")
+    return reason if reason.startswith(HOLD_PREFIX) else ""
+
+
+def verified_turn(loop: dict, st, number, head: str, claim: str) -> str:
+    """The next-turn clause the loop can back, not the one the caller was handed.
+
+    ``on_queued`` fires on the gate's hold path as well as its success path, so a caller told to
+    say "reviewer queued" says it whether or not a run was armed. A held turn becomes "held —
+    <reason>"; everything else, including a genuine queue wait, is left exactly as the transition
+    worded it.
+    """
+    seat = claimed_seat(claim)
+    reason = hold_reason(loop, st, seat, number, head) if seat else ""
+    return f"held — {reason}" if reason else claim
+
+
 def summarize(loop: dict, event: str, number, head: str, *, outcome: str = "",
               next_turn: str = "", round_no=None, actor: str = "") -> str:
     """The one-line summary of a transition: seat/event, head, outcome, next turn.
@@ -352,15 +422,22 @@ def block_for(loop: dict, event: str, number, head: str, text: str) -> dict:
 # -- delivery ------------------------------------------------------------------
 
 
-def _post(loop: dict, block: dict, tag: str) -> tuple:
-    """Return (delivered, error, uncertain); a POST without a 2xx may have landed."""
+def _post(loop: dict, block: dict, tag: str, delivery: str = "") -> tuple:
+    """Return (delivered, error, uncertain); a POST without a 2xx may have landed.
+
+    ``delivery`` is the id this notice was issued with. A caller sending a notice for the first
+    time leaves it empty and gets a fresh one from ``routes.fire``; a caller re-sending one
+    logical delivery passes the id it used before, so the gateway's idempotency window can
+    recognise it.
+    """
     route = (loop.get("observer") or {}).get("route") or ""
     contract = route_contract(loop)
     if _target(loop) is None:
         return False, (f"route {route!r} is missing from the gateway's subscriptions, or has no "
                        f"secret/url, or violates the observer delivery-only contract"), False
     payload = {"repository": {"full_name": loop["repo"]}, "_observer": block}
-    if routes.fire(route, "pull_request", payload, tag, loop.get("host"), expected=contract):
+    if routes.fire(route, "pull_request", payload, tag, loop.get("host"), expected=contract,
+                   delivery=delivery):
         return True, "", False
     return False, "POST result unverified; manual reconciliation required (not automatically retried)", True
 
@@ -414,10 +491,19 @@ def notify(loop: dict, st, event: str, number, head: str = "", *, identity: obje
             log(f"observer: {event} is not in the feed for #{number} — not sent")
             return False
 
-        summary = summarize(loop, event, number, head, outcome=outcome, next_turn=next_turn,
+        # The caller's next turn is a claim, not evidence: the gate's hold path calls on_queued
+        # too. Put a "queued" claim to the queue the gate just wrote before it reaches a phone.
+        turn = verified_turn(loop, st, number, head, next_turn)
+        summary = summarize(loop, event, number, head, outcome=outcome, next_turn=turn,
                             round_no=round_no, actor=actor)
         text = f"{summary}\n{gh.pr_url(loop, number)}"
         key = key_for(loop, number, head, event, identity)
+        queued = bool((loop.get("observer") or {}).get("digest_min"))
+        tag = f"{event}-{number}"
+        # Minted here rather than at POST time so the ledger can hold it: this notice's retries are
+        # the same logical delivery and must present the same id (see routes.fire). A digest member
+        # is not itself a delivery — its digest is — so it carries no id of its own.
+        delivery = "" if queued else routes.delivery_id(tag)
         path = st.observations
         now = time.time()
         with _lock(path):
@@ -429,7 +515,6 @@ def notify(loop: dict, st, event: str, number, head: str = "", *, identity: obje
                     f"({prior.get('status')}) — not sending it twice")
                 _save(path, data)
                 return False
-            queued = bool((loop.get("observer") or {}).get("digest_min"))
             data["entries"][key] = {"status": "queued" if queued else "pending",
                                     "event": event, "number": number, "head": head,
                                     "identity": str(identity or ""), "summary": summary,
@@ -438,18 +523,21 @@ def notify(loop: dict, st, event: str, number, head: str = "", *, identity: obje
                                     "attempts": 0, "error": "", "at": now}
             if queued:
                 data["entries"][key]["queued_at"] = now
+            else:
+                data["entries"][key]["delivery"] = delivery
             _save(path, data)
 
         if queued:
             log(f"observer: queued {event} #{number} for the next digest")
             return False
-        return _deliver(loop, st, key, text, f"{event}-{number}", event, number, head)
+        return _deliver(loop, st, key, text, tag, event, number, head, delivery)
     except Exception as exc:
         log(f"observer: {event} notice for #{number} failed: {type(exc).__name__}: {exc}")
         return False
 
 
-def _deliver(loop: dict, st, key: str, text: str, tag: str, event: str, number, head: str) -> bool:
+def _deliver(loop: dict, st, key: str, text: str, tag: str, event: str, number, head: str,
+             delivery: str = "") -> bool:
     """POST one rendered notice and record the receipt. The claim already exists in the ledger."""
     if event == "approved" and " · next: you merge" in text:
         # An approval can be dismissed between the gate's check and this POST. A merge
@@ -480,7 +568,8 @@ def _deliver(loop: dict, st, key: str, text: str, tag: str, event: str, number, 
                 and latest and gh.review_state(latest) == "APPROVED"
                 and str(latest.get("id")) == entry.get("identity")):
             text = _without_next_turn(text)
-    delivered, error, uncertain = _post(loop, block_for(loop, event, number, head, text), tag)
+    delivered, error, uncertain = _post(loop, block_for(loop, event, number, head, text), tag,
+                                        delivery)
     _receipt(st, key, delivered, error, uncertain)
     if delivered:
         log(f"observer: notified {event} #{number} at {(head or '')[:7]}")
@@ -536,6 +625,12 @@ def retry(loop: dict, st) -> int:
         if not text:
             continue
         tag = f"retry-{entry.get('event')}-{entry.get('number')}"
+        # A retry is the *same* logical delivery, so it re-presents the id the claim was issued
+        # with: if the first attempt did reach the gateway after all, the header makes the retry a
+        # duplicate of one notice rather than a second copy of it. A claim written before the loop
+        # recorded ids (a legacy ledger) has none, and gets a fresh one — it can only be a notice
+        # whose first attempt the loop has already ruled out as delivered.
+        delivery = str(entry.get("delivery") or routes.delivery_id(tag))
         # Built by hand rather than through block_for: a digest batch has no single PR, and a
         # synthesized link to "pull/" would be worse than no link at all.
         block = {"event": entry.get("event") or "notice", "loop": loop.get("id"),
@@ -543,7 +638,7 @@ def retry(loop: dict, st) -> int:
                  "url": entry.get("url") or "", "at": now_iso(), "message": text}
         if entry.get("batch"):
             block["count"] = len(entry["batch"])
-        delivered, error, uncertain = _post(loop, block, tag)
+        delivered, error, uncertain = _post(loop, block, tag, delivery)
         _receipt(st, key, delivered, error, uncertain)
         if delivered:
             sent += 1
@@ -586,9 +681,12 @@ def flush(loop: dict, st, wait_s: int = 0) -> bool:
                 return False
             members = [data["entries"][k] for k in queued]
             text = render_digest(loop, members)
+            tag = f"digest-{len(members)}"
+            delivery = routes.delivery_id(tag)
             data["entries"][key] = {"status": "pending", "event": DIGEST_EVENT, "number": "",
                                     "head": "", "identity": queued[0], "summary": "",
                                     "message": text, "url": "", "batch": queued,
+                                    "delivery": delivery,
                                     "attempts": int(prior.get("attempts") or 0) if isinstance(prior, dict) else 0,
                                     "error": "", "at": now, "queued_at": oldest}
             for member in queued:
@@ -597,7 +695,7 @@ def flush(loop: dict, st, wait_s: int = 0) -> bool:
 
         delivered, error, uncertain = _post(loop, {"event": DIGEST_EVENT, "loop": loop.get("id"),
                                         "count": len(members), "at": now_iso(), "message": text},
-                                 f"digest-{len(members)}")
+                                 tag, delivery)
         _receipt(st, key, delivered, error, uncertain)
         if delivered:
             log(f"observer: digest of {len(members)} transition(s) delivered")
