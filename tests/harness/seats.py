@@ -925,9 +925,18 @@ def group_webhook_host() -> None:
             installed_hooks.clear()
             parser = parser_for(settings)
             args = parser.parse_args([*init_args, *extra])
-            with contextlib.redirect_stdout(io.StringIO()):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
                 rc = args.func(args)
             check(f"{label}: init succeeds", rc, 0)
+            # A loop goes live with `arm`, after doctor and selftest — not as a side effect of init.
+            check(f"  {label}: hooks created paused",
+                  [kw["body"]["active"] for _, kw in calls], [False, False])
+            check(f"  {label}: says they are paused", "(paused)" in out.getvalue(), True)
+            check(f"  {label}: next steps end with arm",
+                  "hermes review-loop arm --loop host-probe" in out.getvalue(), True)
+            check(f"  {label}: never tells a seat profile to hold a GitHub token",
+                  "GH_TOKEN in the profile .env" in out.getvalue(), False)
             check(f"  {label}: saved host", config.load_id("host-probe")["host"], host)
             check(f"  {label}: hook URLs", [body["config"]["url"] for _, kw in calls
                   for body in [kw["body"]]],
@@ -936,6 +945,26 @@ def group_webhook_host() -> None:
             check(f"  {label}: route hosts",
                   [json.loads(SUBS.read_text())[name]["host"]
                    for name in ("host-probe-review", "host-probe-fix")], [host, host])
+
+        reset(prs={})
+        calls.clear()
+        installed_hooks.clear()
+        parser = parser_for()
+        args = parser.parse_args([*init_args, "--host", "https://own.example", "--arm"])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = args.func(args)
+        check("--arm: init succeeds", rc, 0)
+        check("  --arm: hooks created live", [kw["body"]["active"] for _, kw in calls], [True, True])
+        check("  --arm: says the hooks are armed", "ARMED" in out.getvalue(), True)
+        (LOOPS_DIR / "host-probe.json").unlink(missing_ok=True)
+        calls.clear()
+        args = parser.parse_args([a for a in init_args if a != "--hooks"]
+                                 + ["--host", "https://own.example", "--arm"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = args.func(args)
+        check("--arm without --hooks is refused", rc, 2)
+        check("  and writes nothing", ((LOOPS_DIR / "host-probe.json").exists(), calls), (False, []))
 
         legacy = json.loads((LOOPS_DIR / "widgets.json").read_text())
         legacy["host"] = "https://existing.example/"
