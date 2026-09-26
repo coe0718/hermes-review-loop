@@ -67,11 +67,15 @@ GATE_EVENT = {"reviewer": "pull_request", "fixer": "pull_request_review"}
 class Check:
     """One line of the preflight: what was asked, what was found, and how to fix it."""
 
-    def __init__(self, name: str, status: str, detail: str, fix: str = "") -> None:
+    def __init__(self, name: str, status: str, detail: str, fix: str = "",
+                 paused: bool = False) -> None:
         self.name = name
         self.status = status
         self.detail = detail
         self.fix = fix
+        # A correct hook that is not armed yet. Not a failure: init creates hooks paused and the
+        # documented order is doctor → selftest → arm, so a fresh install must be able to pass.
+        self.paused = paused
 
     @property
     def failed(self) -> bool:
@@ -258,18 +262,23 @@ def check_credential(loop: dict, seat: str) -> Check:
         return Check(f"credential:{seat}", ABSENT,
                      f"nonempty GH_TOKEN in {env}, but no mapped token file for "
                      f"{login or seat}; a profile environment alone does not provide the "
-                     "gate's configured GitHub identity",
-                     f"add --token {login or '<login>'}=/path/to/pat for this seat")
+                     "gate's configured GitHub identity, and the sandboxed seat never sees it",
+                     f"map a token file for {login or '<login>'}: re-run init with "
+                     f"--token {login or '<login>'}=/path/to/pat, or set {seat}_token_file in the "
+                     "plugin settings and run apply; then remove GH_TOKEN from that .env")
     who = login or f"the {seat} seat"
     mapped = gh.token_path(loop, login) if login else None
     if mapped is not None:
         return Check(f"credential:{seat}", ABSENT,
                      f"{login} → {_token_file_facts(mapped)}: missing or empty",
                      f"write the PAT for {login} to {mapped} (chmod 600)")
+    # Seats write only through the host broker with a mapped token file; a GH_TOKEN in the
+    # profile's .env is never used, so it is not offered as a fix.
     return Check(f"credential:{seat}", ABSENT,
-                 f"no tokens entry for {who!r} and no GH_TOKEN in {env}",
-                 f"re-run init with --token {login or '<login>'}=/path/to/pat, or put "
-                 f"GH_TOKEN=<pat> in {env} — a seat with neither cannot push or post a verdict")
+                 f"no token file mapped for {who!r} (a GH_TOKEN in {env} would not be used)",
+                 f"re-run init with --token {login or '<login>'}=/path/to/pat, or set "
+                 f"{seat}_token_file in the plugin settings and run apply — without one the seat "
+                 "cannot push or post a verdict")
 
 
 def check_adjudicator_identity(loop: dict) -> Check | None:
@@ -877,16 +886,16 @@ def check_hook(loop: dict, hooks: list, seat: str, name: str, url: str) -> Check
         return Check(f"hook:{name}", MISMATCH,
                      f"hook {hook_id} subscribes to {events or '(no events)'}, not {event!r}",
                      f"re-run init --hooks, or add {event!r} to hook {hook_id} on {loop['repo']}")
-    if not match.get("active"):
-        return Check(f"hook:{name}", MISMATCH, f"hook {hook_id} is paused",
-                     f"`hermes review-loop arm --loop {loop['id']}` (or activate hook {hook_id} "
-                     f"in the repo's settings)")
     content_type = match["config"].get("content_type")
     if content_type != "json":
         return Check(f"hook:{name}", MISMATCH,
                      f"hook {hook_id} has content_type {content_type!r}, expected 'json'",
                      f"re-run init --hooks, or set hook {hook_id}'s content_type to json: "
                      "the gate reads a JSON payload, not form-encoded data")
+    if not match.get("active"):
+        return Check(f"hook:{name}", VERIFIED,
+                     f"hook {hook_id} → [webhook URL redacted] ({event}, PAUSED — nothing fires "
+                     f"until `hermes review-loop arm --loop {loop['id']}`)", paused=True)
     return Check(f"hook:{name}", VERIFIED,
                  f"hook {hook_id} → [webhook URL redacted] ({event}, active)")
 
@@ -951,8 +960,13 @@ def report(loop: dict, checks: list[Check], strict: bool = False) -> int:
     elif unknown:
         print(f"  no failures — but {len(unknown)} check(s) could not be decided from here; "
               f"verify the ⚠️ lines by hand.")
-    else:
+    elif not any(check.paused for check in checks):
         print("  every check passed — this loop can wake a seat and post a verdict.")
+    else:
+        print("  every check passed.")
+    if not failed and any(check.paused for check in checks):
+        print("  the repo hooks are paused, so nothing fires yet: run selftest, then "
+              f"`hermes review-loop arm --loop {loop['id']}`.")
     if strict and unknown and not failed:
         print(f"  --strict: {len(unknown)} undecided check(s) count as a failure.")
     return 1 if failed or (strict and unknown) else 0

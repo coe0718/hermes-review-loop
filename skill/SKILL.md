@@ -1,107 +1,131 @@
 ---
 name: review-loop
-description: Work a PR review loop — verify before you verdict, re-request review after every push, respect the round budget.
+description: Work a PR review loop — verify before you verdict, publish only through the broker, respect the round budget.
 ---
 
 # Working a review loop
 
 You are one seat of an unattended loop: a **fixer** and a **reviewer** take turns on a pull
-request, and nobody is watching in real time. The gate that woke you already checked the
-preconditions and handed you a `_loop` block with the facts you need:
+request, an **adjudicator** rules when the round budget is spent, and nobody is watching in real
+time. The host that launched your turn already checked the preconditions and put the facts you
+need in your prompt: the repository and PR, the exact head commit, the round and the cap, and (for
+the fixer and the adjudicator) the verdicts so far.
 
-| field | meaning |
-|---|---|
-| `round` / `cap` | which verdict this is, and how many are allowed before the loop stops |
-| `head` | the commit your turn is about |
-| `url` | the pull request |
-| `isolation` | your **own clone** for this PR, the env to export, and the directory your logs go in |
+## Your workspace
 
-Your workspace is per pull request, not shared: its own clone, its own origin, its own detached
-checkout, its own build and temp directories. So you may run anything — checkouts, worktrees,
-stashes, a full build — without touching another seat's run. `isolation.brief` in the payload names
-the exact paths; export what it lists before building, or your output lands in a shared directory
-and a parallel run will fight you for it. When `isolation.isolated` is false, only the logs
-directory is yours: still keep everything inside it and out of the repository.
+Your turn runs in a sandbox, not on the operator's machine:
+
+* **`/work`** is a checkout of the exact head under review, staged by the host for this turn only.
+  The reviewer and the fixer may build, test and edit there freely; the adjudicator's `/work` is
+  read-only (write under `/tmp`). Nothing in it survives the turn — anything that matters belongs
+  in your one write.
+* **No network and no GitHub credentials.** There is no `gh`, no `git push`, no token anywhere in
+  the sandbox, by design. A command that needs GitHub will fail; that is not a bug to work around.
+* **One scoped write, through the broker.** `python -m review_loop.broker_client` is the only way
+  anything leaves the sandbox. The host re-checks the live PR before it acts on it, so a write
+  against a head that moved is refused rather than applied to the wrong code.
+* A write can take minutes. Never claim it succeeded without an `ok` response; if it times out its
+  outcome is unknown — say so, do not retry it.
 
 ## If you are the reviewer
 
 1. Read the PR first: description, diff, and what earlier rounds already settled. Repeating a
    finding that was answered last round wastes the whole budget.
-2. Check the head out in **your own clone** and verify the claims yourself — build it, run the
-   tests it touches, reproduce what it says it fixed. A claim you did not check is not a finding,
-   it is a rumor. Never work in the shared clone named in `isolation.shared`: another seat may be
-   using it right now.
-3. For a direct trunk PR, post a verdict on the PR. For each finding: severity, evidence
-   (the command and what it printed), and `file:line`. Findings without evidence get
-   argued about instead of fixed. For a stacked PR, do **not** use direct gh/manual
-   REST: no trusted run-bound submission CLI exists, so it cannot produce an associated
-   receipt. Escalate and leave the stacked handoff parked.
-4. If the head moved while you worked, say which sha you actually reviewed.
-5. Finish with a 3-5 line summary in your channel: verdict, what you verified, what you did not.
+2. Verify the claims yourself in `/work` — build it, run the tests it touches, reproduce what it
+   says it fixed. A claim you did not check is not a finding, it is a rumor.
+3. Post **exactly one** verdict, `APPROVE` or `REQUEST_CHANGES`, with a body: for each finding the
+   severity, the evidence (the command and what it printed) and `file:line`.
 
-**Never merge, never push, never approve what you did not verify.**
+   ```
+   python -m review_loop.broker_client review --verdict REQUEST_CHANGES --body-file /work/review.txt
+   ```
+
+   A `COMMENT` is refused (without spending your write): it would neither wake the fixer nor cue a
+   merge, and the loop would stall. If you could not verify something, that is `REQUEST_CHANGES`
+   naming what you could not verify — never an approval.
+4. Finish with a 3-5 line summary: verdict, what you verified, what you did not.
+
+**Never approve what you did not verify.** Stacked PRs (based on another open PR's branch) are not
+reviewed unattended; you will not be woken for one.
 
 ## If you are the fixer
 
+You are only woken when the operator has opted this repository in to unattended fixer pushes
+(`hermes review-loop fixer-push --enable`); until then a changes-requested verdict is held for the
+operator and no fixer turn starts. Your one publish is a push followed by the review request.
+
 1. Read the verdict. Fix what was found — a rewrite that dodges the finding is not a fix, and the
    next round will say so.
-2. Commit and push **from your own clone** (its origin and credential helper are already set up
-   for you — that is why the token is not in your working tree).
-3. **Re-request the review.** This is the step that gets forgotten and it is why the loop stops:
+2. Edit files in `/work`. It is a plain checkout with **no `.git`**, so keep your own list of the
+   files you changed.
+3. Check, then publish with the helper — it builds the manifest, fills in the head commit from the
+   host, and enforces every limit before your one push is spent:
 
    ```
-   gh api -X POST repos/<owner>/<repo>/pulls/<number>/requested_reviewers -f 'reviewers[]=<reviewer-seat>'
+   python -m review_loop.broker_client push --files src/a.rs src/b.rs --message-file /tmp/msg.txt --dry-run
+   python -m review_loop.broker_client push --files src/a.rs src/b.rs --message-file /tmp/msg.txt
+   python -m review_loop.broker_client request_review
    ```
 
-   GitHub clears a pending review request the moment a verdict lands, so a push alone wakes
-   nobody. The request *is* the trigger.
-4. Answer each finding in a comment: fixed, or why it is not a defect, with evidence. A silent
-   push makes the reviewer re-derive everything you just learned.
-5. Finish with a 3-5 line summary in your channel: what changed, what you pushed, what you
-   deliberately left alone.
+   Limits: at most 24 files, 64 KiB each and 128 KiB in total, a commit message of at most
+   240 bytes. A push **adds or replaces whole files only**: it cannot delete, rename, change a
+   file's mode or write a symlink. Anything under `.github/`, and `.gitmodules`, `.gitattributes`
+   or `CODEOWNERS`, is refused — those are a human's to change. (A raw manifest,
+   `{"base_head", "message", "files": [{"path", "content_b64", "sha256"}]}`, still works with
+   `--manifest-file`, but the helper is the way.)
+4. **Request the review** after the push — GitHub clears a pending request the moment a verdict
+   lands, so the request is what wakes the reviewer.
+5. You cannot comment on the PR. Put the gist of each answer in the commit message and the full
+   account — fixed, or why it is not a defect, with evidence — in your summary. If a write is
+   refused, stop and say so plainly; never describe a fix as published without an `ok`.
 
-**Never force-push over someone else's commits, never merge, never mark your own work verified.**
+**Never merge, never mark your own work verified.** The push is exact-head: if the branch moved
+while you worked, it is refused rather than overwriting someone else's commits.
+
+## If you are the adjudicator
+
+You are woken only when the round budget is spent without an approval. Read both sides — the
+reviewer's findings and the fixer's answers, at this head — and give one ruling with a reason:
+
+```
+python -m review_loop.broker_client ruling --verdict ACCEPT --body-file /tmp/ruling.txt
+```
+
+`ACCEPT` (the remaining findings do not block), `REJECT` (the work should not land as it stands) or
+`RESPEC` (the two sides disagree about the goal, not the code — say what the next round should be
+about), quoting the findings you rule on. The ruling always reaches the operator, and is posted on
+the PR when the loop has an adjudicator account. You cannot review, push or merge; the human owns
+that step.
 
 ## The budget is a wall
 
-The cap counts **verdicts**, not time. If the loop reaches the cap, the gate hands the PR to an
+The cap counts **verdicts**, not time. If the loop reaches the cap, the host hands the PR to the
 adjudicator instead of buying another round — that is the design, not a bug. Do not try to route
-around it: no new PR, no requesting a different reviewer, no "just one more" push. If you believe
-the cap is wrong for this PR, say so in your summary and let the operator change it.
+around it: no new PR, no different reviewer, no "just one more" push. If you believe the cap is
+wrong for this PR, say so in your summary and let the operator change it.
 
 ## What the loop records about you
 
-The gate, not you, keeps the books: per-seat run ledgers, per-seat capacity, the queue, in-flight
-marks and breach markers live under the loop's state directory, and the watchdog reads GitHub state
-directly rather than trusting anyone's summary. That means three things for how you work:
+The host, not you, keeps the books: the run ledger, per-seat capacity, the queue, in-flight marks
+and breach markers live on the operator's machine, and the watchdog reads GitHub state directly
+rather than trusting anyone's summary. For how you work, that means:
 
-* your review's verdict count comes from the reviews on the PR, so a verdict you post is the
-  round — commenting without a verdict does not consume one;
+* a verdict you post is the round — a verdict is the only review the loop counts;
 * a seat has a limit (the reviewer's and the fixer's are set separately), so work above it waits in
-  the queue — being queued is normal and costs nothing; a run that died mid-way leaves a slot that
-  expires, so you never need to clean up after yourself for the loop to keep moving;
-* one PR is held by one seat at a time. A fix run hands the PR over by pushing and *asking* for the
-  review, and a review hands it over with its verdict — that handoff is what frees your seat, so
-  always end your turn with one of those two acts rather than falling silent;
-* your PR's workspace — one clone per PR *and per seat* — is reused if you are woken again on the
-  same PR (a warm build directory is the point) and deleted when the PR closes. Anything you need to
-  keep belongs on the PR, not on this disk.
+  the queue — being queued is normal and costs nothing; a run that died mid-way is reported to the
+  operator rather than silently retried;
+* one PR is held by one seat at a time. A fix hands the PR over by pushing and *asking* for the
+  review, and a review hands it over with its verdict — always end your turn with one of those acts
+  rather than falling silent.
 
-If the loop carries an **observer feed**, your transitions are announced to it — the gate reports the
-handoff, the verdict, the escalation and the terminal close on its own, from the state change rather
-than from anything you say. So do not relay to it, and do not treat it as a participant: it is
-read-only, it holds no seat, and a notice it never receives changes nothing about your turn. Your
-job is still to end your turn with a push-and-request or a verdict; the observer hears about it
-either way, and nothing you write in a summary is what reaches it.
+If the loop carries an **observer feed**, the host announces your transitions to it from the state
+change itself, not from anything you write. Do not address it; it is read-only and holds no seat.
 
 ## When something is wrong with the loop itself
 
-Say it plainly in your summary — a gate that fired when it should not have, a stale head, a
-missing queue entry, work you were asked to do twice. The loop's whole value is that a failure is
-visible instead of silent, and the operator's next action depends on your report being accurate
-rather than flattering. The operator has `hermes review-loop explain --pr N` for the other side of
-that: it reads the head, the verdicts at that head, the seat and the queue and prints the one event
-that has to happen next. It changes nothing, so it is always safe to say "run explain on this PR"
-in a summary instead of guessing what the loop is waiting for. If nothing fires at all — no wake,
-no verdict, no fix — point the operator at `hermes review-loop doctor --loop <id>`: it names
-the broken piece (a missing profile, token, route or hook) and writes nothing.
+Say it plainly in your summary — a turn you should not have been given, a stale head, a refused
+write you could not explain, work you were asked to do twice. The loop's whole value is that a
+failure is visible instead of silent, and the operator's next action depends on your report being
+accurate rather than flattering. The operator has `hermes review-loop explain --loop <id> --pr N` (why a PR
+is not moving, and the one event that moves it) and `hermes review-loop doctor --loop <id>` (what is
+broken in the installation); naming the right one in your summary is more useful than guessing.
