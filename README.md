@@ -118,8 +118,10 @@ hermes review-loop init \
   --schedule 15m --watchdog-deliver telegram
 ```
 
-Each `--token` is a *path* to one account's fine-grained PAT (mode 600) — never the token itself;
-see [token files](docs/operations.md#token-files-one-pat-per-account).
+Each `--token` is a *path* to one account's **classic** PAT (mode 600) — never the token itself, and
+never a fine-grained token, which GitHub refuses for a seat that is a collaborator on someone else's
+repo. See [token files](docs/operations.md#token-files-one-pat-per-account) and
+[scopes by role](docs/operations.md#token-scopes-by-role).
 
 Replace `--host` with the public origin of **your own** Hermes gateway (no path), or explicitly
 set `host` in this plugin's settings. There is no shared webhook host. `init` refuses a missing or
