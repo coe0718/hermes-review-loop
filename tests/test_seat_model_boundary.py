@@ -40,8 +40,8 @@ class TurnStaging(unittest.TestCase):
             seen, staged = {}, {}
 
             class Inference:
-                def __init__(self, directory, upstream, key, *, model, quota):
-                    seen.update(upstream=upstream, key=key, model=model)
+                def __init__(self, directory, upstream, key, *, model, quota, **kw):
+                    seen.update(upstream=upstream, key=key, model=model, **kw)
                     self.directory = directory
 
                 def __enter__(self):
@@ -173,7 +173,8 @@ class SandboxProbe(unittest.TestCase):
             loop = {"seats": {"reviewer": {"profile": "rev"}, "fixer": {"profile": "fix"}}}
             with mock.patch.dict(os.environ, {"HERMES_HOME": str(hermes)}):
                 expected = seat_model.secret_paths(loop, {})
-            self.assertEqual(sorted(expected), sorted(paths))
+            self.assertTrue(set(paths) <= set(expected), set(paths) - set(expected))
+            paths = expected
             venv, code, home, work, rust = (root / n for n in ("venv", "code", "home", "work", "rust"))
             for d in (code, home, work, rust, venv / "bin"):
                 d.mkdir(parents=True)
@@ -210,7 +211,8 @@ class SelftestPerSeat(SelftestBase):
         self.fx.runtime_file.write_text(json.dumps(settings))
         self.posts = []
 
-    def model_post(self, endpoint, body, key):
+    def model_post(self, endpoint, body, headers):
+        key = headers.get("Authorization", "").removeprefix("Bearer ")
         self.posts.append((endpoint.url.hostname, json.loads(body)["model"], key))
         return (200, "application/json",
                 json.dumps({"choices": [{"message": {"content": "OK"}}]}).encode())

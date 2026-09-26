@@ -168,11 +168,58 @@ def tool_instructions(role: str) -> str:
     return TOOLS[role] + _COMMON
 
 
+SANDBOX_KEY = 'sandbox-dummy-not-a-credential'
+# Shaped like a Claude subscription token so the sandboxed Hermes applies the Claude Code
+# request identity it applies for the real one; it authenticates nothing (the proxy drops it).
+SANDBOX_OAUTH_TOKEN = 'sk-ant-oat01-sandbox-dummy-not-a-credential'
+SEAT_PROVIDER = 'review-loop-seat'
+
+
+def sandbox_config(model: str, api_mode: str = 'chat_completions',
+                   client_identity: str = '') -> tuple[str, str, str]:
+    """``(config.yaml, .env, --provider)`` for the sandboxed Hermes of one seat.
+
+    The sandbox speaks the seat's wire format to the local bridge and holds only a dummy key:
+
+    * ``chat_completions`` — ``provider: custom`` at ``http://127.0.0.1:18761/v1``;
+    * ``codex_responses`` / ``anthropic_messages`` — a named provider ``review-loop-seat`` with
+      that ``api_mode`` (Hermes ignores ``api_mode: codex_responses`` on a *bare* custom endpoint
+      that is not OpenAI's), at ``/v1`` (→ ``/v1/responses``) or ``/anthropic`` (→
+      ``/anthropic/v1/messages``);
+    * a Claude subscription (``client_identity == 'claude_code'``) — ``provider: anthropic`` at
+      the bridge's ``/anthropic`` path with a dummy OAuth-shaped ``ANTHROPIC_TOKEN``, so Hermes
+      applies the Claude Code system prefix and tool naming that subscription requests need.
+    """
+    from . import inference_proxy
+    inference_proxy.contract_for(api_mode)
+    base = f'http://127.0.0.1:{inference_proxy.BRIDGE_PORT}'
+    tail = 'plugins:\n  enabled: []\nmemory:\n  memory_enabled: false\n'
+    name = json.dumps(model)
+    if api_mode == 'chat_completions':
+        return ('model:\n  provider: custom\n  default: ' + name + f'\n  base_url: {base}/v1\n'
+                f'  api_key: {SANDBOX_KEY}\n' + tail, '', 'custom')
+    if api_mode == 'anthropic_messages' and client_identity == 'claude_code':
+        return ('model:\n  provider: anthropic\n  default: ' + name +
+                f'\n  base_url: {base}/anthropic\n' + tail,
+                f'ANTHROPIC_TOKEN={SANDBOX_OAUTH_TOKEN}\n', 'anthropic')
+    path = '/v1' if api_mode == 'codex_responses' else '/anthropic'
+    return (f'model:\n  provider: {SEAT_PROVIDER}\n  default: ' + name + '\nproviders:\n'
+            f'  {SEAT_PROVIDER}:\n    base_url: {base}{path}\n    api_key: {SANDBOX_KEY}\n'
+            f'    api_mode: {api_mode}\n' + tail, '', SEAT_PROVIDER)
+
+
 def run_turn(loop: dict, scope: broker_ipc.RunScope, *, source: Path, venv: Path,
              runtime: Path, rust: Path, upstream: str, key: str, model: str,
              prompt: str, timeout: int = 600, work_root: Path | None = None,
-             no_write: bool = False, observed: dict | None = None) -> int:
+             no_write: bool = False, observed: dict | None = None,
+             api_mode: str = 'chat_completions', credential=None, proxy_model: str = '',
+             client_identity: str = '') -> int:
     """Stage a live PR head, start host capabilities, execute Hermes within bwrap.
+
+    ``api_mode`` picks the proxy contract and the sandbox's provider config; ``credential`` (a
+    provider from ``seat_model.SeatInference.credential_provider``) replaces the static ``key``
+    when given — an OAuth seat's token is then refreshed host-side during the turn.
+    ``proxy_model`` is the model id forced on the wire (Hermes's spelling), default ``model``.
 
     ``no_write`` (host-only; the selftest's live turn) starts the broker in its record-only
     mode: a reviewer's verdict is authorized with live reads and recorded, never POSTed.
@@ -198,11 +245,12 @@ def run_turn(loop: dict, scope: broker_ipc.RunScope, *, source: Path, venv: Path
         (client / '__init__.py').touch()
         shutil.copyfile(Path(__file__).with_name('broker_client.py'), client / 'broker_client.py')
         home.mkdir(mode=0o700)
-        (home / 'config.yaml').write_text('model:\n  provider: custom\n  default: ' +
-            json.dumps(model) + '\n  base_url: http://127.0.0.1:18761/v1\n'
-            '  api_key: sandbox-dummy-not-a-credential\nplugins:\n  enabled: []\n'
-            'memory:\n  memory_enabled: false\n')
+        config_text, env_text, provider = sandbox_config(model, api_mode, client_identity)
+        (home / 'config.yaml').write_text(config_text)
         (home / 'config.yaml').chmod(0o600)
+        if env_text:
+            (home / '.env').write_text(env_text)
+            (home / '.env').chmod(0o600)
         query = root / 'query.txt'
         query.write_text(prompt + '\n\n' + tool_instructions(scope.role) + '\n')
         checkout = trusted_fetch.stage(loop, repo=scope.repo, number=scope.number,
@@ -214,7 +262,8 @@ def run_turn(loop: dict, scope: broker_ipc.RunScope, *, source: Path, venv: Path
             if len(os.fsencode(sockets)) > 50:
                 raise TurnDenied('scratch socket directory path too long')
             inference = stack.enter_context(inference_proxy.InferenceCapability(
-                sockets / 'i', upstream, key, model=model, quota=32))
+                sockets / 'i', upstream, None if credential is not None else key,
+                model=proxy_model or model, quota=32, api_mode=api_mode, credential=credential))
             broker_root = sockets / 'b'
             broker_root.mkdir(mode=0o700)
             broker = stack.enter_context(broker_ipc.RunBroker(
@@ -225,7 +274,7 @@ def run_turn(loop: dict, scope: broker_ipc.RunScope, *, source: Path, venv: Path
                 command = ['/opt/venv/bin/python', '-m', 'review_loop.inference_proxy',
                            'bridge', '--', '/opt/venv/bin/python', '/opt/venv/bin/hermes', 'chat',
                            '--query-file', '/opt/query', '--oneshot', '-Q',
-                           '--provider', 'custom', '-m', model, '-t', 'terminal,file',
+                           '--provider', provider, '-m', model, '-t', 'terminal,file',
                            '--ignore-rules', '--max-turns', '24', '--run-budget', str(timeout)]
                 result = contained.run(code=code, venv=venv, runtime=runtime,
                     home=home, checkout=checkout, rust=rust, query=query, entry=command,

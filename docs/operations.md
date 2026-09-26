@@ -218,13 +218,24 @@ python -m review_loop.run_supervisor status ~/.hermes/state/review-loop-runs.sql
 
 | step | what it proves |
 |---|---|
-| 1 runtime | the runtime file is a regular 0600 file you own with `source venv runtime rust` (plus optional `seats.<seat>` overrides and the legacy `model upstream key_file`, warned about), the paths exist (the venv's interpreter link must stay inside `runtime`), and any override has an HTTPS `…/chat/completions` upstream and a private non-empty key file; then one `seat:<seat>` line per seat — reviewer, fixer, and the adjudicator when it has a route — with the profile → provider / model the worker will use (never the key), or the reason that seat's turn would be held |
+| 1 runtime | the runtime file is a regular 0600 file you own with `source venv runtime rust` (plus optional `seats.<seat>` overrides and the legacy `model upstream key_file`, warned about), the paths exist (the venv's interpreter link must stay inside `runtime`), and any override has an HTTPS `…/chat/completions` upstream and a private non-empty key file; then one `seat:<seat>` line per seat — reviewer, fixer, and the adjudicator when it has a route — with the profile → provider / model the worker will use and its `[api_mode, API key \| OAuth (host-refreshed)]` (never the key or token), or the reason that seat's turn would be held |
 | 2 bubblewrap | unprivileged user namespaces work; a probe in the real sandbox layout (committed source snapshot, configured venv/runtime/Rust) cannot read a dummy host secret, any model key file, each seat profile's `.env`/`auth.json`/`config.yaml`, the PATs, the runtime file, `~/.hermes/.env` or the loop config, and has no network or credential-like env |
-| 3 inference | one ~16-token completion through the host inference capability **per distinct seat resolution** (seats that share a profile's provider, model and key share one call), each with that resolution's own key (`--no-model` skips it) |
+| 3 inference | one ~16-token request in the seat's own wire format (chat completion, Responses or Messages) through the host inference capability **per distinct seat resolution** (seats that share a profile's provider, model and credential share one call), each with that resolution's own credential; an OAuth seat's 401 is refreshed and retried once on the host before it is reported (`--no-model` skips it) |
 | 4 identities | read, reviewer, fixer (and optional adjudicator) PATs resolve via `/user` to the expected logins and distinct principals; the repo is readable |
 | 5 authorization | with `--pr N`: the broker's reviewer-write checks (`broker.authorize`, reads only) and the host receipt generation |
 | 6 supervisor | the ledger migrates and `status` reads; the route would accept the runtime file; `doctor`'s state dir, cron shim/job and gateway checks; the observer route |
 | 7 live turn | with `--live-turn --pr N`: a real isolated reviewer turn with the reviewer seat's resolved model (`--timeout`, default 600 s); the verdict and body the agent *would* submit are printed |
+
+Example step-1/3 lines for a ChatGPT-subscription reviewer and an API-key fixer:
+
+```text
+✅ seat:reviewer    profile codex: openai-codex / gpt-5.3-codex via chatgpt.com [codex_responses, OAuth (host-refreshed)]
+✅ seat:fixer       profile fix: custom:acme / fix-model via acme.example [chat_completions, API key]
+✅ model:completion HTTP 200 — reviewer: profile codex: openai-codex / gpt-5.3-codex via chatgpt.com [codex_responses, OAuth (host-refreshed)], reply 'OK'
+```
+
+A subscription seat's step 3 spends a request from **your** plan's usage window (the seat shares
+it with your own use of that account); a 429 there means that window is spent.
 
 The live turn runs in the CLI process, not through the supervisor, so it adds no ledger row and
 raises no operator notice; confirming alerts still needs a real enqueued turn and a watchdog sweep.

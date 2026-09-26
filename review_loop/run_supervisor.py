@@ -864,7 +864,8 @@ class Supervisor:
                 raise ValueError("loop not configured")
             # The seat's own profile decides its model and account (#32). Resolved host-side,
             # before any GitHub read: an unresolvable seat is held here with the reason, and never
-            # borrows another seat's model or key. The key lives only in this turn's proxy.
+            # borrows another seat's model or key. The key lives only in this turn's proxy; an
+            # OAuth seat's token is re-resolved there (host-side) when it nears expiry or is rejected.
             try:
                 inference = seat_model.resolve_seat(loop, row["seat"], settings)
             except seat_model.SeatModelError as exc:
@@ -911,6 +912,8 @@ class Supervisor:
                   venv=Path(settings["venv"]), runtime=Path(settings["runtime"]),
                   rust=Path(settings["rust"]), upstream=inference.upstream,
                   key=inference.key, model=inference.model,
+                  api_mode=inference.api_mode, credential=inference.credential_provider(),
+                  proxy_model=inference.proxy_model, client_identity=inference.client_identity,
                   prompt=prompt, timeout=int(self.child_timeout),
                   work_root=Path(loop["state_dir"]) / "isolated-runs")
         except Exception as exc:

@@ -7,13 +7,15 @@ exits 1 if anything failed:
 
 1. the private runtime file (``$HERMES_HOME/review-loop-runtime.json``) and the paths it names,
    then each seat's model as the worker would resolve it (its Hermes profile, or a runtime
-   override — see ``seat_model``), shown as profile → provider / model, never the key;
+   override — see ``seat_model``), shown as profile → provider / model with its
+   ``[api_mode, API key | OAuth (host-refreshed)]``, never the key or token;
 2. bubblewrap with unprivileged user namespaces, and a probe *inside* the real sandbox layout
    (configured venv, runtime and Rust, a staged source snapshot) that must not be able to read a
    dummy host secret, any model key file, the seat profiles' ``.env``/``auth.json``/``config.yaml``,
    the PATs, the runtime file or ``$HERMES_HOME/.env``;
-3. one tiny real completion through the host inference capability, once per distinct seat
-   resolution (``--no-model`` skips it);
+3. one tiny real request in the seat's wire format (chat completion, Responses or Messages)
+   through the host inference capability, once per distinct seat resolution (``--no-model``
+   skips it);
 4. the read/reviewer/fixer (and optional adjudicator) tokens resolve via ``/user`` to distinct
    principals with the expected logins, and the repository is readable;
 5. with ``--pr N``: the broker's reviewer-write authorization, run with reads only;
@@ -555,24 +557,74 @@ def check_model(report: Report, seats: dict | None) -> None:
         _one_completion(report, names, members[0][1])
 
 
+_PROBE = "Reply with the single word OK."
+
+
+def probe_body(api_mode: str, client_identity: str = "") -> bytes:
+    """The smallest request of each wire format (the proxy forces model and output cap)."""
+    if api_mode == "codex_responses":
+        body = {"instructions": "You are a connectivity probe.", "store": False, "stream": True,
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": _PROBE}]}]}
+    elif api_mode == "anthropic_messages":
+        body = {"max_tokens": 16, "messages": [{"role": "user", "content": _PROBE}]}
+        if client_identity == "claude_code":
+            # What Hermes sends first on a subscription token (see its anthropic adapter).
+            body["system"] = [{"type": "text",
+                               "text": "You are Claude Code, Anthropic's official CLI for Claude."}]
+    else:
+        body = {"messages": [{"role": "user", "content": _PROBE}], "max_tokens": 16}
+    return json.dumps(body).encode()
+
+
+def probe_answer(api_mode: str, content_type: str, data: bytes) -> str | None:
+    """The reply text of a probe answer in ``api_mode``'s shape, or ``None`` if it is not one."""
+    try:
+        if content_type.startswith("text/event-stream"):
+            text, done = [], False
+            for line in data.decode("utf-8", "replace").splitlines():
+                if not line.startswith("data:") or line[5:].strip() in ("", "[DONE]"):
+                    continue
+                event = json.loads(line[5:])
+                kind = event.get("type", "")
+                if kind in ("response.output_text.delta",):
+                    text.append(str(event.get("delta") or ""))
+                elif kind == "content_block_delta":
+                    text.append(str((event.get("delta") or {}).get("text") or ""))
+                elif "choices" in event:
+                    text.append(str(((event["choices"] or [{}])[0].get("delta") or {}).get("content") or ""))
+                done = done or kind in ("response.completed", "message_stop") or "choices" in event
+            return "".join(text) if done else None
+        answer = json.loads(data)
+        if api_mode == "anthropic_messages":
+            return "".join(b.get("text", "") for b in answer["content"] if b.get("type") == "text")
+        if api_mode == "codex_responses":
+            return "".join(c.get("text", "") for item in answer["output"] if item.get("type") == "message"
+                           for c in item.get("content", []))
+        return answer["choices"][0]["message"].get("content") or ""
+    except Exception:
+        return None
+
+
 def _one_completion(report: Report, seats: str, inference) -> None:
     from . import inference_proxy
     step, name = "inference", "model:completion"
     report.redact.add(inference.key)
     host = inference.host
-    body = json.dumps({"messages": [{"role": "user", "content": "Reply with the single word OK."}],
-                       "max_tokens": 16}).encode()
+    mode = getattr(inference, "api_mode", "chat_completions")
+    identity = getattr(inference, "client_identity", "")
+    body = probe_body(mode, identity)
     try:
         with tempfile.TemporaryDirectory(prefix="rl-st-") as sockets:
-            with inference_proxy.InferenceCapability(Path(sockets) / "i", inference.upstream,
-                                                     inference.key, model=inference.model,
-                                                     quota=1) as capability:
+            with inference_proxy.InferenceCapability(
+                    Path(sockets) / "i", inference.upstream, model=inference.proxy_model,
+                    quota=1, api_mode=mode, credential=inference.credential_provider()) as capability:
                 conn = inference_proxy._UnixHTTP(str(capability.socket_path))
                 try:
-                    conn.request("POST", inference_proxy.PATH, body=body,
+                    conn.request("POST", capability.contract.local_path, body=body,
                                  headers={"Content-Type": "application/json"})
                     response = conn.getresponse()
                     status, data = response.status, response.read(inference_proxy.MAX_RESPONSE)
+                    content_type = response.getheader("Content-Type", "")
                 finally:
                     conn.close()
     except (OSError, http.client.HTTPException, ValueError) as exc:
@@ -582,11 +634,16 @@ def _one_completion(report: Report, seats: str, inference) -> None:
         return
     where = (f"profile {inference.profile}'s credential" if inference.origin == "profile"
              else "the override's key file")
-    fixes = {401: f"{where} was rejected — replace it",
+    oauth = getattr(inference, "auth", "") == "oauth"
+    fixes = {401: (f"{where} was rejected even after a host refresh — log in again with "
+                   f"`hermes -p {inference.profile} auth`" if oauth
+                   else f"{where} was rejected — replace it"),
              403: f"{where} may not use model {inference.model!r}",
              404: f"the provider does not know model {inference.model!r} at this URL — "
                   "`hermes review-loop models` lists what it offers",
-             429: "the provider rate-limited or the account is out of credit",
+             429: ("the subscription's rate limit is spent — it is shared with your own use of "
+                   "this account" if oauth else
+                   "the provider rate-limited or the account is out of credit"),
              502: f"the proxy could not complete an HTTPS call to {host} (DNS, TLS, network, or a "
                   "non-JSON answer) — try `curl -sS https://" + str(host) + "` from this host"}
     what = f"{seats}: {inference.describe()}"
@@ -594,11 +651,10 @@ def _one_completion(report: Report, seats: str, inference) -> None:
         report.add(step, name, FAIL, f"HTTP {status} for {what}",
                    fixes.get(status, "check the upstream URL, the model name and the key"))
         return
-    try:
-        answer = json.loads(data)["choices"][0]["message"].get("content") or ""
-    except Exception:
-        report.add(step, name, FAIL, f"{seats}: HTTP 200 via {host}, but not a chat completion",
-                   "upstream must be an OpenAI-compatible chat-completions endpoint")
+    answer = probe_answer(mode, content_type, data)
+    if answer is None:
+        report.add(step, name, FAIL, f"{seats}: HTTP 200 via {host}, but not a {mode} answer",
+                   f"upstream must speak {mode} at {inference.upstream}")
         return
     report.add(step, name, PASS, f"HTTP 200 — {what}, reply {answer.strip()[:40]!r}")
 
@@ -805,6 +861,10 @@ def run_live_turn(report: Report, loop: dict, settings: dict | None, pr: dict | 
                                    venv=Path(settings["venv"]), runtime=Path(settings["runtime"]),
                                    rust=Path(settings["rust"]), upstream=reviewer.upstream,
                                    key=reviewer.key, model=reviewer.model, prompt=prompt,
+                                   api_mode=reviewer.api_mode,
+                                   credential=reviewer.credential_provider(),
+                                   proxy_model=reviewer.proxy_model,
+                                   client_identity=reviewer.client_identity,
                                    timeout=timeout, work_root=_work_root(loop),
                                    no_write=True, observed=observed)
         error = ""

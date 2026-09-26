@@ -124,7 +124,8 @@ class SelftestBase(unittest.TestCase):
         self.model_status = 200
         self.model_keys = []
 
-    def model_post(self, endpoint, body, key):
+    def model_post(self, endpoint, body, headers):
+        key = headers.get("Authorization", "").removeprefix("Bearer ")
         self.model_keys.append(key)
         payload = json.loads(body)
         self.assertEqual(payload["model"], "tiny-model")
