@@ -47,6 +47,10 @@ CLONE = TMP / "clone"
 SUBS = TMP / "webhook_subscriptions.json"
 WORLD_FILE = TMP / "world.json"
 STUB = TMP / "gh_stub.py"
+# A fake `hermes` first on every child's PATH (and named by REVIEW_LOOP_HERMES): `uninstall` and
+# `init --schedule` drive the scheduler through it, and a test must never reach the real install.
+FAKE_BIN = TMP / "bin"
+FAKE_HERMES = FAKE_BIN / "hermes"
 
 REPO = "acme/widgets"
 FIXER, REVIEWER, SEAT = "dev-fixer", "rev-coach", "rev-seat"
@@ -119,7 +123,60 @@ def n_of(p):
     m = re.search(r"/pulls/(\\d+)", p)
     return int(m.group(1)) if m else None
 
-if re.search(r"/hooks\\?per_page=100(?:&page=\\d+)?$", path):
+hook_one = re.search(r"/hooks/(\\d+)$", path)
+hook_deliveries = re.search(r"/hooks/(\\d+)/deliveries", path)
+if method != "GET" and ("/hooks" in path) and os.environ.get("GH_LOGIN", "") in world.get("hook_write_denied", []):
+    sys.stderr.write("HTTP 403 Resource not accessible by personal access token")
+    sys.exit(1)
+hook_ping = re.search(r"/hooks/(\\d+)/pings$", path)
+if hook_ping and method == "POST":
+    # GitHub signs and sends a `ping`; its delivery lands in the hook's log with the status the
+    # gateway answered (world "ping_status" per hook id, default 200). "ping_silent" records none.
+    hid = hook_ping.group(1)
+    world.setdefault("pings", []).append(int(hid))
+    if not world.get("ping_silent"):
+        log = world.setdefault("deliveries", {}).setdefault(hid, [])
+        world["next_delivery_id"] = world.get("next_delivery_id", 5000) + 1
+        log.insert(0, {"id": world["next_delivery_id"], "event": "ping",
+                       "status_code": (world.get("ping_status") or {}).get(hid, 200),
+                       "delivered_at": "2026-09-26T12:00:%02dZ" % (world["next_delivery_id"] % 60)})
+    open(os.environ["GH_WORLD"], "w").write(json.dumps(world))
+    print("null")
+elif hook_deliveries:
+    # GitHub's recent-delivery log for a hook; none recorded reads as an empty list.
+    print(json.dumps((world.get("deliveries") or {}).get(hook_deliveries.group(1), [])))
+elif method == "POST" and path.endswith("/hooks"):
+    spec = json.loads(body or "{}")
+    hooks = world.setdefault("hooks", [])
+    # GitHub never reuses a hook id: a counter, not max(existing) + 1.
+    world["next_hook_id"] = max([world.get("next_hook_id", 101)] + [h["id"] + 1 for h in hooks])
+    hook = {"id": world["next_hook_id"], "active": spec.get("active", True),
+            "events": spec.get("events", []),
+            "config": {"url": spec["config"]["url"], "content_type": spec["config"].get("content_type"),
+                       "insecure_ssl": "0", "secret": "********"}}
+    hooks.append(hook)
+    world["next_hook_id"] += 1
+    open(os.environ["GH_WORLD"], "w").write(json.dumps(world))
+    print(json.dumps(hook))
+elif hook_one and method in ("DELETE", "PATCH", "GET"):
+    hooks = world.get("hooks") or []
+    hook = next((h for h in hooks if h["id"] == int(hook_one.group(1))), None)
+    if hook is None:
+        print("null")
+    elif method == "DELETE":
+        world["hooks"] = [h for h in hooks if h is not hook]
+        open(os.environ["GH_WORLD"], "w").write(json.dumps(world))
+        print("null")
+    elif method == "PATCH":
+        spec = json.loads(body or "{}")
+        if "active" in spec:
+            hook["active"] = spec["active"]
+        hook["config"].update(spec.get("config") or {})
+        open(os.environ["GH_WORLD"], "w").write(json.dumps(world))
+        print(json.dumps(hook))
+    else:
+        print(json.dumps(hook))
+elif re.search(r"/hooks\\?per_page=100(?:&page=\\d+)?$", path):
     page = int(re.search(r"[?&]page=(\\d+)", path).group(1)) if "&page=" in path else 1
     hooks = world.get("hooks", [])
     print(json.dumps(hooks[(page-1)*100:page*100] if isinstance(hooks, list) else hooks))
@@ -142,6 +199,52 @@ elif n_of(path) is not None:
 else:
     print("null")
 '''
+
+
+FAKE_HERMES_SRC = '''#!/usr/bin/env python3
+"""A stand-in `hermes`: only `cron create` / `cron remove`, on $HERMES_HOME/cron/jobs.json."""
+import json, os, pathlib, sys
+
+store = pathlib.Path(os.environ["HERMES_HOME"]) / "cron" / "jobs.json"
+args = sys.argv[1:]
+log = os.environ.get("FAKE_HERMES_LOG")
+if log:
+    with open(log, "a") as stream:
+        stream.write(json.dumps(args) + "\\n")
+if args[:1] != ["cron"] or len(args) < 3:
+    sys.stderr.write("fake hermes: unsupported command")
+    sys.exit(2)
+data = json.loads(store.read_text()) if store.exists() else {"jobs": []}
+jobs = data["jobs"]
+if args[1] == "remove":
+    kept = [job for job in jobs if job.get("id") != args[2]]
+    if len(kept) == len(jobs):
+        sys.stderr.write(f"Job {args[2]} not found")
+        sys.exit(1)
+    data["jobs"] = kept
+elif args[1] == "create":
+    name = args[args.index("--name") + 1]
+    script = args[args.index("--script") + 1]
+    jobs.append({"id": f"job{len(jobs) + 1}", "name": name, "script": script, "no_agent": True,
+                 "enabled": True, "state": "scheduled",
+                 "schedule": {"kind": "interval", "minutes": 15},
+                 "next_run_at": "2030-01-01T00:00:00+00:00"})
+else:
+    sys.stderr.write("fake hermes: unsupported cron command")
+    sys.exit(2)
+store.parent.mkdir(parents=True, exist_ok=True)
+store.write_text(json.dumps(data))
+print("ok")
+'''
+
+
+def install_fake_hermes() -> None:
+    FAKE_BIN.mkdir(parents=True, exist_ok=True)
+    FAKE_HERMES.write_text(FAKE_HERMES_SRC)
+    os.chmod(FAKE_HERMES, 0o755)
+
+
+install_fake_hermes()
 
 
 class Sink(BaseHTTPRequestHandler):
@@ -337,7 +440,9 @@ def env() -> dict:
     return {**os.environ, "HERMES_HOME": str(TMP / "hermes-home"),
             "REVIEW_LOOP_CONFIG_DIR": str(LOOPS_DIR),
             "REVIEW_LOOP_SUBS": str(SUBS), "REVIEW_LOOP_GH_STUB": str(STUB),
-            "GH_WORLD": str(WORLD_FILE), "REVIEW_LOOP_TEST": "1"}
+            "GH_WORLD": str(WORLD_FILE), "REVIEW_LOOP_TEST": "1",
+            "REVIEW_LOOP_HERMES": str(FAKE_HERMES),
+            "PATH": f"{FAKE_BIN}{os.pathsep}{os.environ.get('PATH', '')}".rstrip(os.pathsep)}
 
 
 def run(script: str, payload: dict | None = None, *args: str,
