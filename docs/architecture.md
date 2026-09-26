@@ -185,7 +185,7 @@ The worker claims the turn only after re-reading GitHub (open, not draft, same b
 a configured fixer, cap still spent, no approval at the head, a matching marker); a moved, closed,
 retargeted or approved PR cancels it, an unreadable one waits. Right before launch it re-verifies,
 marks the breach `adjudicating`, and runs the agent credentialless with a read-only export of the
-head, a host-rendered prompt and the reviewer verdicts and fixer comments as data.
+head, a host-rendered prompt and the reviewer verdicts and the fixer's published answers as data.
 
 The adjudicator is told to read both positions and rule — ACCEPT, REJECT or RESPEC — with a reason,
 and **not** merge, push or review (it has no way to). Its one broker `ruling` is recorded in the run

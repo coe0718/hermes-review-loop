@@ -184,6 +184,16 @@ def _read_pages(loop: dict, path: str, what: str, max_pages: int) -> tuple[list[
     return None, f"{what} listing exceeds {max_pages} full pages"
 
 
+# Issue comments on a PR, read in full for the seats' records (the fixer's answers, #52).
+MAX_COMMENT_PAGES = 30
+
+
+def issue_comments_read(loop: dict, number: int) -> tuple[list[dict] | None, str]:
+    """Every issue comment on the PR, or ``(None, reason)`` — never the oldest page alone."""
+    return _read_pages(loop, f"/repos/{loop['repo']}/issues/{number}/comments?per_page=100",
+                       "comment", MAX_COMMENT_PAGES)
+
+
 def reviews(loop: dict, number: int):
     result, error = reviews_read(loop, number)
     if error:
