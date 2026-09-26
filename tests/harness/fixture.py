@@ -226,6 +226,9 @@ def write_loop() -> dict:
         "host": HOST,
         "grace_min": 25, "marker_grace_min": 60, "cooldown_h": 6,
         "ttl_min": 45, "inflight_ttl_min": 10,
+        # The gate scenarios exercise the fix leg; the push-off hold has its own suite
+        # (tests/test_fixer_gating.py).
+        "unattended_fixer_push": True,
     }
     (LOOPS_DIR / "widgets.json").write_text(json.dumps(cfg, indent=2))
     (TMP / "rev.pat").write_text("token-reviewer\n")

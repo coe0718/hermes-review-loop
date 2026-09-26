@@ -50,35 +50,34 @@ reviewed unattended; you will not be woken for one.
 
 ## If you are the fixer
 
-Your one publish is a push followed by the review request, and it is only available when the
-operator has opted this repository in (`hermes review-loop fixer-push --enable`).
+You are only woken when the operator has opted this repository in to unattended fixer pushes
+(`hermes review-loop fixer-push --enable`); until then a changes-requested verdict is held for the
+operator and no fixer turn starts. Your one publish is a push followed by the review request.
 
 1. Read the verdict. Fix what was found — a rewrite that dodges the finding is not a fix, and the
    next round will say so.
-2. Write a push manifest (JSON) listing every changed file in full:
-
-   ```json
-   {"base_head": "<the head commit from your prompt>",
-    "message": "fix: <one line; at most 240 bytes>",
-    "files": [{"path": "src/x.py",
-               "content_b64": "<base64 of the whole new file>",
-               "sha256": "<hex sha256 of the decoded bytes>"}]}
-   ```
-
-   At most 24 files of 64 KiB each. Paths are repository-relative. Anything under `.github/`,
-   and `.gitmodules`, `.gitattributes` or `CODEOWNERS`, is refused — those are a human's to change.
-   An edited file keeps its mode.
-3. Publish, then **request the review** — GitHub clears a pending request the moment a verdict
-   lands, so the request is what wakes the reviewer:
+2. Edit files in `/work`. It is a plain checkout with **no `.git`**, so keep your own list of the
+   files you changed.
+3. Check, then publish with the helper — it builds the manifest, fills in the head commit from the
+   host, and enforces every limit before your one push is spent:
 
    ```
-   python -m review_loop.broker_client push --manifest-file /work/manifest.json
+   python -m review_loop.broker_client push --files src/a.rs src/b.rs --message-file /tmp/msg.txt --dry-run
+   python -m review_loop.broker_client push --files src/a.rs src/b.rs --message-file /tmp/msg.txt
    python -m review_loop.broker_client request_review
    ```
 
-4. You cannot comment on the PR. Put the gist of each answer in the commit message (it is short)
-   and the full account — fixed, or why it is not a defect, with evidence — in your summary.
-5. Finish with a 3-5 line summary: what changed, what you pushed, what you deliberately left alone.
+   Limits: at most 24 files, 64 KiB each and 128 KiB in total, a commit message of at most
+   240 bytes. A push **adds or replaces whole files only**: it cannot delete, rename, change a
+   file's mode or write a symlink. Anything under `.github/`, and `.gitmodules`, `.gitattributes`
+   or `CODEOWNERS`, is refused — those are a human's to change. (A raw manifest,
+   `{"base_head", "message", "files": [{"path", "content_b64", "sha256"}]}`, still works with
+   `--manifest-file`, but the helper is the way.)
+4. **Request the review** after the push — GitHub clears a pending request the moment a verdict
+   lands, so the request is what wakes the reviewer.
+5. You cannot comment on the PR. Put the gist of each answer in the commit message and the full
+   account — fixed, or why it is not a defect, with evidence — in your summary. If a write is
+   refused, stop and say so plainly; never describe a fix as published without an `ok`.
 
 **Never merge, never mark your own work verified.** The push is exact-head: if the branch moved
 while you worked, it is refused rather than overwriting someone else's commits.

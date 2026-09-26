@@ -60,6 +60,22 @@ RULINGS = ("ACCEPT", "REJECT", "RESPEC")
 # reported as uncertain and never replayed.
 COMMENT_STATES = ("pending", "none", "denied", "posting", "posted", "uncertain")
 _WORKERS: list[subprocess.Popen] = []
+# Why a fixer row is cancelled at claim instead of launched. A run admitted while pushes were
+# off can never publish (a later opt-in does not authorize it, #22); a run whose loop was opted
+# out after admission would be refused at the broker. Either way the turn would only spend a
+# model conversation, so it never starts.
+FIXER_NOT_ADMITTED = ("fixer push not admitted: unattended fixer pushes were off when this "
+                      "verdict was enqueued, and a later opt-in cannot authorize this run — "
+                      "no turn launched; this head needs a manual fix or a new commit")
+FIXER_PUSH_REVOKED = ("fixer push revoked: unattended fixer pushes were disabled after this "
+                      "run was admitted — no turn launched")
+
+
+class FixerPushDisabled(ValueError):
+    """The host policy does not admit an unattended fixer turn for this repository."""
+
+    def __init__(self, repo: str):
+        super().__init__(f"unattended fixer pushes are off for {repo}")
 
 
 def effective_reviews(loop: dict, row, reviews, ledger=None):
@@ -514,8 +530,14 @@ class Supervisor:
         return count
 
     def enqueue(self, delivery: str, repo: str, pr: int, head: str, seat: str,
-                *, turn_key: str = '') -> str:
-        """Commit identity before any spawn. A repeated delivery cannot change terms."""
+                *, turn_key: str = '', require_push_admission: bool = False) -> str:
+        """Commit identity before any spawn. A repeated delivery cannot change terms.
+
+        ``require_push_admission`` (the fixer gate's path): a production fixer turn that the
+        host policy would not admit is refused with ``FixerPushDisabled`` *before* any row is
+        written, under the same policy lock as the admission snapshot. The verdict is then
+        held by the gate, and a later opt-in admits a fresh row instead of an old one.
+        """
         if not all(isinstance(v, str) and v and len(v) <= 256 for v in
                    (delivery, repo, head, seat)) or not isinstance(turn_key, str) or len(turn_key) > 256 or type(pr) is not int or pr <= 0:
             raise ValueError("invalid run identity")
@@ -540,6 +562,10 @@ class Supervisor:
             else:
                 prior = con.execute("SELECT * FROM runs WHERE repo=? AND pr=? AND head=? AND seat=? AND turn_key=?",
                                     (repo, pr, head, seat, turn_key)).fetchone()
+                if not prior and require_push_admission and self.production_config \
+                        and seat == 'fixer' and not admitted:
+                    con.execute("ROLLBACK")
+                    raise FixerPushDisabled(repo)
                 if not prior:
                     con.execute("INSERT INTO runs(id,delivery,repo,pr,head,seat,turn_key,state,created,updated,push_admitted) "
                                 "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
@@ -632,12 +658,17 @@ class Supervisor:
                     superseded, retry_read = status == 'superseded', status == 'retry'
                 except Exception:
                     retry_read = True
+            refused = ''
             if self.production_config and row['seat'] == 'fixer':
                 from . import config, gh, gate
                 try:
                     loop = config.by_repo(row['repo'])
                     if loop is None:
                         retry_read = True
+                    elif row['push_admitted'] != 1:
+                        refused = FIXER_NOT_ADMITTED
+                    elif not config.unattended_fixer_push_enabled(loop):
+                        refused = FIXER_PUSH_REVOKED
                     else:
                         pr = gh.api(loop, f"/repos/{row['repo']}/pulls/{row['pr']}",
                                     login=loop['read_token'])
@@ -667,6 +698,12 @@ class Supervisor:
                 # the read; never bind a resolved receipt to different row terms.
                 if current is None or dict(current) != dict(row):
                     con.execute("COMMIT")
+                    continue
+                if refused:
+                    # Not a capacity question: this row can never publish, so it never waits.
+                    con.execute("UPDATE runs SET state='cancelled', error=?,updated=? WHERE id=?",
+                                (refused, time.time(), row['id']))
+                    con.execute('COMMIT')
                     continue
                 # Recheck both capacity and PR occupancy under the writer lock.
                 occupied = con.execute("SELECT 1 FROM runs WHERE repo=? AND pr=? "
@@ -862,6 +899,12 @@ class Supervisor:
             loop = config.by_repo(row["repo"])
             if loop is None:
                 raise ValueError("loop not configured")
+            if row['seat'] == 'fixer' and (row['push_admitted'] != 1
+                                           or not config.unattended_fixer_push_enabled(loop)):
+                # The claim's policy read may be minutes old; a turn that cannot publish is
+                # never started (the broker would refuse its push anyway).
+                error = FIXER_NOT_ADMITTED if row['push_admitted'] != 1 else FIXER_PUSH_REVOKED
+                return
             # The seat's own profile decides its model and account (#32). Resolved host-side,
             # before any GitHub read: an unresolvable seat is held here with the reason, and never
             # borrows another seat's model or key. The key lives only in this turn's proxy; an

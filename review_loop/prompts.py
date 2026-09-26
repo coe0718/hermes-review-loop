@@ -181,8 +181,12 @@ What to do:
 1. Read the verdict below. Fix what was actually found in `/work` — a rewritten file that dodges
    the finding is not a fix, and the next round will say so.
 2. Verify your fix in `/work`: build it and run the tests the finding touches.
-3. Publish the fix through the broker's push (command below). The host pushes it to the PR
-   branch only if the branch is still at {head}; you cannot push any other way.
+3. Publish the fix through the broker's push (command below): name the files you changed and
+   give a short commit message — the client builds the manifest and checks the limits before
+   anything is sent (`--dry-run` checks without sending). A push adds or replaces whole files
+   only; it cannot delete or rename a file, so if the fix needs that, say so in your summary.
+   The host pushes it to the PR branch only if the branch is still at {head}; you cannot push
+   any other way.
 4. **Then ask for the next review through the broker** — GitHub clears a pending review request
    the moment a verdict lands, so the loop only continues because you re-request it. The request
    *is* the trigger, and it is the step that gets forgotten.
