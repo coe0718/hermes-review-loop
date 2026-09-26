@@ -10,7 +10,9 @@ Runs with a plain interpreter and no network — no ``gh``, no pytest, no GitHub
 * the isolated supervisor's SQLite ledger is tested with a trusted inert fixture command,
   never an ambient GitHub bypass or a credential-owning gateway agent;
 * git is real: the cleanup tests build a throwaway clone with detached review worktrees and a
-  branch worktree, because the difference between those two is the whole safety story.
+  branch worktree, because the difference between those two is the whole safety story;
+* the documented commands are parsed by the CLI itself: every ``hermes review-loop …`` line in a
+  fenced block in README, docs/ and skill/ has to be a command the parser still accepts.
 
     python3 tests/run_tests.py             # all of it
     python3 tests/run_tests.py watchdog    # one area (a module under tests/harness/)
@@ -28,10 +30,12 @@ from __future__ import annotations
 import sys
 import types
 
-from harness import cleanup, doctor, fixture, gates, observer, routes, seats, state, watchdog
+from harness import (cleanup, docs, doctor, fixture, gates, observer, routes, seats, state,
+                     watchdog)
 
 AREAS = {"routes": routes, "gates": gates, "seats": seats, "watchdog": watchdog,
-         "cleanup": cleanup, "doctor": doctor, "state": state, "observer": observer}
+         "cleanup": cleanup, "doctor": doctor, "state": state, "observer": observer,
+         "docs": docs}
 GROUPS = {name: func for module in AREAS.values() for name, func in module.GROUPS.items()}
 
 # Suites such as test_reconciliation.py do ``import run_tests as t`` and use the fixture through
