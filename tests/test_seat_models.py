@@ -345,6 +345,8 @@ class Worker(Base):
                                return_value=("ok", {"reviews": [], "marker": {"rounds": 3}})), \
              mock.patch("review_loop.state.state_for") as state_for, \
              mock.patch.object(run_supervisor, "isolated_prompt", return_value="PROMPT"), \
+             mock.patch.object(run_supervisor, "pr_change",
+                               return_value=run_supervisor.PRChange("CHANGE", "DIFF")), \
              mock.patch.object(trusted_turn, "run_turn", side_effect=run_turn), \
              mock.patch.object(sup, "recover"):
             state_for.return_value.breach_start.return_value = {"ok": True}
@@ -364,6 +366,8 @@ class Worker(Base):
                 self.assertEqual(row, ("succeeded", None))
                 self.assertEqual((seen["role"], seen["model"], seen["key"]), (seat, model, key))
                 self.assertIn(host, seen["upstream"])
+                # Reviewer and fixer get the staged diff (#50); a ruling has none.
+                self.assertEqual(seen["review_diff"], None if seat == "adjudicator" else "DIFF")
                 others = {k for s, (_, k, _) in expected.items() if s != seat}
                 self.assertFalse(others & {seen["key"]})
 
