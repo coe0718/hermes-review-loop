@@ -75,6 +75,36 @@ def budget_spent_line(where: str, budget: float, exc: BaseException) -> str:
             f"sweep starts fresh")
 
 
+def sweep_budget_spent(loop: dict, st: state_mod.LoopState, budget: float,
+                       exc: BaseException) -> list[str]:
+    """A sweep GitHub stalled until its budget ran out is a failed-read sweep in #54's sense.
+
+    It is counted in the same ``github_read`` record the health check keeps, and said under the
+    same alert key as a read that got no HTTP answer (``read:none``): once per cooldown, not every
+    cron tick. Its end is said once by the health check ("GitHub reads work again").
+    """
+    now = time.time()
+    watch = st.watch()
+    record = watch.get("github_read") if isinstance(watch.get("github_read"), dict) else {}
+    sweeps = record["sweeps"] + 1 if type(record.get("sweeps")) is int else 1
+    since = valid_clock(record.get("since"), now) or now
+    login = str(loop.get("read_token") or "the read token")
+    record = {**record, "sweeps": sweeps, "since": since, "status": None, "login": login,
+              "error": f"no answer within the sweep's {budget:g}s budget: {exc}"[:200]}
+    cooldown = 0.0 if TEST else float(loop.get("cooldown_h", 6)) * 3600
+    lines = []
+    if alert_due(watch, "read:none", now, cooldown):
+        record["alerted"] = True
+        lines.append(budget_spent_line(f"[{loop.get('id', '?')}] {loop.get('repo', '')}".rstrip(),
+                                       budget, exc)
+                     + f" — reading as {login}, {gh.failure_hint(None)} ({sweeps} sweep(s) since "
+                       f"{time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(since))})")
+    watch["github_read"] = record
+    st.watch_save(watch)
+    st.note(f"run: stopped — GitHub did not answer within {budget:g}s ({sweeps} sweep(s))")
+    return lines
+
+
 def sweep_gate_failures(ledger: gate_failures.Ledger, header: str, cooldown_s: float,
                         may_redrive: bool) -> list[str]:
     """A gate that crashed, overran, or silenced after a failed read (#75): alert, re-drive."""
@@ -852,7 +882,11 @@ def run(args: argparse.Namespace, budget: float) -> None:
             out.extend(sweep_loop(loop, state_mod.state_for(loop), lines))
         except gh.GateBudgetExceeded as exc:      # GitHub is hanging: every loop would too
             out.extend(lines)
-            out.append(budget_spent_line(f"[{loop.get('id', '?')}]", budget, exc))
+            try:
+                out.extend(sweep_budget_spent(loop, state_mod.state_for(loop), budget, exc))
+            except Exception as err:              # never hide the stop itself
+                out.append(budget_spent_line(f"[{loop.get('id', '?')}]", budget, exc)
+                           + f" (could not record it: {type(err).__name__})")
             break
         except Exception as exc:                  # one bad loop must not hide the others
             out.extend(lines)

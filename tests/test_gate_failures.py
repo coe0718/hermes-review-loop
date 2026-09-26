@@ -365,6 +365,76 @@ class GateFailureTest(unittest.TestCase):
         self.assertIn("watchdog stopped: GitHub did not answer within the sweep's 2s budget",
                       proc.stdout)
 
+    # -- the real watchdog in its normal (non-test) mode -------------------------------------
+
+    def switch_stub(self, default: str = "world", paths: dict | None = None) -> pathlib.Path:
+        """A stub in front of the fixture's GitHub: hang, answer a status, or serve the world."""
+        mode = t.TMP / "gh_mode.json"
+        mode.write_text(json.dumps({"default": default, "paths": paths or {}}))
+        stub = t.TMP / "switch_stub.py"
+        if not stub.exists():
+            stub.write_text(
+                f"#!{sys.executable}\nimport json, os, sys, time\n"
+                f"mode = json.load(open({str(mode)!r}))\npath = sys.argv[1]\n"
+                "status = next((v for k, v in mode['paths'].items() if path.endswith(k)),"
+                " mode['default'])\n"
+                "if status == 'hang':\n    time.sleep(60)\n"
+                "elif status != 'world':\n"
+                "    print(json.dumps({'__gh_stub_response__': {'status': int(status),"
+                " 'body': {'message': 'stubbed'}}}))\n"
+                f"else:\n    os.execv({str(t.STUB)!r}, [{str(t.STUB)!r}, *sys.argv[1:]])\n")
+            stub.chmod(0o755)
+        return stub
+
+    def normal_watchdog(self, stub: pathlib.Path, budget: str = "600"):
+        """The watchdog exactly as cron runs it — no REVIEW_LOOP_TEST — against the stub."""
+        env = {k: v for k, v in t.env().items() if k != "REVIEW_LOOP_TEST"}
+        env.update(REVIEW_LOOP_GH_STUB=str(stub), REVIEW_LOOP_WATCHDOG_BUDGET_S=budget)
+        started = time.monotonic()
+        proc = subprocess.run([sys.executable, str(SCRIPTS / "watchdog.py")], capture_output=True,
+                              text=True, cwd=str(SCRIPTS), timeout=120, env=env)
+        return proc, time.monotonic() - started
+
+    def test_normal_mode_hanging_github_stops_once_then_health_alerts_and_recovers(self):
+        t.set_prs({"7": t.pr(7)})
+        hang = self.switch_stub("hang")
+        first, took = self.normal_watchdog(hang, "5")
+        self.assertEqual(first.returncode, 0)
+        self.assertLess(took, 15)
+        self.assertNotIn("Traceback", first.stdout + first.stderr)
+        stopped = [line for line in first.stdout.splitlines() if "watchdog stopped" in line]
+        self.assertEqual(len(stopped), 1, first.stdout)
+        self.assertIn("reading as rev-coach", stopped[0])
+        again, _ = self.normal_watchdog(hang, "5")          # still hanging, inside the cooldown
+        self.assertEqual((again.returncode, again.stdout.strip()), (0, ""))
+        watch = t.load_state("watchdog.json")["github_read"]
+        self.assertEqual((watch["sweeps"], watch["status"]), (2, None))
+        dead, _ = self.normal_watchdog(self.switch_stub("401"), "5")
+        alert = [line for line in dead.stdout.splitlines() if "cannot read GitHub" in line]
+        self.assertEqual(len(alert), 1, dead.stdout)
+        self.assertIn("HTTP 401", alert[0])
+        self.assertIn("(3 sweep(s) since", alert[0])
+        well, _ = self.normal_watchdog(self.switch_stub("world"))
+        self.assertIn("GitHub reads work again", well.stdout)
+
+    def test_normal_mode_owned_and_unowned_failed_reads_are_each_said_once(self):
+        t.set_prs({"7": t.pr(7, requested=t.SEAT), "8": t.pr(8, requested=t.SEAT)})
+        stub = self.switch_stub("world", {"/pulls/7": 502, "/pulls/8": 410})
+        env = {"REVIEW_LOOP_GH_STUB": str(stub)}
+        gateway_run("gate_reviewer.py", t.pr_payload(7), env)   # owned by gate-failures.json
+        gateway_run("gate_reviewer.py", t.pr_payload(8), env)   # 410: an answer, #54 reports it
+        (key, entry), = loop_entries().items()
+        self.assertEqual((entry["pr"], entry["kind"]), (7, "incomplete"))
+        out, _ = self.normal_watchdog(self.switch_stub("world"))
+        lines = out.stdout.splitlines()
+        owned = [line for line in lines if "/pulls/7" in line or "#7 " in line]
+        unowned = [line for line in lines if "/pulls/8" in line or "#8 " in line]
+        self.assertEqual(len(owned), 1, out.stdout)
+        self.assertIn(f"gate failure {key}", owned[0])
+        self.assertEqual(len(unowned), 1, out.stdout)
+        self.assertIn("HTTP 410", unowned[0])
+        self.assertNotIn("Traceback", out.stdout + out.stderr)
+
     def test_a_gate_drain_runs_on_the_gates_clock(self):
         from unittest import mock
         from review_loop import gh
