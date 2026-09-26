@@ -258,18 +258,23 @@ def check_credential(loop: dict, seat: str) -> Check:
         return Check(f"credential:{seat}", ABSENT,
                      f"nonempty GH_TOKEN in {env}, but no mapped token file for "
                      f"{login or seat}; a profile environment alone does not provide the "
-                     "gate's configured GitHub identity",
-                     f"add --token {login or '<login>'}=/path/to/pat for this seat")
+                     "gate's configured GitHub identity, and the sandboxed seat never sees it",
+                     f"map a token file for {login or '<login>'}: re-run init with "
+                     f"--token {login or '<login>'}=/path/to/pat, or set {seat}_token_file in the "
+                     "plugin settings and run apply; then remove GH_TOKEN from that .env")
     who = login or f"the {seat} seat"
     mapped = gh.token_path(loop, login) if login else None
     if mapped is not None:
         return Check(f"credential:{seat}", ABSENT,
                      f"{login} → {_token_file_facts(mapped)}: missing or empty",
                      f"write the PAT for {login} to {mapped} (chmod 600)")
+    # Seats write only through the host broker with a mapped token file; a GH_TOKEN in the
+    # profile's .env is never used, so it is not offered as a fix.
     return Check(f"credential:{seat}", ABSENT,
-                 f"no tokens entry for {who!r} and no GH_TOKEN in {env}",
-                 f"re-run init with --token {login or '<login>'}=/path/to/pat, or put "
-                 f"GH_TOKEN=<pat> in {env} — a seat with neither cannot push or post a verdict")
+                 f"no token file mapped for {who!r} (a GH_TOKEN in {env} would not be used)",
+                 f"re-run init with --token {login or '<login>'}=/path/to/pat, or set "
+                 f"{seat}_token_file in the plugin settings and run apply — without one the seat "
+                 "cannot push or post a verdict")
 
 
 def check_adjudicator_identity(loop: dict) -> Check | None:

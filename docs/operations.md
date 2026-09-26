@@ -67,7 +67,7 @@ hermes review-loop set --loop name --reviewer-concurrency 2   # two reviews at o
 hermes review-loop arm --loop name      # arm/pause by flipping the repo hooks
 hermes review-loop arm --loop name --pause
 hermes review-loop drain --loop name --seat reviewer
-hermes review-loop cleanup --loop name --sweep --dry-run
+hermes review-loop cleanup --loop name --dry-run   # every closed PR; --pr N for one
 hermes review-loop uninstall --loop name
 ```
 

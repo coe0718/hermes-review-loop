@@ -389,8 +389,10 @@ def group_doctor() -> None:
     rc, out = run_doctor("--loop", "widgets")
     check("a seat with no credential at all fails", rc, 1)
     check("  and names the seat", "❌ credential:fixer" in out, True)
-    check("  and both places it looked", "GH_TOKEN" in out and FIXER in out, True)
-    check("  the reviewer keeps its GH_TOKEN alternative", "✅ credential:reviewer" in out, True)
+    check("  and names the login", FIXER in out, True)
+    check("  the fix is a token file, never a GH_TOKEN in the profile",
+          "--token" in out and "GH_TOKEN=<pat>" not in out, True)
+    check("  the reviewer keeps its mapped token", "✅ credential:reviewer" in out, True)
 
     section("doctor — profiles, scripts and the cron shim")
     install_doctor_fixture()

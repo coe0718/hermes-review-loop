@@ -1686,7 +1686,8 @@ def cmd_uninstall(args) -> int:
             path.unlink()
             print(f"config removed: {path}")
     print("GitHub hooks and the cron job are NOT removed automatically:")
-    print(f"  hooks: hermes review-loop arm --loop {loop['id']}  # to pause them first")
+    print(f"  hooks: hermes review-loop arm --loop {loop['id']} --pause  # stops deliveries; "
+          "delete them on GitHub to remove them")
     print("  cron:  hermes cron list | grep review-loop-watchdog && hermes cron remove <id>")
     return 0
 
