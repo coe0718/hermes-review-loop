@@ -316,7 +316,8 @@ class Precedence(Base):
 class Worker(Base):
     """The production worker hands run_turn the row's own seat resolution, or holds the run."""
 
-    def run_seat(self, seat: str, settings: dict | None = None, loop: dict | None = None):
+    def run_seat(self, seat: str, settings: dict | None = None, loop: dict | None = None,
+                 turn=None, pr=None, calls: dict | None = None):
         runtime = self.root / "runtime.json"
         runtime.write_text(json.dumps(settings or self.settings))
         runtime.chmod(0o600)
@@ -331,8 +332,8 @@ class Worker(Base):
 
         def run_turn(_loop, scope, **kw):
             seen.update(kw, role=scope.role)
-            return 0
-        pr = {"number": 7, "head": {"sha": HEAD, "ref": "fix-7"}}
+            return turn(kw) if turn else 0
+        pr = {"number": 7, "head": {"sha": HEAD, "ref": "fix-7"}} if pr is None else pr
         from review_loop import run_supervisor
         with mock.patch.object(config, "by_repo", return_value=loop or self.loop), \
              mock.patch.object(gh, "api", return_value=pr) as api, \
@@ -348,9 +349,51 @@ class Worker(Base):
             state_for.return_value.breach_start.return_value = {"ok": True}
             sup._run_production(run_id, "w")
             called_github = api.called
+            if calls is not None:
+                calls["breach_resume"] = state_for.return_value.breach_resume.call_args_list
+                with sqlite3.connect(sup.db) as con:
+                    calls["detail"] = con.execute("SELECT detail FROM runs WHERE id=?",
+                                                  (run_id,)).fetchone()[0]
         with sqlite3.connect(sup.db) as con:
             row = con.execute("SELECT state, error FROM runs WHERE id=?", (run_id,)).fetchone()
         return seen, row, called_github
+
+    def test_prewrite_turn_failures_keep_the_real_reason_and_retry(self):
+        """#53: the exception's text and the sandbox output tail reach the ledger; a failure
+        with nothing on the write-ahead record waits for a retry unless it is terminal."""
+        def exits(code):
+            def turn(kw):
+                kw["observed"].update(stdout="thinking…", stderr="Error code: 503 - upstream overloaded")
+                return code
+            return turn
+
+        def raises(exc):
+            def turn(kw):
+                raise exc
+            return turn
+
+        calls = {}
+        _, row, _ = self.run_seat("reviewer", turn=exits(3), calls=calls)
+        self.assertEqual(row, ("waiting", "turn exited with status 3"))
+        self.assertIn("stderr: Error code: 503 - upstream overloaded", calls["detail"])
+        _, row, _ = self.run_seat("reviewer", pr={"message": "Server Error"})
+        self.assertEqual(row, ("failed", "isolated turn failed: ValueError: PR head moved"))
+        _, row, _ = self.run_seat("fixer", pr=False)
+        self.assertEqual(row, ("waiting", "isolated turn failed: RetryableError: PR unreadable "
+                                          "before launch (GitHub read failed)"))
+        _, row, _ = self.run_seat("reviewer", turn=raises(
+            trusted_turn.TurnDenied("agent exited without a confirmed scoped write")))
+        self.assertEqual(row, ("failed", "isolated turn failed: TurnDenied: agent exited without "
+                                         "a confirmed scoped write"))
+        _, row, _ = self.run_seat("reviewer", turn=raises(TimeoutError("sandbox run budget")))
+        self.assertEqual(row, ("waiting", "isolated turn failed: TimeoutError: sandbox run budget"))
+        _, row, _ = self.run_seat("reviewer", turn=raises(
+            trusted_turn.TurnDenied("broker did not shut down")))
+        self.assertEqual(row[0], "uncertain")
+        calls = {}
+        _, row, _ = self.run_seat("adjudicator", turn=exits(1), calls=calls)
+        self.assertEqual(row, ("waiting", "turn exited with status 1"))
+        self.assertEqual(len(calls["breach_resume"]), 1, "the marker is handed back for the retry")
 
     def test_each_seat_turn_runs_with_its_own_model_and_key(self):
         expected = {"reviewer": ("vendor/rev-model", KEYS["rev"], "openrouter.test"),

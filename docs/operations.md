@@ -67,6 +67,7 @@ hermes review-loop set --loop name --reviewer-concurrency 2   # two reviews at o
 hermes review-loop arm --loop name      # arm/pause by flipping the repo hooks
 hermes review-loop arm --loop name --pause
 hermes review-loop drain --loop name --seat reviewer
+hermes review-loop retry --loop name --pr 123   # re-arm a run that failed before any GitHub write
 hermes review-loop cleanup --loop name --dry-run   # every closed PR; --pr N for one
 hermes review-loop uninstall --loop name
 ```
@@ -417,6 +418,37 @@ all — an unknown loop, or several loops and no `--loop`.
 
 The guard order `explain` walks is in
 [architecture: Explain](architecture.md#explain--why-is-this-pr-not-moving).
+
+## When an isolated run fails
+
+Every isolated turn is a row in the host run ledger (`~/.hermes/state/review-loop-runs.sqlite`).
+A failure is sorted by one question — *could it have written to GitHub?* — answered from the
+host's own write-ahead records, never from an exit code. The sandbox holds no GitHub credential;
+its only writes go through the run's broker, which commits a record keyed by the run ID *before*
+the external call: a review-receipt claim (reviewer), a push intent/confirmation (fixer; its
+review request needs a confirmed push first) or a ruling (adjudicator; its optional PR comment
+follows the ruling). A run with any of those, or one ever quarantined as `uncertain`, may have
+written. Anything else did not.
+
+```
+pending ──claim──► claimed ──► launching/running ──► succeeded
+   ▲  │ GitHub read failed (a 502), PR draft: stays pending, retried by the next event or sweep
+   │  └ PR closed / head moved: cancelled        (a reopen or redelivery re-arms it)
+   │                         │ failed, nothing on the write-ahead record
+   │                         ├─ transient (non-zero sandbox exit — model 429/5xx, OAuth refresh —,
+   │                         │  timeout, network, staging read): waiting, backoff 2m·2ⁿ⁻¹ (≤1h)
+   ├──── backoff elapsed ────┘     … after 4 attempts: failed
+   ├──── redelivered event (≤8 failures) or `retry` ◄── failed / cancelled
+   │                         │ may have written, or a worker lost/still alive: uncertain
+   └─ never ◄────────────────┘   (operator `reconcile` only; never replayed)
+```
+
+Due retries start on the next event for the PR, when another run finishes, or on the next armed
+watchdog sweep. A failed run's notice carries the real reason (the exception text, or the sandbox
+exit status) and the tail of the turn's stdout/stderr; `status` and `explain` print the same with
+the next step. `hermes review-loop retry --loop name --pr 123 [--seat reviewer]` re-arms the
+PR's failed or waiting runs at its newest head, resets their retry budget and starts the worker;
+it refuses a run that may have written and prints the `reconcile` command instead.
 
 ## How it handles a burst
 

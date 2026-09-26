@@ -78,12 +78,15 @@ class Lifecycle(unittest.TestCase):
         self.assertEqual(len(self.launches()), 2)
 
     def test_child_failure_and_timeout_release_seat(self):
+        # Nothing on the write-ahead record: both wait for a backed-off retry (#53).
         sup = self.supervisor(rc=7)
         sup.enqueue("bad", "o/r", 1, "a", "reviewer")
-        self.assertEqual(self.wait(sup, "bad", "failed")["outcome"], 7)
+        bad = self.wait(sup, "bad", "waiting")
+        self.assertEqual((bad["outcome"], bad["retries"], bad["error"]),
+                         (7, 1, "turn exited with status 7"))
         slow = self.supervisor(delay=1, child_timeout=0.08)
         slow.enqueue("slow", "o/r", 2, "b", "reviewer")
-        self.assertEqual(self.wait(slow, "slow", "failed")["error"], "child timeout")
+        self.assertEqual(self.wait(slow, "slow", "waiting")["error"], "child timeout")
         ok = self.supervisor()
         ok.enqueue("ok", "o/r", 3, "c", "reviewer")
         self.wait(ok, "ok", "succeeded")

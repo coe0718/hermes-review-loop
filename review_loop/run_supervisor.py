@@ -53,6 +53,21 @@ CREATE TABLE IF NOT EXISTS review_receipts (
 """
 ACTIVE = ("claimed", "launching", "running", "uncertain")
 MAX_ATTEMPTS = 3
+# Issue #53: a turn that failed before any external write is not dead. It waits
+# (``waiting``, ``retry_at``) with exponential backoff and is relaunched up to MAX_RETRIES
+# times, then ``failed``. A redelivered event re-arms a failed pre-write run while its
+# ``retries`` stay under MAX_REARMS; past that only ``retry`` (an operator) resets it.
+# "No write happened" is decided from the host's own write-ahead records, never from the
+# exit code: every sandbox write goes through the run's broker, which commits a review
+# receipt claim, a push intent or a ruling row keyed by the run ID *before* the external
+# call (see ``write_evidence``). A run with any of those, or one ever quarantined as
+# uncertain, is never re-armed.
+MAX_RETRIES = 4
+MAX_REARMS = 8
+RETRY_BASE = 120.0
+RETRY_CAP = 3600.0
+DETAIL_BYTES = 2000
+REARMABLE = ("failed", "cancelled")
 SEATS = ("reviewer", "fixer", "adjudicator")
 RULINGS = ("ACCEPT", "REJECT", "RESPEC")
 # Terminal states of the optional PR comment. 'posting' is a durable pre-POST intent: a
@@ -60,6 +75,55 @@ RULINGS = ("ACCEPT", "REJECT", "RESPEC")
 # reported as uncertain and never replayed.
 COMMENT_STATES = ("pending", "none", "denied", "posting", "posted", "uncertain")
 _WORKERS: list[subprocess.Popen] = []
+
+
+class RetryableError(Exception):
+    """A pre-write failure worth another attempt (an unreadable read, a transient outage)."""
+
+
+def backoff(retries: int) -> float:
+    """Seconds before retry number ``retries`` (1-based): 2m, 4m, 8m, … capped at 1h."""
+    return min(RETRY_BASE * 2 ** max(0, retries - 1), RETRY_CAP)
+
+
+def tail(text: object, limit: int = DETAIL_BYTES) -> str:
+    """The last ``limit`` bytes of a turn's output, printable, for the ledger and notices."""
+    if isinstance(text, bytes):
+        text = text.decode(errors='replace')
+    text = text if isinstance(text, str) else ''
+    text = ''.join(ch if ch in '\n\t' or ch.isprintable() else '?' for ch in text).strip()
+    data = text.encode()
+    return text if len(data) <= limit else '[…]' + data[-limit:].decode(errors='ignore')
+
+
+def output_detail(stdout: object, stderr: object) -> str | None:
+    parts = [f'{name}: {tail(value, DETAIL_BYTES // 2)}' for name, value in
+             (('stderr', stderr), ('stdout', stdout)) if tail(value)]
+    return '\n'.join(parts) or None
+
+
+def _file_tail(handle, limit: int) -> bytes:
+    handle.seek(0, os.SEEK_END)
+    handle.seek(max(0, handle.tell() - limit))
+    return handle.read()
+
+
+def retryable(exc: BaseException) -> bool:
+    """Whether a pre-write exception is plausibly transient. Unknown kinds are not retried
+    automatically; they still fail *pre-write*, so a redelivery or ``retry`` re-arms them."""
+    import urllib.error
+    from . import seat_model, trusted_fetch
+    if isinstance(exc, (RetryableError, subprocess.TimeoutExpired, TimeoutError,
+                        ConnectionError, urllib.error.URLError)):
+        return True
+    if isinstance(exc, trusted_fetch.FetchDenied):
+        text = str(exc)
+        return text in ('GitHub response unavailable', 'exclusive sandbox publish unavailable') \
+            or text.startswith('sandbox publish failed')
+    if isinstance(exc, seat_model.SeatModelError):
+        return 'did not resolve within' in str(exc)
+    return isinstance(exc, OSError) and not isinstance(
+        exc, (FileNotFoundError, PermissionError, IsADirectoryError, NotADirectoryError))
 
 
 def effective_reviews(loop: dict, row, reviews, ledger=None):
@@ -205,6 +269,106 @@ def isolated_prompt(loop: dict, row, reviews, marker=None) -> str:
             + pr_record(loop, row, reviews, comments))
 
 
+def write_records(con, run_id: str) -> str | None:
+    """The host's write-ahead record of an external write this run began, if any.
+
+    The sandbox holds no GitHub credential; its only writes are the run broker's, and each
+    commits one of these, keyed by the run ID, before the external call: a review receipt
+    claim (reviewer), a push intent / confirmation (fixer; its review request needs a
+    confirmed push first) or a ruling (adjudicator; the optional PR comment follows it).
+    """
+    row = con.execute('SELECT push_intent,push_confirmed FROM runs WHERE id=?',
+                      (run_id,)).fetchone()
+    if row is not None and (row['push_intent'] is not None or row['push_confirmed'] is not None):
+        return 'fixer push recorded'
+    receipt = con.execute('SELECT state FROM review_receipts WHERE run_id=?', (run_id,)).fetchone()
+    if receipt is not None:
+        return f"review receipt {receipt['state']}"
+    if con.execute('SELECT 1 FROM rulings WHERE run_id=?', (run_id,)).fetchone():
+        return 'ruling recorded'
+    return None
+
+
+def write_evidence(con, run_id: str) -> str | None:
+    """Why a run may have written (so must never be re-armed), or None for a pre-write run.
+
+    Beyond the write-ahead records, a run that is or ever was quarantined as uncertain
+    (reconciled by an operator, or a post-write push hold) counts as having written: the
+    quarantine exists precisely because nobody could tell.
+    """
+    row = con.execute('SELECT state,error FROM runs WHERE id=?', (run_id,)).fetchone()
+    if row is None:
+        return 'run not found'
+    if row['state'] == 'uncertain':
+        return 'run is uncertain (a worker may have written)'
+    error = row['error'] or ''
+    if error.startswith(('operator reconciliation:', 'post-write push quarantine:')):
+        return 'run was quarantined as uncertain'
+    return write_records(con, run_id)
+
+
+def runs_view(con, repo: str | None = None, pr: int | None = None) -> list[dict]:
+    """Up to 100 failed, waiting and uncertain runs, oldest first. Each row carries ``write``:
+    why it may have written (never re-armed), or None — then ``retry`` re-arms it."""
+    where, args = "r.state IN ('failed','uncertain','waiting')", []
+    if repo is not None:
+        where += ' AND r.repo=?'
+        args.append(repo)
+    if pr is not None:
+        where += ' AND r.pr=?'
+        args.append(pr)
+    rows = [dict(row) for row in con.execute(
+        "SELECT r.id,r.repo,r.pr,r.head,r.seat,r.turn_key,r.state,r.pid,r.error,"
+        "r.detail,r.retries,r.retry_at,r.outcome,n.state AS notice FROM runs r "
+        "LEFT JOIN operator_notices n ON n.run_id=r.id WHERE " + where +
+        " ORDER BY r.created,r.id LIMIT 100", args)]
+    for row in rows:
+        row['write'] = write_evidence(con, row['id'])
+    return rows
+
+
+def read_only_view(db: str | Path, repo: str, pr: int | None = None) -> list[dict] | None:
+    """``runs_view`` without writing anything — no schema migration, no WAL creation — for
+    ``status``/``explain``. None when the ledger is absent or unreadable."""
+    path = Path(db)
+    if not path.is_file():
+        return None
+    # With no live WAL there is nothing uncheckpointed to miss, and ``immutable`` keeps even a
+    # read-only connection from creating -wal/-shm files; with one, those files already exist.
+    live = Path(f'{path}-wal').exists()
+    try:
+        from urllib.parse import quote
+        con = sqlite3.connect(f"file:{quote(str(path))}?{'mode=ro' if live else 'immutable=1'}",
+                              uri=True, timeout=5)
+        try:
+            con.row_factory = sqlite3.Row
+            return runs_view(con, repo, pr)
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return None
+
+
+def describe_run(row: dict, loop_id: str = 'LOOP') -> str:
+    """One operator line: state, reason and the next step for a ``runs_view`` row."""
+    text = (f"{row['seat']} #{row['pr']} @ {str(row['head'])[:7]} {row['state']}"
+            + (f" ({row['turn_key']})" if row.get('turn_key') else '')
+            + f" — {row['error'] or 'no reason recorded'}")
+    if row['state'] == 'waiting':
+        due = max(0, int((row['retry_at'] or 0) - time.time()))
+        return text + (f"; attempt {(row['retries'] or 0) + 1} of {MAX_RETRIES} due in {due}s "
+                       "(starts on the next event or armed watchdog sweep)")
+    if row['write'] is None:
+        return text + (f"; no external write — re-arm: hermes review-loop retry --loop {loop_id} "
+                       f"--pr {row['pr']} --seat {row['seat']}")
+    if row['state'] == 'failed':
+        return text + (f"; may have written ({row['write']}) — never replayed; a new head "
+                       "gets a fresh turn")
+    return text + (f"; may have written ({row['write']}) — inspect the PR, then "
+                   f"python -m review_loop.run_supervisor reconcile DB {row['id']} --reason "
+                   "REASON --acknowledge-no-live-worker")
+
+
 class Supervisor:
     def __init__(self, db: str | Path, *, fixture_command: list[str] | None = None,
                  fixture_mode: bool = False, capacity: dict[str, int] | None = None,
@@ -250,6 +414,14 @@ class Supervisor:
                 con.execute('ALTER TABLE runs ADD COLUMN push_intent REAL')
             if 'push_confirmed' not in {r[1] for r in con.execute('PRAGMA table_info(runs)')}:
                 con.execute('ALTER TABLE runs ADD COLUMN push_confirmed REAL')
+            columns = {r[1] for r in con.execute('PRAGMA table_info(runs)')}
+            # Issue #53: pre-write failure count, next retry time, bounded output tail.
+            if 'retries' not in columns:
+                con.execute('ALTER TABLE runs ADD COLUMN retries INTEGER NOT NULL DEFAULT 0')
+            if 'retry_at' not in columns:
+                con.execute('ALTER TABLE runs ADD COLUMN retry_at REAL')
+            if 'detail' not in columns:
+                con.execute('ALTER TABLE runs ADD COLUMN detail TEXT')
             con.execute('COMMIT')
 
     def _connect(self):
@@ -265,14 +437,10 @@ class Supervisor:
             row = con.execute("SELECT * FROM runs WHERE delivery=?", (delivery,)).fetchone()
             return dict(row) if row else None
 
-    def status(self) -> list[dict]:
+    def status(self, repo: str | None = None, pr: int | None = None) -> list[dict]:
         """Read-only, bounded operator view; no lease or worker is altered."""
         with self._connect() as con:
-            return [dict(row) for row in con.execute(
-                "SELECT r.id,r.repo,r.pr,r.head,r.seat,r.state,r.pid,r.error,"
-                "r.outcome,n.state AS notice FROM runs r LEFT JOIN operator_notices n "
-                "ON n.run_id=r.id WHERE r.state IN ('failed','uncertain') "
-                "ORDER BY r.created,r.id LIMIT 100")]
+            return runs_view(con, repo, pr)
 
     def quarantine_push(self, run_id: str, repo: str, pr: int, head: str,
                         outcome: str) -> None:
@@ -421,6 +589,30 @@ class Supervisor:
                 f"Reason as written by the adjudicator (model output, not verified by the loop):\n"
                 f"{body}")
 
+    @staticmethod
+    def _notice_message(row, current, wrote: str | None) -> str:
+        head = (f"⚠️ Review-loop worker {current['state']}: "
+                f"https://github.com/{row['repo']}/pull/{row['pr']} "
+                f"seat={row['seat']} head={row['head']} run={row['id']}. "
+                f"Reason: {current['error'] or 'worker outcome unavailable'}.")
+        if current['detail']:
+            head += f"\nTurn output (tail):\n{tail(current['detail'], 1200)}\n"
+        if wrote is None:
+            # Nothing reached GitHub: the host's write-ahead records for this run are empty.
+            return (head + f" No external write was made ({current['retries'] or 0} failed "
+                    "attempts on record). Fix the cause if it is not transient, then re-arm it: "
+                    f"`hermes review-loop retry --loop LOOP --pr {row['pr']} --seat {row['seat']}` "
+                    f"(or `python -m review_loop.run_supervisor retry DB {row['id']}`); a "
+                    "redelivered webhook for this head also re-arms it.")
+        return (head + f" Possible external write ({wrote}). "
+                "Do not replay this turn or release its seat based on a lease alone. "
+                "Inspect the worker PID and external GitHub writes; use "
+                "`python -m review_loop.run_supervisor status DB` and "
+                "`python -m review_loop.run_supervisor reconcile DB RUN_ID "
+                "--reason REASON --acknowledge-no-live-worker` only after "
+                "establishing no worker remains. Failed writes require "
+                "manual inspection before any new turn.")
+
     def notify(self, deliver) -> int:
         """One bounded alert per failed/uncertain run, retried if delivery fails.
 
@@ -445,24 +637,14 @@ class Supervisor:
                 pending = con.execute("SELECT 1 FROM operator_notices WHERE run_id=? "
                                       "AND state='pending'", (row['id'],)).fetchone()
                 if pending:
-                    current = con.execute("SELECT state,error FROM runs WHERE id=?",
+                    current = con.execute("SELECT state,error,detail,retries FROM runs WHERE id=?",
                                           (row['id'],)).fetchone()
                     if current is None or current['state'] not in ('failed', 'uncertain'):
                         con.execute("UPDATE operator_notices SET state='resolved' WHERE run_id=?",
                                     (row['id'],))
                         con.execute('COMMIT')
                         continue
-                    message = (f"⚠️ Review-loop worker {current['state']}: "
-                               f"https://github.com/{row['repo']}/pull/{row['pr']} "
-                               f"seat={row['seat']} head={row['head']} run={row['id']}. "
-                               f"Reason: {current['error'] or 'worker outcome unavailable'}. "
-                               "Do not replay this turn or release its seat based on a lease alone. "
-                               "Inspect the worker PID and external GitHub writes; use "
-                               "`python -m review_loop.run_supervisor status DB` and "
-                               "`python -m review_loop.run_supervisor reconcile DB RUN_ID "
-                               "--reason REASON --acknowledge-no-live-worker` only after "
-                               "establishing no worker remains. Failed writes require "
-                               "manual inspection before any new turn.")
+                    message = self._notice_message(row, current, write_evidence(con, row['id']))
                     # Claim durably before calling a potentially slow transport.
                     # A crash while sending is ambiguous: leave it for an operator,
                     # rather than replaying a possibly acknowledged notification.
@@ -516,6 +698,15 @@ class Supervisor:
     def enqueue(self, delivery: str, repo: str, pr: int, head: str, seat: str,
                 *, turn_key: str = '') -> str:
         """Commit identity before any spawn. A repeated delivery cannot change terms."""
+        self.submit(delivery, repo, pr, head, seat, turn_key=turn_key)
+        return SILENT
+
+    def submit(self, delivery: str, repo: str, pr: int, head: str, seat: str,
+               *, turn_key: str = '') -> str:
+        """``enqueue``, reporting what it did (issue #73): ``enqueued`` (new row),
+        ``rearmed`` (a failed/cancelled pre-write run is pending again), ``pending``
+        (an unclaimed row, worker re-armed), or ``duplicate <state>[: why]`` — nothing
+        was scheduled, and the caller must not report a fresh enqueue."""
         if not all(isinstance(v, str) and v and len(v) <= 256 for v in
                    (delivery, repo, head, seat)) or not isinstance(turn_key, str) or len(turn_key) > 256 or type(pr) is not int or pr <= 0:
             raise ValueError("invalid run identity")
@@ -545,12 +736,68 @@ class Supervisor:
                                 "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                                 (uuid.uuid4().hex, delivery, repo, pr, head, seat, turn_key,
                                  "pending" if self.fixture_mode or self.production_config else "blocked", now, now, admitted))
+            outcome = 'enqueued' if not prior else 'pending' if prior['state'] == 'pending' \
+                else f"duplicate {prior['state']}"
+            if prior and prior['state'] in REARMABLE and (self.fixture_mode or self.production_config):
+                # A new event for a head whose run never wrote is a reason to try again
+                # (#53): re-arm it, one attempt per event, up to MAX_REARMS failures.
+                wrote = write_evidence(con, prior['id'])
+                if wrote is not None:
+                    outcome += f': {wrote} — reconcile, never replayed'
+                elif (prior['retries'] or 0) >= MAX_REARMS:
+                    outcome += (f": {prior['retries']} failed attempts — only "
+                                "`hermes review-loop retry` re-arms it")
+                else:
+                    self._rearm(con, prior['id'], reset=False)
+                    outcome = 'rearmed'
+            elif prior and prior['state'] == 'waiting' and prior['retry_at']:
+                outcome += f" (retry {prior['retries']} due in {max(0, int(prior['retry_at'] - now))}s)"
             con.execute("COMMIT")
         # A redelivery of an unclaimed run must rearm the worker after a
         # transient generation/read outage; active or completed runs stay deduped.
-        if (self.fixture_mode or self.production_config) and (not prior or prior['state'] == 'pending'):
+        if (self.fixture_mode or self.production_config) and outcome in ('enqueued', 'pending', 'rearmed'):
             self._spawn()
-        return SILENT
+        return outcome
+
+    @staticmethod
+    def _rearm(con, run_id: str, *, reset: bool) -> None:
+        """Make a pre-write run pending again, inside the caller's transaction. Admission,
+        generation terms and history stay; claim attempts restart; its notice is resolved
+        so a later failure is reported afresh."""
+        con.execute("UPDATE runs SET state='pending', owner=NULL, lease=NULL, pid=NULL, "
+                    "launch_intent=NULL, outcome=NULL, attempts=0, retry_at=NULL, "
+                    "retries=CASE WHEN ? THEN 0 ELSE retries END, updated=? WHERE id=?",
+                    (1 if reset else 0, time.time(), run_id))
+        con.execute("DELETE FROM operator_notices WHERE run_id=?", (run_id,))
+
+    def retry(self, run_id: str) -> str:
+        """Operator re-arm of a failed or waiting run that never wrote (#53).
+
+        Refuses anything that may have written — uncertain, quarantined, reconciled, or with
+        a receipt claim, push intent or ruling on record — with the reconcile instructions.
+        Resets the automatic retry budget. Returns the new state; raises ValueError on refusal.
+        """
+        with self._connect() as con:
+            con.execute('BEGIN IMMEDIATE')
+            row = con.execute('SELECT state FROM runs WHERE id=?', (run_id,)).fetchone()
+            if row is None:
+                con.execute('COMMIT')
+                raise ValueError(f'no run {run_id}')
+            wrote = write_evidence(con, run_id)
+            if wrote is not None:
+                con.execute('COMMIT')
+                raise ValueError(
+                    f'refused: {wrote}. A run that may have written is never replayed. Inspect '
+                    'the PR for its external writes, establish no worker remains, then '
+                    f'`python -m review_loop.run_supervisor reconcile DB {run_id} --reason '
+                    "'external writes inspected' --acknowledge-no-live-worker`; a new head "
+                    'gets a fresh turn.')
+            if row['state'] not in REARMABLE + ('waiting',):
+                con.execute('COMMIT')
+                raise ValueError(f"refused: run is {row['state']}, not failed or waiting")
+            self._rearm(con, run_id, reset=True)
+            con.execute('COMMIT')
+        return 'pending'
 
     def _spawn(self):
         # Trusted supervisor process only, never the credential-owning gateway agent.
@@ -591,6 +838,10 @@ class Supervisor:
                         "owner=NULL, lease=NULL, updated=? WHERE state='claimed' "
                         "AND lease<? AND attempts>=?",
                         (now, now, MAX_ATTEMPTS))
+            # A pre-write failure whose backoff has elapsed is scheduled again (#53).
+            con.execute("UPDATE runs SET state='pending', owner=NULL, lease=NULL, attempts=0, "
+                        "retry_at=NULL, updated=? WHERE state='waiting' AND "
+                        "(retry_at IS NULL OR retry_at<=?)", (now, now))
             pending = con.execute("SELECT COUNT(*) FROM runs WHERE state='pending'").fetchone()[0]
             con.execute("COMMIT")
         if pending and (self.fixture_mode or self.production_config):
@@ -605,22 +856,35 @@ class Supervisor:
                                      "ORDER BY created,id").fetchall()
         for row in candidates:
             generation = None
-            unavailable = False
+            unavailable = None
             retry_read = False
-            superseded = False
+            superseded = None
             if self.production_config and row['seat'] == 'reviewer':
                 from . import config, gh
                 from .review_receipt import ReceiptDenied, generation_for
                 try:
                     loop = config.by_repo(row['repo'])
                     if loop is None:
-                        unavailable = True
+                        unavailable = 'loop not configured'
                     else:
                         pr = gh.api(loop, f"/repos/{row['repo']}/pulls/{row['pr']}",
                                     login=loop['read_token'])
-                        generation = generation_for(pr, loop, row['pr'], row['head'])
-                except ReceiptDenied:
-                    unavailable = True
+                        # gh.api answers None for any failed read (a 502 included): that is a
+                        # read to retry, never a verdict on the PR (#53). A closed PR or a moved
+                        # head retires this turn (a reopen/redelivery re-arms it); a draft waits
+                        # for ready, as the fixer's claim does.
+                        if not isinstance(pr, dict) or pr.get('number') != row['pr']:
+                            retry_read = True
+                        elif pr.get('state') == 'closed':
+                            superseded = 'PR closed before the review started'
+                        elif (pr.get('head') or {}).get('sha') != row['head']:
+                            superseded = 'PR head moved before the review started'
+                        elif pr.get('state') != 'open' or pr.get('draft') is not False:
+                            retry_read = True
+                        else:
+                            generation = generation_for(pr, loop, row['pr'], row['head'])
+                except ReceiptDenied as exc:
+                    unavailable = f'review generation unavailable: {exc}'
                 except Exception:
                     retry_read = True
             if row['seat'] not in self.capacity:
@@ -629,7 +893,8 @@ class Supervisor:
                 from . import config
                 try:
                     status, _ = adjudication_state(config.by_repo(row['repo']), row, self.db)
-                    superseded, retry_read = status == 'superseded', status == 'retry'
+                    superseded = 'adjudication superseded' if status == 'superseded' else None
+                    retry_read = status == 'retry'
                 except Exception:
                     retry_read = True
             if self.production_config and row['seat'] == 'fixer':
@@ -644,7 +909,7 @@ class Supervisor:
                         if not isinstance(pr, dict) or not isinstance(pr.get('head'), dict):
                             retry_read = True
                         elif pr['head'].get('sha') != row['head'] or pr.get('state') == 'closed':
-                            superseded = True
+                            superseded = 'fixer verdict superseded'
                         elif pr.get('state') != 'open' or pr.get('draft') is not False:
                             retry_read = True
                         else:
@@ -657,7 +922,7 @@ class Supervisor:
                                 if latest is None:
                                     retry_read = True
                                 elif gh.review_state(latest) != 'CHANGES_REQUESTED':
-                                    superseded = True
+                                    superseded = 'fixer verdict superseded'
                 except Exception:
                     retry_read = True
             with self._connect() as con:
@@ -682,8 +947,7 @@ class Supervisor:
                 now = time.time()
                 if superseded:
                     con.execute("UPDATE runs SET state='cancelled', error=?,updated=? WHERE id=?",
-                                ('adjudication superseded' if row['seat'] == 'adjudicator'
-                                 else 'fixer verdict superseded', now, row['id']))
+                                (superseded, now, row['id']))
                     con.execute('COMMIT')
                     continue
                 if retry_read:
@@ -691,8 +955,7 @@ class Supervisor:
                     continue
                 if unavailable:
                     con.execute("UPDATE runs SET state='failed', attempts=attempts+1, "
-                                "error='review generation unavailable',updated=? WHERE id=?",
-                                (now, row['id']))
+                                "error=?,updated=? WHERE id=?", (unavailable, now, row['id']))
                     con.execute("COMMIT")
                     continue
                 owner = uuid.uuid4().hex
@@ -718,12 +981,18 @@ class Supervisor:
                 pass
 
     def complete_uncertain(self, run_id: str, owner: str, rc: int | None,
-                           error: str | None = None, *, stopped: bool = True) -> None:
+                           error: str | None = None, *, stopped: bool = True,
+                           retry: bool = False, detail: str | None = None) -> str | None:
         """Record direct worker completion, including after lease expiry.
 
         Never use this for operator guesswork: only the owner after its child
         has stopped may call it. A lost worker remains uncertain until manual
         reconciliation, and is never automatically retried.
+
+        A stopped run with no write-ahead record (``write_records``) failed *before any
+        write*: with ``retry`` (a transient cause, or a non-zero sandbox exit) it waits for a
+        backed-off relaunch, up to MAX_RETRIES, then fails. Returns the state written, or
+        None when this owner no longer holds the run.
         """
         with self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
@@ -731,19 +1000,36 @@ class Supervisor:
                                     (run_id,)).fetchone()
             held = con.execute("SELECT error FROM runs WHERE id=? AND owner=? AND state='uncertain'",
                                (run_id, owner)).fetchone()
-            intent = con.execute('SELECT push_intent FROM runs WHERE id=? AND owner=?',
+            intent = con.execute('SELECT push_intent,retries FROM runs WHERE id=? AND owner=?',
                                  (run_id, owner)).fetchone()
             quarantined = held is not None and (held['error'] or '').startswith('post-write push quarantine: ')
             post_write = quarantined or (intent is not None and intent['push_intent'] is not None)
-            con.execute("UPDATE runs SET state=?, outcome=?, error=?, lease=NULL, "
-                        "updated=? WHERE id=? AND owner=? AND state IN "
-                        "('launching','running','uncertain')",
-                        ("uncertain" if not stopped or ambiguous or post_write else
-                         "succeeded" if rc == 0 and error is None else "failed",
-                         rc, (held['error'] if quarantined else
-                              'post-write push quarantine: unresolved push intent') if post_write else error,
-                         time.time(), run_id, owner))
+            if rc not in (None, 0) and error is None:
+                error = f'turn exited with status {rc}'
+            retries = (intent['retries'] or 0) if intent is not None else 0
+            retry_at = None
+            if not stopped or ambiguous or post_write:
+                state = 'uncertain'
+                error = (held['error'] if quarantined else
+                         'post-write push quarantine: unresolved push intent') if post_write else error
+            elif rc == 0 and error is None:
+                state = 'succeeded'
+            elif retry and write_records(con, run_id) is None:
+                retries += 1
+                if retries < MAX_RETRIES:
+                    state, retry_at = 'waiting', time.time() + backoff(retries)
+                else:
+                    state = 'failed'
+                    error = f'retry limit ({retries} attempts): {error}'
+            else:
+                state = 'failed'
+            changed = con.execute(
+                "UPDATE runs SET state=?, outcome=?, error=?, detail=?, "
+                "retries=?, retry_at=?, lease=NULL, updated=? WHERE id=? AND owner=? AND state IN "
+                "('launching','running','uncertain')",
+                (state, rc, error, detail, retries, retry_at, time.time(), run_id, owner)).rowcount
             con.execute("COMMIT")
+        return state if changed else None
 
     def reconcile_uncertain(self, run_id: str, *, reason: str,
                             acknowledge_no_live_worker: bool = False) -> bool:
@@ -806,46 +1092,59 @@ class Supervisor:
 
     def _run_fixture(self, run_id: str, owner: str) -> None:
         assert self.fixture_command is not None
+        import tempfile
         child = None
         rc = None
         error = None
         stopped = True
-        try:
-            child = subprocess.Popen(self.fixture_command,
-                                     env={"PATH": "/usr/bin:/bin", "HOME": os.environ["HOME"],
-                                          "HERMES_HOME": os.environ["HERMES_HOME"]},
-                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                     stderr=subprocess.DEVNULL, close_fds=True,
-                                     start_new_session=True)
-            with self._connect() as con:
-                con.execute("UPDATE runs SET state='running', pid=?, lease=?, updated=? "
-                            "WHERE id=? AND owner=? AND state='launching'",
-                            (child.pid, time.time() + self.lease_seconds, time.time(), run_id, owner))
+        retry = False
+        detail = None
+        with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
             try:
-                rc = child.wait(timeout=self.child_timeout)
-            except subprocess.TimeoutExpired:
-                os.killpg(child.pid, signal.SIGKILL)
-                child.wait()
-                error = "child timeout"
-        except Exception as exc:
-            error = f"launch/wait failed: {type(exc).__name__}: {exc}"
-            if child and child.poll() is None:
+                child = subprocess.Popen(self.fixture_command,
+                                         env={"PATH": "/usr/bin:/bin", "HOME": os.environ["HOME"],
+                                              "HERMES_HOME": os.environ["HERMES_HOME"]},
+                                         stdin=subprocess.DEVNULL, stdout=out,
+                                         stderr=err, close_fds=True,
+                                         start_new_session=True)
+                with self._connect() as con:
+                    con.execute("UPDATE runs SET state='running', pid=?, lease=?, updated=? "
+                                "WHERE id=? AND owner=? AND state='launching'",
+                                (child.pid, time.time() + self.lease_seconds, time.time(), run_id, owner))
                 try:
+                    rc = child.wait(timeout=self.child_timeout)
+                    retry = rc != 0
+                except subprocess.TimeoutExpired:
                     os.killpg(child.pid, signal.SIGKILL)
                     child.wait()
+                    error = "child timeout"
+                    retry = True
+            except Exception as exc:
+                error = f"launch/wait failed: {type(exc).__name__}: {exc}"
+                if child and child.poll() is None:
+                    try:
+                        os.killpg(child.pid, signal.SIGKILL)
+                        child.wait()
+                    except OSError:
+                        stopped = False
+            finally:
+                try:
+                    detail = output_detail(*(_file_tail(f, DETAIL_BYTES) for f in (out, err)))
                 except OSError:
-                    stopped = False
-        finally:
-            # A failed launch remains failed, not retryable: spawn may have occurred.
-            self.complete_uncertain(run_id, owner, rc, error, stopped=stopped)
-            # A completed child releases the seat and allows waiting work to advance.
-            self.recover()
+                    detail = None
+                # A failed launch remains failed, not retryable: spawn may have occurred. A
+                # child that exited or timed out with nothing on the write-ahead record waits.
+                self.complete_uncertain(run_id, owner, rc, error, stopped=stopped,
+                                        retry=retry, detail=detail)
+                # A completed child releases the seat and allows waiting work to advance.
+                self.recover()
 
 
     def _run_production(self, run_id: str, owner: str) -> None:
         """Worker-only host control plane; never pass credentials to bwrap."""
         from . import broker_ipc, config, gh, seat_model, trusted_turn
         rc, error = None, None
+        retry, stopped, observed, breach = False, True, {}, None
         try:
             assert self.production_config is not None
             try:
@@ -870,10 +1169,13 @@ class Supervisor:
                 inference = seat_model.resolve_seat(loop, row["seat"], settings)
             except seat_model.SeatModelError as exc:
                 error = f"seat model unresolved: {exc}"[:600]
+                retry = retryable(exc)
                 return
             reader = loop["read_token"]
             pr = gh.api(loop, f'/repos/{row["repo"]}/pulls/{row["pr"]}', login=reader)
-            head = pr.get("head") if isinstance(pr, dict) else None
+            if not isinstance(pr, dict):
+                raise RetryableError("PR unreadable before launch (GitHub read failed)")
+            head = pr.get("head")
             if not isinstance(head, dict) or head.get("sha") != row["head"]:
                 raise ValueError("PR head moved")
             if row['seat'] == 'reviewer' and not row['generation']:
@@ -882,14 +1184,17 @@ class Supervisor:
             if row['seat'] == 'fixer':
                 from . import gate
                 reviews = effective_reviews(loop, row, gh.reviews(loop, row['pr']), self.db)
-                latest = (gate.latest_effective_review_at_head(reviews, loop, row['head'])
-                          if isinstance(reviews, list) else None)
+                if not isinstance(reviews, list):
+                    raise RetryableError('reviews or receipts unreadable before launch')
+                latest = gate.latest_effective_review_at_head(reviews, loop, row['head'])
                 if latest is None or gh.review_state(latest) != 'CHANGES_REQUESTED':
                     raise ValueError('fixer verdict no longer current')
             elif row['seat'] == 'adjudicator':
                 # Same live checks as the claim, repeated right before launch: the claim's
                 # reads may be minutes old, and a ruling on a moved or approved head is noise.
                 status, facts = adjudication_state(loop, row, self.db)
+                if status == 'retry':
+                    raise RetryableError('adjudication facts unreadable before launch')
                 if status != 'ok':
                     raise ValueError('adjudication no longer current')
                 reviews, marker = facts['reviews'], facts['marker']
@@ -900,7 +1205,12 @@ class Supervisor:
             scope = broker_ipc.RunScope(row["repo"], row["pr"], row["head"],
                                         row["seat"], head["ref"], row['id'],
                                         str(self.db), row['generation'])
-            prompt = isolated_prompt(loop, row, reviews, marker)
+            try:
+                prompt = isolated_prompt(loop, row, reviews, marker)
+            except ValueError as exc:
+                if str(exc) == 'fixer comments unreadable':
+                    raise RetryableError(str(exc)) from None
+                raise
             if row['seat'] == 'adjudicator':
                 from . import state as state_mod
                 # Last step before launch: mark the breach as being ruled on. Anyone else's
@@ -908,6 +1218,7 @@ class Supervisor:
                 if state_mod.state_for(loop).breach_start(row['pr'], row['head'],
                                                          marker['rounds']) is None:
                     raise ValueError('breach marker already claimed or replaced')
+                breach = (state_mod.state_for(loop), marker['rounds'])
             rc = trusted_turn.run_turn(loop, scope, source=Path(settings["source"]),
                   venv=Path(settings["venv"]), runtime=Path(settings["runtime"]),
                   rust=Path(settings["rust"]), upstream=inference.upstream,
@@ -915,18 +1226,38 @@ class Supervisor:
                   api_mode=inference.api_mode, credential=inference.credential_provider(),
                   proxy_model=inference.proxy_model, client_identity=inference.client_identity,
                   prompt=prompt, timeout=int(self.child_timeout),
-                  work_root=Path(loop["state_dir"]) / "isolated-runs")
+                  work_root=Path(loop["state_dir"]) / "isolated-runs", observed=observed)
+            # A non-zero sandbox exit with nothing on the write-ahead record is the model or
+            # provider failing (429/5xx, OAuth refresh, crash): worth a backed-off retry.
+            retry = rc != 0
         except Exception as exc:
-            error = f"isolated turn failed: {type(exc).__name__}"
+            # The real reason, not just its type (#53). Messages here are host-generated
+            # (no credential is ever formatted into one), and bounded.
+            error = f"isolated turn failed: {type(exc).__name__}: {exc}"[:600]
+            retry = retryable(exc)
+            if isinstance(exc, trusted_turn.TurnDenied) and 'did not shut down' in str(exc):
+                stopped = False  # a live broker thread may still write: quarantine
         finally:
-            self.complete_uncertain(run_id, owner, rc, error)
+            state = self.complete_uncertain(
+                run_id, owner, rc, error, stopped=stopped, retry=retry,
+                detail=output_detail(observed.get('stdout'), observed.get('stderr')))
+            if breach is not None and state in ('waiting', 'failed'):
+                # This run marked the breach 'adjudicating' and made no ruling: hand the
+                # marker back so its retry (or a re-arm) can claim it again.
+                try:
+                    with self._connect() as con:
+                        unwritten = write_records(con, run_id) is None
+                    if unwritten:
+                        breach[0].breach_resume(row['pr'], row['head'], breach[1])
+                except Exception:
+                    pass
             self.recover()
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("operation", choices=["_fixture-worker", "_production-worker",
-                                         "status", "sweep", "reconcile", "rulings"])
+                                         "status", "sweep", "reconcile", "rulings", "retry"])
     p.add_argument("db")
     p.add_argument("command", nargs='?')
     p.add_argument("capacity", nargs='?')
@@ -935,7 +1266,7 @@ def main():
     p.add_argument('--reason')
     p.add_argument('--acknowledge-no-live-worker', action='store_true')
     a = p.parse_args()
-    if a.operation in ('status', 'sweep', 'reconcile', 'rulings'):
+    if a.operation in ('status', 'sweep', 'reconcile', 'rulings', 'retry'):
         sup = Supervisor(a.db)
         if a.operation == 'rulings':
             if a.command or a.reason or a.acknowledge_no_live_worker:
@@ -950,6 +1281,18 @@ def main():
                 p.error('unexpected sweep arguments')
             sup.recover()  # no production configuration: cannot launch waiting work
             sup.notify(lambda message: print(message, flush=True))
+        elif a.operation == 'retry':
+            if not a.command or a.capacity or a.reason or a.acknowledge_no_live_worker:
+                p.error('retry requires exactly one run ID')
+            try:
+                sup.retry(a.command)
+            except ValueError as exc:
+                print(exc)
+                raise SystemExit(2)
+            # This ledger-only process launches nothing: the next event for the PR, a
+            # worker-enabled recovery or the next armed watchdog sweep starts it.
+            print('rearmed: pending (starts on the next armed watchdog sweep or event; '
+                  '`hermes review-loop retry` also starts it now)')
         else:
             if not a.command or not a.reason or not a.acknowledge_no_live_worker:
                 p.error('reconcile requires run ID, reason and explicit acknowledgement')

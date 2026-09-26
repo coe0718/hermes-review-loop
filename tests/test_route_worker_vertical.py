@@ -255,13 +255,15 @@ class RouteWorkerVertical(unittest.TestCase):
         self.assertEqual(self.world['model'], [])
         self.assertEqual(self.world['writes'], [])
 
-    def test_out_of_scope_agent_write_fails_and_does_not_retry(self):
+    def test_out_of_scope_agent_write_fails_and_is_never_written(self):
         self.world['model_command'] = 'python -m review_loop.broker_client request_review'
         route = self.route()
         self.assertEqual((route.returncode, route.stdout.strip()), (0, '[SILENT]'), route.stderr)
         row = self.result('failed')
         self.assertEqual(row[1], 1)
         self.assertEqual(self.world['writes'], [])
+        # A redelivery re-arms the failed pre-write turn (#53): it runs once more, is denied
+        # the same way, and still writes nothing.
         again = self.route()
         self.assertEqual((again.returncode, again.stdout.strip()), (0, '[SILENT]'), again.stderr)
         self.assertEqual(self.result('failed')[1], 1)
