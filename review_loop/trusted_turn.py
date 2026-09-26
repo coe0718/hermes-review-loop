@@ -217,7 +217,7 @@ def run_turn(loop: dict, scope: broker_ipc.RunScope, *, source: Path, venv: Path
              prompt: str, timeout: int = 600, work_root: Path | None = None,
              no_write: bool = False, observed: dict | None = None,
              api_mode: str = 'chat_completions', credential=None, proxy_model: str = '',
-             client_identity: str = '') -> int:
+             client_identity: str = '', review_diff: str | None = None) -> int:
     """Stage a live PR head, start host capabilities, execute Hermes within bwrap.
 
     ``api_mode`` picks the proxy contract and the sandbox's provider config; ``credential`` (a
@@ -229,6 +229,10 @@ def run_turn(loop: dict, scope: broker_ipc.RunScope, *, source: Path, venv: Path
     mode: a reviewer's verdict is authorized with live reads and recorded, never POSTed.
     ``observed``, when given, receives the sandbox exit code, bounded output tails and the
     recorded submissions.
+
+    ``review_diff``, when given, is the host-built diff of the PR (``run_supervisor.pr_change``);
+    it is mounted read-only at ``/opt/review/pr.diff``, outside the ``/work`` a fixer publishes
+    from, so it can never become part of a push.
     """
     if scope.repo != loop.get('repo') or scope.role not in TOOLS:
         raise TurnDenied('scope mismatch')
@@ -257,6 +261,12 @@ def run_turn(loop: dict, scope: broker_ipc.RunScope, *, source: Path, venv: Path
             (home / '.env').chmod(0o600)
         query = root / 'query.txt'
         query.write_text(prompt + '\n\n' + tool_instructions(scope.role) + '\n')
+        review = None
+        if review_diff is not None:
+            review = root / 'review'
+            review.mkdir(mode=0o700)
+            (review / 'pr.diff').write_text(review_diff)
+            (review / 'pr.diff').chmod(0o444)
         checkout = trusted_fetch.stage(loop, repo=scope.repo, number=scope.number,
                                        head=scope.head, ref=scope.branch, role=scope.role,
                                        sandbox_root=root / 'export')
@@ -284,7 +294,7 @@ def run_turn(loop: dict, scope: broker_ipc.RunScope, *, source: Path, venv: Path
                     home=home, checkout=checkout, rust=rust, query=query, entry=command,
                     inference_socket_dir=inference.directory,
                     broker_socket_dir=broker.socket_path.parent,
-                    client_code=client.parent, timeout=timeout,
+                    client_code=client.parent, review_dir=review, timeout=timeout,
                     # A ruling is judgement, not a change: the adjudicator's tree is mounted
                     # read-only so nothing it runs can dress up the head it rules on.
                     checkout_writable=scope.role != 'adjudicator')

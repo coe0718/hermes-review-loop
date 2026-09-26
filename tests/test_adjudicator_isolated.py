@@ -468,7 +468,8 @@ class Prompts(Base):
             with self.subTest(seat):
                 row = {"seat": seat, "repo": REPO, "pr": 7, "head": HEAD}
                 with mock.patch.object(gh, "api", return_value=comments):
-                    text = run_supervisor.isolated_prompt(self.loop, row, reviews, marker)
+                    change = run_supervisor.PRChange("## The change under review", "")
+                    text = run_supervisor.isolated_prompt(self.loop, row, reviews, marker, change)
                 template, record = text.split("## PR record", 1)
                 self.assertIsNone(self.FIELD.search(template))
                 self.assertIn("finding 3 at src/x.rs:3", record)
