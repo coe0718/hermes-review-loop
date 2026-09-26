@@ -235,7 +235,10 @@ class Supervisor:
             raise ValueError("child command requires explicit fixture mode")
         if lease_seconds <= 0 or child_timeout <= 0:
             raise ValueError("positive timeouts required")
-        self.db = Path(db)
+        from .config import guard_real_home
+        self.db = guard_real_home(Path(db))
+        if hermes_home is not None:
+            guard_real_home(hermes_home)
         self.fixture_command = fixture_command
         self.fixture_mode = fixture_mode
         self.production_config = Path(production_config).resolve(strict=True) if production_config else None
@@ -587,10 +590,15 @@ class Supervisor:
         args = [sys.executable, "-m", "review_loop.run_supervisor", operation,
                 str(self.db), command, json.dumps(self.capacity),
                 str(self.lease_seconds), str(self.child_timeout)]
-        host_home = self.hermes_home or Path(os.environ.get("HERMES_HOME", os.environ["HOME"])).resolve(strict=True)
+        from .config import TEST_HOME_GUARD_ENV, TEST_REAL_HOME_ENV, guard_real_home
+        host_home = guard_real_home(self.hermes_home or Path(os.environ.get("HERMES_HOME", os.environ["HOME"])).resolve(strict=True))
         env = {"PATH": "/usr/bin:/bin", "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
                "HOME": str(host_home), "HERMES_HOME": str(host_home),
                "REVIEW_LOOP_TEST_FIXTURE": "1" if self.fixture_mode else "0"}
+        # The worker's environment is built from scratch; keep the test tripwire armed in it.
+        for name in (TEST_HOME_GUARD_ENV, TEST_REAL_HOME_ENV):
+            if os.environ.get(name):
+                env[name] = os.environ[name]
         if os.environ.get("REVIEW_LOOP_GH_STUB") and self.fixture_mode:
             env["REVIEW_LOOP_GH_STUB"] = os.environ["REVIEW_LOOP_GH_STUB"]
         _WORKERS[:] = [worker for worker in _WORKERS if worker.poll() is None]
