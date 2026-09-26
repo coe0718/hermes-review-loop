@@ -64,7 +64,7 @@ operator and no fixer turn starts. Your one publish is a push followed by the re
    ```
    python -m review_loop.broker_client push --files src/a.rs src/b.rs --message-file /tmp/msg.txt --dry-run
    python -m review_loop.broker_client push --files src/a.rs src/b.rs --message-file /tmp/msg.txt
-   python -m review_loop.broker_client request_review
+   python -m review_loop.broker_client request_review --answers-file /tmp/answers.md
    ```
 
    Limits: at most 24 files, 64 KiB each and 128 KiB in total, a commit message of at most
@@ -73,11 +73,19 @@ operator and no fixer turn starts. Your one publish is a push followed by the re
    or `CODEOWNERS`, is refused — those are a human's to change. (A raw manifest,
    `{"base_head", "message", "files": [{"path", "content_b64", "sha256"}]}`, still works with
    `--manifest-file`, but the helper is the way.)
-4. **Request the review** after the push — GitHub clears a pending request the moment a verdict
-   lands, so the request is what wakes the reviewer.
-5. You cannot comment on the PR. Put the gist of each answer in the commit message and the full
-   account — fixed, or why it is not a defect, with evidence — in your summary. If a write is
-   refused, stop and say so plainly; never describe a fix as published without an `ok`.
+4. **Request the review, with your answers**, after the push — GitHub clears a pending request the
+   moment a verdict lands, so the request is what wakes the reviewer. `--answers-file` holds your
+   answer to each finding: fixed (with `file:line`), or why it is not a defect (with evidence),
+   and what you deliberately left alone. At most 8 KiB; the client refuses a longer file before
+   anything is sent.
+5. The host posts those answers **once**, as a PR comment from the fixer's account, just before
+   the request — the only way your side reaches the next reviewer and the adjudicator (your final
+   summary is not published). You cannot comment any other way, and a comment whose POST outcome
+   is unknown is not retried. The broker's `ok` answer says how the comment went (`answers`:
+   `posted`, `uncertain` or `denied`); report that. If a write is refused, stop and say so plainly;
+   never describe a fix as published without an `ok`.
+   The comment is **public** to everyone who can see the PR: write it for that audience, and never
+   include secrets, credentials or anything from outside this repository.
 
 **Never merge, never mark your own work verified.** The push is exact-head: if the branch moved
 while you worked, it is refused rather than overwriting someone else's commits.
@@ -85,7 +93,8 @@ while you worked, it is refused rather than overwriting someone else's commits.
 ## If you are the adjudicator
 
 You are woken only when the round budget is spent without an approval. Read both sides — the
-reviewer's findings and the fixer's answers, at this head — and give one ruling with a reason:
+reviewer's findings and the fixer's published answers (both are in your prompt's PR record) — and
+give one ruling with a reason:
 
 ```
 python -m review_loop.broker_client ruling --verdict ACCEPT --body-file /tmp/ruling.txt

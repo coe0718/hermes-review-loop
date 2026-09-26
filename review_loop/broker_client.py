@@ -9,6 +9,11 @@ broker would refuse *before* the one write is spent. ``base_head`` comes from th
 host writes, read-only, next to this client; the broker still compares it with the run's own
 scoped head, so a wrong value is refused, never trusted. ``push --manifest-file`` still sends a
 manifest built by hand.
+
+After the push, ``request_review --answers-file <file>`` asks for the next review and, with it,
+publishes the fixer's answers to the findings: the host posts them as one PR comment by the fixer
+identity, which the next reviewer and the adjudicator read. The client checks the answers' size
+before the request is spent.
 """
 from __future__ import annotations
 
@@ -39,6 +44,10 @@ MAX_FILES = 24
 MAX_FILE = 64 * 1024
 MAX_CONTENT = 128 * 1024
 MAX_MESSAGE = 240
+# review_loop.broker.ANSWERS_MAX, and the broker's request line limit the answers travel in.
+MAX_ANSWERS = 8 * 1024
+MAX_REQUEST = 16 * 1024
+from review_loop.wire import ANSWERS_MARKER  # copied into the sandbox with this client
 _SHA = re.compile(r'[0-9a-f]{40}\Z')
 _SEGMENT = re.compile(r'[A-Za-z0-9_.-]{1,128}\Z')
 _CONTROL_FILES = {'.gitmodules', '.gitattributes'}
@@ -130,6 +139,26 @@ def build_manifest(files: list[str], message: str, *, work: str | None = None,
     return {'base_head': turn_head(turn_file), 'message': message, 'files': entries}
 
 
+def read_answers(path: str) -> str:
+    """The answers text from ``path``, or ``ManifestError`` naming the limit (nothing sent)."""
+    with open(path, 'rb') as stream:
+        raw = stream.read(MAX_ANSWERS + 1)
+    if len(raw) > MAX_ANSWERS:
+        raise ManifestError(f'the answers are over {MAX_ANSWERS} bytes — shorten them '
+                            '(one line per finding: fixed at file:line, or why not)')
+    text = raw.decode('utf-8')
+    if not text.strip() or '\x00' in text:
+        raise ManifestError('the answers must be non-empty text')
+    if ANSWERS_MARKER in text:
+        raise ManifestError('the answers may not contain the host\'s answers marker')
+    frame = json.dumps({'operation': 'request_review', 'verdict': '', 'body': text},
+                       separators=(',', ':')).encode()
+    if len(frame) > MAX_REQUEST:
+        raise ManifestError(f'the answers encode to {len(frame)} bytes on the wire (non-ASCII '
+                            f'text is escaped) — at most {MAX_REQUEST}; shorten them')
+    return text
+
+
 def call(operation: str, *, verdict: str = '', body: str = '', manifest=None,
          socket_path: str | None = None) -> dict:
     if operation == 'push':
@@ -206,9 +235,25 @@ def main() -> None:
     parser.add_argument('--message-file', help='push: a file holding the commit message')
     parser.add_argument('--dry-run', action='store_true',
                         help='push: build and check the manifest, send nothing')
+    parser.add_argument('--answers-file',
+                        help=f'request_review: your answers to the findings (at most {MAX_ANSWERS} '
+                             'bytes), posted once on the PR by the host as the fixer')
     args = parser.parse_args()
+    if args.answers_file and args.operation != 'request_review':
+        parser.error('--answers-file is a request_review option')
     if args.operation == 'push':
         operation = _push(parser, args)
+    elif args.operation == 'request_review':
+        if (args.files or args.message is not None or args.message_file or args.dry_run
+                or args.verdict or args.body_file or args.manifest_file):
+            parser.error('request_review takes only --answers-file')
+        body = ''
+        if args.answers_file:
+            try:
+                body = read_answers(args.answers_file)
+            except (ManifestError, OSError, UnicodeError) as exc:
+                parser.error(f'request_review refused before sending (your request is unspent): {exc}')
+        operation = lambda: call('request_review', body=body)
     else:
         if args.files or args.message is not None or args.message_file or args.dry_run:
             parser.error('--files, --message, --message-file and --dry-run are push options')
