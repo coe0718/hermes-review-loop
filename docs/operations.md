@@ -23,6 +23,9 @@ running loop.
    created **paused**, so nothing fires until `arm` (after `doctor` and `selftest`); `--arm` creates
    them live instead
 4. one cron job plus a 5-line shim in `~/.hermes/scripts/` that forwards to the plugin's watchdog
+   (`--schedule`). If `hermes cron create` fails, `init` prints the scheduler's error and the exact
+   command to run yourself (shell-quoted, pasteable as printed), skips the "Next:" list, and exits
+   **1** — the config, routes and hooks above are in place; only the job is missing
 
 Route edits are serialized only among cooperating review-loop plugin processes, using a sibling
 lock file and atomic replacement. Native Hermes CLI and dashboard subscription edits do **not**
@@ -74,7 +77,11 @@ registry is visible, but crash durability is unconfirmed; do not assume the oper
    is *now*. Held verdicts never create a run-ledger row, so this is a fresh admission, not a later
    opt-in upgrading an older run. Or keep pushes off and answer verdicts by hand: push the fix and
    re-request review.
-4. `hermes review-loop arm --loop name`.
+4. `hermes review-loop arm --loop name` — flipping a hook needs hook *write* access, as the
+   reader unless `--admin-token <login>` names another. On a user-owned repo only the owner can
+   manage hooks, and the reader is usually the owner, so give its file `repository_hooks: write`
+   (or leave hooks to the web UI and keep it read-only); on an org repo, `--admin-token` can name a
+   separate admin login mapped at `init`.
 
 ## Everyday commands
 
@@ -89,13 +96,23 @@ hermes review-loop init --repo owner/name --dry-run   # preview a loop: seats, r
 hermes review-loop apply --loop name    # push those defaults onto an existing loop (--dry-run)
 hermes review-loop apply --loop name --while-busy     # rebind even while a seat has a run out
 hermes review-loop set --loop name --reviewer-concurrency 2   # two reviews at once, one fix at a time
-hermes review-loop arm --loop name      # arm/pause by flipping the repo hooks
+hermes review-loop arm --loop name      # arm/pause by flipping the repo hooks (--admin-token LOGIN)
 hermes review-loop arm --loop name --pause
 hermes review-loop drain --loop name --seat reviewer
 hermes review-loop fixer-push --loop name --enable --acknowledge-pr-race   # let the fixer publish (off by default)
 hermes review-loop cleanup --loop name --dry-run   # every closed PR; --pr N for one
 hermes review-loop uninstall --loop name
 ```
+
+`arm` and `arm --pause` never report what they asked for — after each PATCH they read the hook back
+and print the state GitHub shows (`hook 12 → paused (read back)`, or `hook 12 is still active, not
+paused: PATCH failed (HTTP 403 …)`), then one `fix:` line. They exit **0** only when every loop
+hook was observed in the requested state (a hook already there counts), **1** on a refused or
+unconfirmed PATCH, a read-back that disagrees, an unreadable hook listing, or no loop hooks on the
+repo, and **2** when the loop is unknown or none is configured. Without `--admin-token` the PATCH
+goes out as the loop's `read_token`; the `fix:` line names the scope that login's file needs
+(`repository_hooks: write`, `admin:repo_hook` or classic `repo`) and, when it is the reader, the
+owner case above.
 
 `set` is how you change the knobs after install — `--reviewer-concurrency`, `--fixer-concurrency`,
 `--concurrency` (the default for both seats), `--cap`, `--clone`, `--base`, `--grace-min`,
@@ -151,7 +168,7 @@ makes.
 
 | role | account | what it does | token | why nothing narrower works |
 | --- | --- | --- | --- | --- |
-| reader (`read_token`) | the repo owner | reads PRs, refs and the repo's hooks | **fine-grained, read-only**: `contents: read`, `pull_requests: read`, `repository_hooks: read` (classic `repo` also works) | the owner *is* the fine-grained token's resource owner, so this is the one seat that can hold a read-only credential on a user-owned repo. `doctor` and `explain` read the hooks to tell *armed* from *paused*; without hook read access the line reports the state as unknown |
+| reader (`read_token`) | the repo owner | reads PRs, refs and the repo's hooks | **fine-grained, read-only**: `contents: read`, `pull_requests: read`, `repository_hooks: read` (classic `repo` also works). When the reader also creates and arms the hooks — `init --hooks` / `arm` without `--admin-token` — make that `repository_hooks: write` | the owner *is* the fine-grained token's resource owner, so this is the one seat that can hold a read-only credential on a user-owned repo. `doctor` and `explain` read the hooks to tell *armed* from *paused*; without hook read access the line reports the state as unknown |
 | reviewer | collaborator (write) | posts one review | classic, `repo` | a review POST needs pull-request write, and on a user-owned repo that is the same permission that can push code |
 | fixer | collaborator (write) | pushes a fix commit | classic, `repo` | the fix is a commit |
 | adjudicator login | collaborator (write) | posts one comment | classic, `repo` | a comment needs only read, but a user-owned repo refuses a read-only collaborator grant (`422`), so the account can write whatever its token says |
