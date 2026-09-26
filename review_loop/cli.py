@@ -420,7 +420,8 @@ def _observer_args(args, loop_id: str) -> dict:
 
 
 def _install_hooks(loop: dict, token_login: str | None) -> list[str]:
-    """Create the two repo hooks via the API. Needs a token with admin:repo_hook on the repo."""
+    """Create the two repo hooks via the API. Needs hook write access on the repo: classic ``repo``,
+    or the narrower ``admin:repo_hook``."""
     names = _routes_of(loop)
     host = config.webhook_host(loop.get("host"), required=True)
     # Validate both destinations and secrets before creating either external hook.

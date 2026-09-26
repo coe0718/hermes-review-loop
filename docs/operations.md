@@ -123,16 +123,18 @@ makes.
 
 | role | account | what it does | token | why nothing narrower works |
 | --- | --- | --- | --- | --- |
-| reader (`read_token`) | the repo owner | reads PRs, refs and the repo's hooks | classic, `repo` | `doctor` and `explain` read the hooks to tell *armed* from *paused*; without that visibility the line reports the hook state as unknown |
+| reader (`read_token`) | the repo owner | reads PRs, refs and the repo's hooks | **fine-grained, read-only**: `contents: read`, `pull_requests: read`, `repository_hooks: read` (classic `repo` also works) | the owner *is* the fine-grained token's resource owner, so this is the one seat that can hold a read-only credential on a user-owned repo. `doctor` and `explain` read the hooks to tell *armed* from *paused*; without hook read access the line reports the state as unknown |
 | reviewer | collaborator (write) | posts one review | classic, `repo` | a review POST needs pull-request write, and on a user-owned repo that is the same permission that can push code |
 | fixer | collaborator (write) | pushes a fix commit | classic, `repo` | the fix is a commit |
 | adjudicator login | collaborator (write) | posts one comment | classic, `repo` | a comment needs only read, but a user-owned repo refuses a read-only collaborator grant (`422`), so the account can write whatever its token says |
 
-* **A fine-grained PAT cannot serve any of those seats.** GitHub's documented gaps: a fine-grained
-  token cannot "contribute to repositories where the user is an outside or repository collaborator",
-  and each token is bound to a single *resource owner* — for a repo you do not own, the owner, which
-  is a different account and therefore a different identity, exactly what the four-identity rule
-  forbids. Classic is the only type that works here, not a preference.
+* **A fine-grained PAT cannot serve any of the *collaborator* seats** — the reviewer, the fixer and
+  the adjudicator login. GitHub's documented gap: a fine-grained token cannot "contribute to
+  repositories where the user is an outside or repository collaborator", and it is bound to a single
+  *resource owner*; for a repo you do not own that owner is a different account, i.e. a different
+  identity, exactly what the four-identity rule forbids. The **reader is the exception**: it is the
+  owner, and an owner can scope a fine-grained token to their own repo with read-only permissions —
+  which is the least-privilege credential worth using where it is available.
 * **Scope cannot make a reviewer or an adjudicator safe.** If the account can post a review or a
   comment it can also push; there is no token shape on a user-owned repo that separates the two.
   What keeps a seat's write credential away from a turn is the
@@ -159,14 +161,22 @@ seat whose PAT lapsed mid-turn fails as an authentication error that reads like 
 GitHub rather than trusting a note:
 
 ```bash
-curl -sI -H "Authorization: token $(cat ~/.hermes/keys/<login>-pat)" \
-  https://api.github.com/ | grep -i github-authentication-token-expiration
+GH_TOKEN=$(cat ~/.hermes/keys/<login>-pat) gh api -i / | grep -i github-authentication-token-expiration
 ```
 
-A `repo`-scoped classic PAT does **not** carry `workflow`, so a fix that edits `.github/workflows/`
-is refused mid-push — push those edits with the owner's credential rather than widening a seat's
-token. Creating the repo's hooks (`init` with `--hooks`, or `apply`) additionally needs
-`admin:repo_hook`, which is normally the reader's token, since the reader is the owner.
+Not `curl -H "Authorization: token $(cat …)"`: that puts the token in the command's argument list,
+where `ps` can read it while the call runs. An environment variable does not.
+
+A `repo`-scoped classic PAT does **not** carry `workflow` — but a seat never gets that far: the
+broker refuses any path under `.github/`, along with `.gitmodules`, `.gitattributes` and
+`CODEOWNERS`, before it invokes git at all. Workflow edits are always a human's, made with a
+credential that has `workflow`.
+
+Creating the repo's hooks (`init` with `--hooks`, or `apply`) needs hook *write* access, which
+a classic `repo` token already has: `admin:repo_hook` is the narrower hooks-only scope, not an extra
+requirement on top of `repo`. An owner's fine-grained reader token needs `repository_hooks: write`
+to create them, so either widen that file once or create the hooks with the owner's classic
+credential.
 
 ## Preflight: `doctor`
 
@@ -195,8 +205,9 @@ One line per check, in one of four states:
 
 Each failure is followed by the one command that fixes it, failures exit 1, and `unknown` is never
 reported as `absent`: "the API refused to tell me" and "there are no hooks" are different claims,
-and printing the second when the first is true sends you hunting for a hook that exists (reading
-the repo's hooks needs `admin:repo_hook`, so a token without it shows ⚠️, not ❌).
+and printing the second when the first is true sends you hunting for a hook that exists (reading the
+repo's hooks needs hook read access, which classic `repo` or the narrower `read:repo_hook` grants, so
+a token without either shows ⚠️, not ❌).
 
 It writes nothing — no config, no route registry, no state, no GitHub hook — unless you pass
 `--repair`, whose one write is restoring this loop's own routes from the plugin's intent record
@@ -264,7 +275,7 @@ $ hermes review-loop doctor --loop widgets
   ✅ state_dir            doctor-demo/state (created under doctor-demo on the first run)
   ✅ roots                1 configured: doctor-demo/reviews
   ✅ gateway              127.0.0.1:43651 accepts a connection
-  ⚠️ hooks                could not read /repos/acme/widgets/hooks — nothing was proved about 2 hook(s) (a token without admin:repo_hook reads as denied)
+  ⚠️ hooks                could not read /repos/acme/widgets/hooks — nothing was proved about 2 hook(s) (a token without hook read access — `repo`, or the narrower `admin:repo_hook` — reads as denied)
 
 widgets: 12 verified, 6 failed, 1 unknown (of 19 checks)
   6 failed: profile:fixer, token:dev-fixer, route:widgets-review, route:widgets-fix, cron:shim, cron:job — fix the ❌ lines above before this loop is armed.
