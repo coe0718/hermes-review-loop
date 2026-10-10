@@ -90,6 +90,7 @@ shared rules. Tables inside `flags:` markers are generated; implementation cavea
 | back up an install, or restore one | [`backup`](#backup), [`restore`](#restore) |
 | turn the loop on or off | [`arm`](#arm) |
 | change a setting | [`set`](#set), [`apply`](#apply), [`settings`](#settings) |
+| see every setting a loop has, its value and where it came from | [`show`](#show) |
 | let the fixer push on its own | [`fixer-push`](#fixer-push) |
 | label new issues automatically | [`triage`](#triage) |
 | find out why a PR is not moving | [`explain`](#explain) |
@@ -158,6 +159,24 @@ The form lives in the Hermes desktop app under **Capabilities → Plugins → di
 
 <!-- flags:settings -->
 No flags.
+<!-- /flags -->
+
+### show
+
+Every setting one loop has: the whole settings schema, the loop-file-only keys, and the nested
+`triage`, `observer` and `adjudicator` keys. Each row shows the effective value (the one the loop
+runs with), where it came from (`loop file`, `default`, or `derived`, e.g. `review_only_cap`
+falling back to `cap`) and a one-line meaning. Settings that are on come first; settings that are
+off but matter say what that means (`fix_ci: off — red CI on fixer PRs waits for a review`).
+The plugin settings form is not a source for a running loop: a form value the loop does not hold
+is a note, since `apply` pushes it. Token values are never read, only file paths. Read-only;
+`--json` prints the same rows as JSON.
+
+<!-- flags:show -->
+| flag | value | default | what it does |
+| --- | --- | --- | --- |
+| `--loop` | `LOOP` | **required** | loop id (its config file name; `list` shows them) |
+| `--json` |  |  | machine-readable output |
 <!-- /flags -->
 
 ### stats

@@ -3131,6 +3131,24 @@ def _apply(args) -> int:
     return 1 if _diverged(updated) or redundant_hooks or leftover_hooks else 0
 
 
+def cmd_show(args) -> int:
+    """Every setting one loop has, its effective value and where it came from (#555). Read-only."""
+    from . import show
+
+    try:
+        loop = config.load_id(args.loop)
+        raw = json.loads((config.config_dir() / f"{args.loop}.json").read_text())
+    except (config.ConfigError, OSError, ValueError) as exc:
+        print(f"cannot show loop: {exc}")
+        return 2
+    rows = show.collect(loop, raw if isinstance(raw, dict) else {}, _SETTINGS)
+    if args.json:
+        print(json.dumps({"loop": loop["id"], "settings": rows}, indent=2, sort_keys=True))
+    else:
+        print(show.render(loop["id"], rows))
+    return 0
+
+
 def cmd_settings(args) -> int:
     """Show the plugin-level defaults — what a new loop starts from, and what ``apply`` pushes."""
     d = config.settings_defaults(_SETTINGS)
@@ -5744,6 +5762,13 @@ def register_cli(ctx, settings: dict | None = None) -> None:
         settings_cmd = sub.add_parser("settings",
                                       help="Show the plugin-level defaults a loop starts from")
         settings_cmd.set_defaults(func=cmd_settings)
+
+        show_cmd = sub.add_parser("show",
+                                  help="Every setting of one loop: value, source, meaning")
+        show_cmd.add_argument("--loop", required=True,
+                              help="loop id (its config file name; `list` shows them)")
+        show_cmd.add_argument("--json", action="store_true", help="machine-readable output")
+        show_cmd.set_defaults(func=cmd_show)
 
         arm = sub.add_parser("arm", help="Activate the loop's GitHub hooks")
         arm.add_argument("--loop", help="loop id (default: every configured loop)")
