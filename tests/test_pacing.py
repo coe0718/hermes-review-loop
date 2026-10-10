@@ -42,7 +42,36 @@ class ParseReset(unittest.TestCase):
                            5400),
             "Codex body, absolute": ({}, json.dumps({"error": {"resets_at": NOW + 900}}).encode(), 900),
             "Codex header": ({"x-codex-primary-reset-after-seconds": "90"}, b"", 90),
-            "the latest wins": ({"Retry-After": "60", "x-ratelimit-reset-tokens": "10m"}, b"", 600),
+            "Retry-After is the server's own answer":
+                ({"Retry-After": "60", "x-ratelimit-reset-tokens": "10m"}, b"", 60),
+        }
+        for name, (headers, body, want) in cases.items():
+            with self.subTest(name):
+                self.assertAlmostEqual(pacing.parse_reset(headers, body, NOW) - NOW, want, delta=1)
+
+    def test_the_hold_is_the_full_windows_not_the_latest_one(self):
+        # Live, 2026-10-10: Codex's 5-hour window was full (resets in 47 m) and its weekly one had
+        # 84% left (resets in 6 days); the reviewer was held until the weekly reset.
+        five_h, week = 47 * 60, 6 * 24 * 3600
+        codex = {"x-codex-primary-used-percent": "100", "x-codex-primary-reset-after-seconds": str(five_h),
+                 "x-codex-secondary-used-percent": "16", "x-codex-secondary-reset-after-seconds": str(week)}
+        cases = {
+            "the full 5-hour window": (codex, b"", five_h),
+            "the full weekly window": ({**codex, "x-codex-primary-used-percent": "40",
+                                        "x-codex-secondary-used-percent": "100"}, b"", week),
+            "the body names the limit it hit": (codex, json.dumps({"error": {
+                "type": "usage_limit_reached", "resets_in_seconds": 1234}}).encode(), 1234),
+            "no usage given: the earliest reset": ({"x-codex-primary-reset-after-seconds": str(five_h),
+                                                    "x-codex-secondary-reset-after-seconds": str(week)},
+                                                   b"", five_h),
+            "Anthropic: the window with nothing remaining": (
+                {"anthropic-ratelimit-tokens-remaining": "0",
+                 "anthropic-ratelimit-tokens-reset": str(int(NOW + 7200)),
+                 "anthropic-ratelimit-requests-remaining": "40",
+                 "anthropic-ratelimit-requests-reset": str(int(NOW + 60))}, b"", 7200),
+            "OpenAI: the window with nothing remaining": (
+                {"x-ratelimit-remaining-requests": "12", "x-ratelimit-reset-requests": "20s",
+                 "x-ratelimit-remaining-tokens": "0", "x-ratelimit-reset-tokens": "9m"}, b"", 540),
         }
         for name, (headers, body, want) in cases.items():
             with self.subTest(name):

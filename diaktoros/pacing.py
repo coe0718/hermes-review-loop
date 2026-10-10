@@ -77,18 +77,38 @@ def _instant(text: str, now: float) -> float | None:
 def parse_reset(headers: dict, body: bytes, now: float | None = None) -> float | None:
     """When a 429's usage window reopens (epoch seconds), from what the provider said, or None.
 
-    Reads ``Retry-After`` (seconds or an HTTP date), any ``…-reset…`` rate-limit header (a
-    duration like ``6m0s``, seconds, epoch or RFC 3339; Anthropic's ``anthropic-ratelimit-*-reset``,
-    OpenAI's ``x-ratelimit-reset-*``), and the JSON body's ``resets_in_seconds`` / ``resets_at``
-    (the Codex usage-limit answer). The latest named time wins, bounded by a week.
+    Reads the JSON body's ``resets_in_seconds`` / ``resets_at`` (the Codex usage-limit answer),
+    ``Retry-After`` (seconds or an HTTP date), and any ``…-reset…`` rate-limit header (a duration
+    like ``6m0s``, seconds, epoch or RFC 3339; Anthropic's ``anthropic-ratelimit-*-reset``,
+    OpenAI's ``x-ratelimit-reset-*``, Codex's ``x-codex-*-reset-*``). Bounded by a week.
+
+    Providers report every window they track, not only the one that is full: Codex sends its
+    5-hour and its weekly reset on every answer. So the time is the hit limit's, by authority:
+    the error body's own reset first (it describes the limit that refused), then ``Retry-After``,
+    then the reset of a window the headers show exhausted (``…-used-percent`` at 100, or
+    ``…-remaining`` at 0). With no window shown exhausted, the earliest reset: a wait that is too
+    short ends in one more 429 and a new hold, one that is too long silences a seat for days
+    (live, 2026-10-10: a full 5-hour window held the reviewer until the weekly reset).
     """
     now = time.time() if now is None else now
-    found: list[float] = []
+
+    def kept(moments):
+        return [m for m in moments if math.isfinite(m) and m > now]
+
+    def bounded(moment):
+        return min(moment, now + MAX_WAIT_S)
+
+    body_found = kept(_body_resets(body, now))
+    if body_found:
+        return bounded(max(body_found))
     lowered = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
     retry_after = lowered.get("retry-after")
     if retry_after:
         seconds = _seconds(retry_after)
-        found.append(now + seconds if seconds is not None else (_instant(retry_after, now) or 0))
+        moment = kept([now + seconds if seconds is not None else (_instant(retry_after, now) or 0)])
+        if moment:
+            return bounded(moment[0])
+    windows = []                                   # (reset, exhausted: True / False / None)
     for name, value in lowered.items():
         if not _reset_header(name):
             continue
@@ -99,15 +119,29 @@ def parse_reset(headers: dict, body: bytes, now: float | None = None) -> float |
         seconds = _seconds(value)
         at = _instant(value, now)
         if relative_first and seconds is not None:
-            found.append(now + seconds)
+            moment = now + seconds
         elif at is not None:
-            found.append(at)
+            moment = at
         elif seconds is not None:
-            found.append(now + seconds)
+            moment = now + seconds
+        else:
+            continue
+        if kept([moment]):
+            windows.append((moment, _exhausted(name, lowered)))
+    full = [moment for moment, exhausted in windows if exhausted is True]
+    if full:
+        return bounded(max(full))
+    unknown = [moment for moment, exhausted in windows if exhausted is None]
+    pool = unknown or [moment for moment, _ in windows]
+    return bounded(min(pool)) if pool else None
+
+
+def _body_resets(body: bytes, now: float) -> list[float]:
     try:
         data = json.loads(body or b"null")
     except (ValueError, UnicodeDecodeError):
-        data = None
+        return []
+    found: list[float] = []
     error = data.get("error") if isinstance(data, dict) else None
     for source in (error, data):
         if not isinstance(source, dict):
@@ -122,8 +156,36 @@ def parse_reset(headers: dict, body: bytes, now: float | None = None) -> float |
             moment = _instant(at, now)
             if moment is not None:
                 found.append(moment)
-    found = [moment for moment in found if math.isfinite(moment) and moment > now]
-    return min(max(found), now + MAX_WAIT_S) if found else None
+    return found
+
+
+def _number(text: str | None) -> float | None:
+    try:
+        value = float(str(text).strip().rstrip("%"))
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _exhausted(reset_name: str, headers: dict) -> bool | None:
+    """Whether the window a reset header belongs to is full, from its sibling usage header:
+    ``x-codex-primary-used-percent`` for ``x-codex-primary-reset-…``, ``…-remaining`` for an
+    Anthropic ``…-reset``, ``x-ratelimit-remaining-X`` for OpenAI's ``x-ratelimit-reset-X``.
+    None when the provider gives no usage for that window."""
+    if reset_name.startswith("x-ratelimit-reset-"):
+        siblings = {"remaining": "x-ratelimit-remaining-" + reset_name[len("x-ratelimit-reset-"):]}
+    else:
+        base = reset_name[:reset_name.index("-reset")] if "-reset" in reset_name else ""
+        if not base:
+            return None
+        siblings = {"used": base + "-used-percent", "remaining": base + "-remaining"}
+    used = _number(headers.get(siblings.get("used", "")))
+    if used is not None:
+        return used >= 100
+    remaining = _number(headers.get(siblings["remaining"]))
+    if remaining is not None:
+        return remaining <= 0
+    return None
 
 
 def _reset_header(name: str) -> bool:
