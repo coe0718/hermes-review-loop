@@ -1,0 +1,172 @@
+name: Experimental native macOS boundary
+
+on:
+  pull_request:
+    paths:
+      - diaktoros/seatbelt.py
+      - diaktoros/native_macos.py
+      - diaktoros/native_storage.py
+      - diaktoros/native_lifecycle.py
+      - diaktoros/seatbelt_wire.py
+      - diaktoros/broker_client.py
+      - diaktoros/contained.py
+      - diaktoros/trusted_turn.py
+      - diaktoros/turn_layout.py
+      - tests/test_seatbelt.py
+      - tests/test_native_macos.py
+      - tests/test_native_storage.py
+      - tests/test_native_lifecycle.py
+      - tests/test_native_snapshot.py
+      - tests/test_snapshot_secrets.py
+      - tests/test_trusted_fetch.py
+      - tests/test_turn_layout.py
+      - tests/test_native_roles.py
+      - tests/native_rust_fixture.py
+      - .github/workflows/seatbelt.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: seatbelt-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  boundary:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    env:
+      DIAKTOROS_REQUIRE_SEATBELT: '1'
+      DIAKTOROS_REQUIRE_NATIVE_STORAGE: '1'
+      DIAKTOROS_REQUIRE_NATIVE_LIFECYCLE: '1'
+      DIAKTOROS_REQUIRE_NATIVE_ROLES: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Record native runtime
+        run: |
+          sw_vers
+          uname -m
+          test -x /usr/bin/sandbox-exec
+          python -c 'import sys; print(sys.executable); print(sys.base_prefix)'
+      - name: Exercise real Seatbelt boundary (no credentials or live services)
+        run: python tests/leakguard.py discover -v -s tests -p 'test_seatbelt.py'
+      - name: Exercise fixed-capacity APFS storage and cleanup
+        run: python tests/leakguard.py discover -v -s tests -p 'test_native_storage.py'
+      - name: Exercise pinned committed source export and path replacement
+        run: |
+          python tests/leakguard.py discover -v -s tests -p 'test_native_snapshot.py'
+          python tests/leakguard.py discover -v -s tests -p 'test_turn_layout.py'
+          python tests/leakguard.py -v test_trusted_fetch.CommittedSourceSnapshotTests
+          python tests/leakguard.py -v test_snapshot_secrets.SnapshotSecretTests test_snapshot_secrets.EvalsAreNotExported test_snapshot_secrets.ExportedSnapshotProbeTests
+      - name: Test watchdog cleanup and characterize remaining detached-child gap
+        run: python tests/leakguard.py discover -v -s tests -p 'test_native_lifecycle.py'
+      - name: Verify role-specific checkout mutation permissions
+        run: python tests/leakguard.py discover -v -s tests -p 'test_native_roles.py'
+      - name: Startup diagnostics on failure
+        if: failure()
+        run: |
+          /usr/bin/log show --last 2m --style compact --predicate 'eventMessage CONTAINS "deny" OR process == "sandboxd"' 2>&1 | tail -n 100
+          python - <<'PY'
+          from pathlib import Path
+          for root in (Path.home() / 'Library/Logs/DiagnosticReports', Path('/Library/Logs/DiagnosticReports')):
+              for path in sorted(root.glob('*Python*'), key=lambda p: p.stat().st_mtime)[-3:]:
+                  print(path.name)
+                  print(path.read_text(errors='replace')[:14000])
+          PY
+
+  hermes-turn:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    env:
+      HERMES_AGENT_SOURCE: ${{ github.workspace }}/hermes
+      DIAKTOROS_REQUIRE_NATIVE_HERMES: '1'
+      UV_PYTHON_PREFERENCE: only-managed
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: NousResearch/hermes-agent
+          ref: be5e9f72c6681af9dfb75bf480f08844f1499949
+          path: hermes
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          version: '0.12.19'
+          enable-cache: false
+      - name: Stage dedicated Rust toolchain, vendored crate and selected Apple SDK
+        run: |
+          rustup_bin=$(command -v rustup)
+          export RUSTUP_HOME="$RUNNER_TEMP/native-rustup"
+          export CARGO_HOME="$RUNNER_TEMP/native-cargo"
+          "$rustup_bin" toolchain install 1.85.1 --profile minimal --no-self-update
+          rust_root=$("$rustup_bin" run 1.85.1 rustc --print sysroot)
+          export PATH="$rust_root/bin:$PATH"
+          fixture="$RUNNER_TEMP/native-build-fixture"
+          python tests/native_rust_fixture.py "$fixture"
+          cargo generate-lockfile --manifest-path "$fixture/Cargo.toml"
+          cargo vendor --locked --manifest-path "$fixture/Cargo.toml" "$fixture/vendor"
+          sdk=$(xcrun --sdk macosx --show-sdk-path)
+          clang=$(xcrun --sdk macosx --find clang)
+          developer_tools=$(dirname "$(dirname "$clang")")
+          test -x "$developer_tools/bin/clang"
+          test -d "$sdk"
+          echo "DIAKTOROS_NATIVE_RUST_ROOT=$rust_root" >> "$GITHUB_ENV"
+          echo "DIAKTOROS_NATIVE_BUILD_FIXTURE=$fixture" >> "$GITHUB_ENV"
+          echo "DIAKTOROS_NATIVE_SDK=$sdk" >> "$GITHUB_ENV"
+          echo "DIAKTOROS_NATIVE_DEVELOPER_TOOLS=$developer_tools" >> "$GITHUB_ENV"
+      - name: Install pinned native Hermes into a disposable venv
+        run: |
+          py=$(python -c 'import json; print(json.load(open("hermes/pm/lock.json"))["packages"]["python"]["version"].split("+")[0])')
+          uv venv --python "$py" hermes/venv
+          cd hermes
+          UV_PROJECT_ENVIRONMENT="$HERMES_AGENT_SOURCE/venv" uv sync --frozen --no-dev --extra anthropic
+          test -x "$HERMES_AGENT_SOURCE/venv/bin/hermes"
+      - name: Real Hermes tool turn over Unix model and broker sockets
+        run: python tests/leakguard.py discover -v -s tests -p 'test_native_macos.py'
+      - name: Native runtime denials on failure
+        if: failure()
+        run: /usr/bin/log show --last 2m --style compact --predicate 'eventMessage CONTAINS "deny" AND (eventMessage CONTAINS "python" OR eventMessage CONTAINS "Python" OR eventMessage CONTAINS "cargo" OR eventMessage CONTAINS "rustc" OR eventMessage CONTAINS "clang" OR eventMessage CONTAINS "ld(")' 2>&1 | tail -n 100
+      - name: Identify users of retained workspace volumes
+        if: failure()
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import plistlib
+          import subprocess
+          info = subprocess.run(['/usr/bin/hdiutil', 'info', '-plist'],
+                                capture_output=True, timeout=10, check=True)
+          images = plistlib.loads(info.stdout).get('images', [])
+          for root in sorted(Path('/private/tmp').glob('dk-volume-*'))[-3:]:
+              mount = root / 'mount'
+              if not mount.is_dir():
+                  continue
+              print('RETAINED WORKSPACE:', root, flush=True)
+              for image in images:
+                  if Path(image.get('image-path', '')).resolve() == root / 'turn.dmg':
+                      print('OWNED ATTACHMENT:', image, flush=True)
+              try:
+                  result = subprocess.run(['/usr/sbin/lsof', '-nP', '+f', '--', str(mount)],
+                                          capture_output=True, timeout=10)
+                  print((result.stdout + result.stderr).decode(errors='replace')[-12000:])
+              except subprocess.TimeoutExpired:
+                  print('volume lsof exceeded diagnostic deadline')
+          PY

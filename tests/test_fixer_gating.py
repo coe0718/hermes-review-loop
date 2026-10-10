@@ -392,7 +392,7 @@ class PushHelper(unittest.TestCase):
         import re
         from diaktoros import contained
         source = (ROOT / "diaktoros" / "broker_client.py").read_text()
-        self.assertEqual(re.search(r"^EXPORT = '([^']+)'", source, re.M).group(1),
+        self.assertEqual(re.search(r"^DEFAULT_EXPORT = '([^']+)'", source, re.M).group(1),
                          contained.EXPORT_DIR)
         self.assertEqual(self.client._CONTROL_FILES, safe_push.CONTROL_FILES)
         self.assertEqual(self.client._CONTROL_PATHS, safe_push.CONTROL_PATHS)

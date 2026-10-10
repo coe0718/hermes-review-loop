@@ -30,7 +30,8 @@ import re
 import socket
 import stat
 
-SOCKET = '/run/review-loop/broker/broker.sock'
+DEFAULT_SOCKET = '/run/review-loop/broker/broker.sock'
+SOCKET = os.environ.get('DIAKTOROS_BROKER_SOCKET', DEFAULT_SOCKET)
 TRIAGE_COMMENT_MAX = 1000          # run_supervisor.TRIAGE_COMMENT_MAX; this file runs standalone
 MAX_FRAME = 768 * 1024           # broker_ipc.MAX_PUSH_REQUEST
 # A push or review is several GitHub calls plus git fetch/push (each up to 90s), all
@@ -39,11 +40,14 @@ MAX_FRAME = 768 * 1024           # broker_ipc.MAX_PUSH_REQUEST
 WRITE_TIMEOUT = 900
 
 # The exported PR tree, and the host's read-only facts about this turn (``{"head": sha}``).
-WORK = '/work'
+DEFAULT_WORK = '/work'
+WORK = os.environ.get('DIAKTOROS_WORK', DEFAULT_WORK)
 # The read-only export the seat's /work was copied from (contained.EXPORT_DIR): the base a diff is
 # taken against.
-EXPORT = '/opt/export'
-TURN_FILE = '/opt/client/review-loop-turn.json'
+DEFAULT_EXPORT = '/opt/export'
+EXPORT = os.environ.get('DIAKTOROS_EXPORT', DEFAULT_EXPORT)
+DEFAULT_TURN_FILE = '/opt/client/review-loop-turn.json'
+TURN_FILE = os.environ.get('DIAKTOROS_TURN_FILE', DEFAULT_TURN_FILE)
 
 # The broker's own limits (diaktoros.safe_push), repeated here only so an agent learns about a
 # refusal before spending its write. The broker re-checks every one of them.
