@@ -320,6 +320,9 @@ The `observer` block is an optional **delivery-only feed**, not a model seat. It
 | `fixed` | Issue-fix write ended: PR opened/review requested, could-not-fix comment, or uncertain. Links the issue. |
 | `failed` | Any isolated run's first failed attempt and its terminal failed/uncertain state. Links the issue for triage and issue-fix runs. |
 | `held` | A run waiting on its seat's daily cap or its provider's usage window: when it resumes, and how to run it sooner. Once per hold. |
+| `conflict` | A loop PR no longer merges into its base (GitHub reports a merge conflict): once per head. Urgent tier. |
+| `ci_failed` | A required check is red at a loop PR's current head: once per head, naming the failed check(s) and linking the run. |
+| `updated` | With `review_only_update` on, the host merged the base into a review-only PR's branch and pushed it (clean merge only). |
 | `main_red` | A required check is red at the head of the base branch: once per main head, naming the failed check(s) and the PRs merged since main's last green head. Urgent tier. |
 | `stale_approval` | A loop PR is approved at head H, and a required check at H is then red, cancelled, or never reported within 30 minutes of the approval: once per PR and head. Urgent tier. |
 | `human_paths` | The reviewer would approve, but the diff touches a `human_paths` glob (or is too large to list), so the approval is left to a person: once per PR and head. Urgent tier. |
